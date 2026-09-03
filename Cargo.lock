@@ -649,6 +649,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-proxy"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "lb-core",
+ "lb-healthcheck",
+ "tokio",
+]
+
+[[package]]
 name = "lb-ratelimit"
 version = "0.1.0"
 dependencies = [
