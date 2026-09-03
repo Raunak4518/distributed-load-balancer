@@ -1,5 +1,7 @@
+mod admin;
 mod handles;
 
+pub use admin::{spawn_admin_server, ReadinessCheck};
 pub use handles::{BackendMetrics, ListenerMetrics, StatusClass};
 
 use prometheus::{
