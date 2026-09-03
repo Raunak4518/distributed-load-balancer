@@ -240,3 +240,43 @@ listen = "{traffic_listen}"
         peers = peer_list.join(", ")
     )
 }
+
+/// An HTTP listener plus an `[admin]` section, for metrics tests.
+pub fn admin_config_toml(
+    admin_listen: SocketAddr,
+    traffic_listen: SocketAddr,
+    backend: SocketAddr,
+    rate_per_sec: f64,
+    burst: u32,
+) -> String {
+    format!(
+        r#"
+[admin]
+listen = "{admin_listen}"
+
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{traffic_listen}"
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = {rate_per_sec}
+  burst = {burst}
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    )
+}

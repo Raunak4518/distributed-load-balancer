@@ -22,6 +22,9 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         background_tasks,
         drain_timeout,
         cluster,
+        metrics,
+        admin_listen,
+        pools,
     } = build_app(&config);
 
     // Bind every listener before serving any of them, so a port conflict or
@@ -78,6 +81,28 @@ pub async fn run(config: Config) -> std::io::Result<()> {
             setup.peers.clone(),
             setup.sync_interval,
             Duration::from_secs(2),
+        ));
+    }
+
+    // Bound with the others so an admin port clash also fails startup.
+    if let Some(admin_addr) = admin_listen {
+        let admin_listener = TcpListener::bind(admin_addr).await.map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("admin listener could not bind {admin_addr}: {err}"),
+            )
+        })?;
+        eprintln!("admin listener on {}", admin_listener.local_addr()?);
+
+        // Ready when any listener has somewhere to forward. If every backend
+        // is down, this instance should leave rotation — but stay alive, since
+        // restarting it would not bring the backends back.
+        let readiness: lb_metrics::ReadinessCheck =
+            Arc::new(move || pools.iter().any(|p| !p.eligible_backends().is_empty()));
+        cluster_tasks.push(lb_metrics::spawn_admin_server(
+            Arc::clone(&metrics),
+            admin_listener,
+            readiness,
         ));
     }
 

@@ -5,6 +5,7 @@ use lb_core::{Backend, BackendPool, Config, ListenerConfig, Protocol, SystemCloc
 use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
 };
+use lb_metrics::Metrics;
 use lb_proxy::ProxyContext;
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
 use lb_tcp::TcpContext;
@@ -60,6 +61,11 @@ pub struct WiredApp {
     pub drain_timeout: Duration,
     /// Present only when `[cluster]` is configured.
     pub cluster: Option<ClusterSetup>,
+    /// Always collected; `admin_listen` controls whether it is exposed.
+    pub metrics: Arc<Metrics>,
+    pub admin_listen: Option<SocketAddr>,
+    /// Every listener's pool, for the readiness check.
+    pub pools: Vec<Arc<BackendPool>>,
 }
 
 /// Everything `run` needs to start peer coordination, kept separate from the
@@ -74,6 +80,11 @@ pub struct ClusterSetup {
 pub fn build_app(config: &Config) -> WiredApp {
     let mut listeners = Vec::with_capacity(config.listeners.len());
     let mut background_tasks = Vec::new();
+    let mut pools = Vec::with_capacity(config.listeners.len());
+
+    // One registry per process. Handles are resolved from it once per
+    // listener/backend below — never on the request path.
+    let metrics = Arc::new(Metrics::new().expect("metric names are valid and unique"));
 
     // One cluster node per process, shared by every listener.
     let cluster_node = config.cluster.as_ref().map(|c| {
@@ -91,6 +102,17 @@ pub fn build_app(config: &Config) -> WiredApp {
             .map(|b| Backend::new(b.id.clone(), b.address, b.weight))
             .collect();
         let pool = Arc::new(BackendPool::new(backends.clone()));
+        pools.push(Arc::clone(&pool));
+
+        let protocol_name = match lc.protocol {
+            Protocol::Http => "http",
+            Protocol::Tcp => "tcp",
+        };
+        let listener_metrics = Arc::new(metrics.listener(&lc.name, protocol_name));
+        let backend_metrics: HashMap<_, _> = backends
+            .iter()
+            .map(|b| (b.id.clone(), metrics.backend(&lc.name, &b.id.0)))
+            .collect();
 
         let mut circuit_breakers = HashMap::new();
         for b in &backends {
@@ -117,7 +139,7 @@ pub fn build_app(config: &Config) -> WiredApp {
             Duration::from_secs(60),
         ));
 
-        spawn_health_checkers(lc, &backends, &pool, &mut background_tasks);
+        spawn_health_checkers(lc, &backends, &pool, &mut background_tasks, &metrics);
 
         // The global cap is the sustained rate over the whole window; the
         // local GCRA continues to shape bursts inside it.
@@ -148,6 +170,8 @@ pub fn build_app(config: &Config) -> WiredApp {
                     forward_timeout: lc.forward_timeout(),
                     max_request_body_bytes: lc.max_request_body_bytes(),
                     cluster: cluster_coordinator,
+                    metrics: Arc::clone(&listener_metrics),
+                    backend_metrics,
                 }),
             },
             Protocol::Tcp => ListenerRuntime::Tcp {
@@ -161,6 +185,8 @@ pub fn build_app(config: &Config) -> WiredApp {
                     connect_timeout: lc.connect_timeout(),
                     idle_timeout: lc.idle_timeout(),
                     cluster: cluster_coordinator,
+                    metrics: Arc::clone(&listener_metrics),
+                    backend_metrics,
                 }),
             },
         });
@@ -181,6 +207,9 @@ pub fn build_app(config: &Config) -> WiredApp {
         background_tasks,
         drain_timeout: Duration::from_millis(config.server.drain_timeout_ms),
         cluster,
+        metrics,
+        admin_listen: config.admin.as_ref().map(|a| a.listen),
+        pools,
     }
 }
 
@@ -191,12 +220,16 @@ fn spawn_health_checkers(
     backends: &[Backend],
     pool: &Arc<BackendPool>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    metrics: &Metrics,
 ) {
     let interval = Duration::from_millis(lc.health_check.interval_ms);
     let timeout = Duration::from_millis(lc.health_check.timeout_ms);
 
     for b in backends {
-        let config = ActiveCheckConfig { interval };
+        let config = ActiveCheckConfig {
+            interval,
+            healthy_gauge: Some(metrics.backend(&lc.name, &b.id.0).healthy),
+        };
         match lc.protocol {
             Protocol::Http => {
                 let path =

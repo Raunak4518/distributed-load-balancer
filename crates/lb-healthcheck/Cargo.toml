@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 lb-core = { path = "../lb-core" }
+lb-metrics = { path = "../lb-metrics" }
 tokio = { version = "1", features = ["rt", "time", "macros", "net"] }
 reqwest = "0.12"
 

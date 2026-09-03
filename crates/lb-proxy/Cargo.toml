@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 lb-core = { path = "../lb-core" }
 lb-healthcheck = { path = "../lb-healthcheck" }
+lb-metrics = { path = "../lb-metrics" }
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"

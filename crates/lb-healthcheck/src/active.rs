@@ -5,6 +5,10 @@ use tokio::time;
 
 pub struct ActiveCheckConfig {
     pub interval: Duration,
+    /// Optional gauge mirroring the health flag, so backend health is
+    /// visible in metrics as well as in the pool. `None` in tests that don't
+    /// care about metrics.
+    pub healthy_gauge: Option<lb_metrics::IntGauge>,
 }
 
 /// Polls one backend on an interval and publishes the result into the pool's
@@ -25,6 +29,9 @@ where
             ticker.tick().await;
             let healthy = probe.probe(&backend).await;
             pool.set_active_healthy(&backend.id, healthy);
+            if let Some(gauge) = &config.healthy_gauge {
+                gauge.set(if healthy { 1 } else { 0 });
+            }
         }
     })
 }
@@ -54,6 +61,7 @@ mod tests {
             pool.clone(),
             ActiveCheckConfig {
                 interval: Duration::from_millis(20),
+                healthy_gauge: None,
             },
             HttpProbe::new("/health", Duration::from_millis(200)),
         );
@@ -80,6 +88,7 @@ mod tests {
             pool.clone(),
             ActiveCheckConfig {
                 interval: Duration::from_millis(20),
+                healthy_gauge: None,
             },
             HttpProbe::new("/health", Duration::from_millis(200)),
         );
@@ -106,6 +115,7 @@ mod tests {
             pool.clone(),
             ActiveCheckConfig {
                 interval: Duration::from_millis(20),
+                healthy_gauge: None,
             },
             TcpConnectProbe::new(Duration::from_millis(100)),
         );

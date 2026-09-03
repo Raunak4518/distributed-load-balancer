@@ -137,13 +137,19 @@ mod tests {
     async fn ready_reflects_the_readiness_check() {
         let (base, flag) = start(true).await;
         assert_eq!(
-            reqwest::get(format!("{base}/ready")).await.unwrap().status(),
+            reqwest::get(format!("{base}/ready"))
+                .await
+                .unwrap()
+                .status(),
             200
         );
 
         flag.store(false, Ordering::SeqCst);
         assert_eq!(
-            reqwest::get(format!("{base}/ready")).await.unwrap().status(),
+            reqwest::get(format!("{base}/ready"))
+                .await
+                .unwrap()
+                .status(),
             503
         );
     }
@@ -152,7 +158,10 @@ mod tests {
     async fn unknown_paths_are_404() {
         let (base, _) = start(true).await;
         assert_eq!(
-            reqwest::get(format!("{base}/admin")).await.unwrap().status(),
+            reqwest::get(format!("{base}/admin"))
+                .await
+                .unwrap()
+                .status(),
             404
         );
     }

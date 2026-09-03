@@ -654,6 +654,7 @@ name = "lb-healthcheck"
 version = "0.1.0"
 dependencies = [
  "lb-core",
+ "lb-metrics",
  "reqwest",
  "tokio",
  "wiremock",
@@ -684,6 +685,7 @@ dependencies = [
  "hyper-util",
  "lb-core",
  "lb-healthcheck",
+ "lb-metrics",
  "tokio",
 ]
 
@@ -708,6 +710,7 @@ dependencies = [
  "lb-cluster",
  "lb-core",
  "lb-healthcheck",
+ "lb-metrics",
  "lb-proxy",
  "lb-ratelimit",
  "lb-tcp",
@@ -721,6 +724,7 @@ version = "0.1.0"
 dependencies = [
  "lb-core",
  "lb-healthcheck",
+ "lb-metrics",
  "tokio",
 ]
 

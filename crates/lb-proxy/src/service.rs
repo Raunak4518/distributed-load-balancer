@@ -9,6 +9,7 @@ use lb_core::{
     BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimitKeySource, RateLimiter,
 };
 use lb_healthcheck::CircuitBreaker;
+use lb_metrics::{BackendMetrics, ListenerMetrics, StatusClass};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::IpAddr;
@@ -28,6 +29,11 @@ pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     pub max_request_body_bytes: usize,
     /// Present only when `[cluster]` is configured; `None` means single-node.
     pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
+    /// Always present, never optional: recording is a few atomic increments,
+    /// so keeping it unconditional avoids a branch on the hot path. The
+    /// `[admin]` section controls *exposure*, not collection.
+    pub metrics: Arc<ListenerMetrics>,
+    pub backend_metrics: HashMap<BackendId, BackendMetrics>,
 }
 
 impl<R: RateLimiter, L: LoadBalancer, C: Clock> ProxyContext<R, L, C> {
@@ -120,8 +126,35 @@ where
     L: LoadBalancer,
     C: Clock,
 {
+    let started = std::time::Instant::now();
+    let result = handle_inner(req, Arc::clone(&ctx), peer_ip).await;
+
+    // Recorded in exactly one place so no early return can forget to. The
+    // inner function has six return sites; duplicating this at each of them
+    // would be a bug waiting to happen.
+    if let Ok(resp) = &result {
+        ctx.metrics
+            .record_status(StatusClass::from_code(resp.status().as_u16()));
+        ctx.metrics
+            .request_duration
+            .observe(started.elapsed().as_secs_f64());
+    }
+    result
+}
+
+async fn handle_inner<R, L, C>(
+    req: Request<Incoming>,
+    ctx: Arc<ProxyContext<R, L, C>>,
+    peer_ip: IpAddr,
+) -> Result<Response<ProxyBody>, Infallible>
+where
+    R: RateLimiter,
+    L: LoadBalancer,
+    C: Clock,
+{
     let key = extract_key(&req, &ctx.rate_limit_key, peer_ip);
     if let Decision::Deny { retry_after } = ctx.rate_limiter.check(&key) {
+        ctx.metrics.ratelimit_rejected_local.inc();
         let mut resp = simple_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
         if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string()) {
             resp.headers_mut().insert(header::RETRY_AFTER, value);
@@ -133,6 +166,7 @@ where
     // the request: local is free, this is shared state.
     if let Some(cluster) = &ctx.cluster {
         if !cluster.try_admit(&key) {
+            ctx.metrics.ratelimit_rejected_cluster.inc();
             return Ok(simple_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate limit exceeded",
@@ -151,7 +185,16 @@ where
     // a backend become eligible for a probe request as soon as it's due.
     for id in ctx.pool.all_backend_ids() {
         if let Some(breaker) = ctx.circuit_breakers.get(id) {
-            ctx.pool.set_circuit_open(id, breaker.is_open());
+            let state = breaker.state();
+            ctx.pool
+                .set_circuit_open(id, state == lb_healthcheck::CircuitState::Open);
+            if let Some(bm) = ctx.backend_metrics.get(id) {
+                bm.circuit_state.set(match state {
+                    lb_healthcheck::CircuitState::Closed => 0,
+                    lb_healthcheck::CircuitState::Open => 1,
+                    lb_healthcheck::CircuitState::HalfOpen => 2,
+                });
+            }
         }
     }
 
@@ -180,9 +223,15 @@ where
             .expect("picked id exists in the pool it was picked from")
             .clone();
         let outbound = build_outbound_request(&parts, bytes.clone(), &backend);
+        let attempt_started = std::time::Instant::now();
 
         match forward(&ctx.client, outbound, ctx.forward_timeout).await {
             Ok(resp) => {
+                if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
+                    bm.requests_success.inc();
+                    bm.upstream_duration
+                        .observe(attempt_started.elapsed().as_secs_f64());
+                }
                 ctx.circuit_breaker(&backend_id).record_success();
                 // Propagate immediately (not just next request) so a backend
                 // that just recovered is usable again within this same burst.
@@ -190,7 +239,13 @@ where
                 let (resp_parts, resp_body) = resp.into_parts();
                 return Ok(Response::from_parts(resp_parts, resp_body.boxed()));
             }
-            Err(ForwardError::Connect | ForwardError::Timeout) => {
+            Err(err) => {
+                if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
+                    match err {
+                        ForwardError::Timeout => bm.requests_timeout.inc(),
+                        ForwardError::Connect => bm.requests_failure.inc(),
+                    }
+                }
                 let breaker = ctx.circuit_breaker(&backend_id);
                 breaker.record_failure();
                 // Propagate immediately so the retry attempt below (if any)
@@ -321,6 +376,14 @@ mod tests {
         Arc::new(BackendPool::new(vec![]))
     }
 
+    /// Metrics are always-on in production, so tests supply real handles
+    /// rather than a null object. Nothing scrapes them here; they just need
+    /// to exist so the hot path stays branch-free.
+    fn test_metrics() -> Arc<ListenerMetrics> {
+        let registry = lb_metrics::Metrics::new().expect("metrics registry");
+        Arc::new(registry.listener("test", "http"))
+    }
+
     #[tokio::test]
     async fn rate_limited_request_gets_429_without_touching_a_backend() {
         // `C` (the Clock used by CircuitBreaker) is never exercised on this
@@ -337,6 +400,8 @@ mod tests {
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
             cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -354,6 +419,8 @@ mod tests {
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
             cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -380,6 +447,8 @@ mod tests {
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
             cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -407,6 +476,8 @@ mod tests {
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
             cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -442,6 +513,8 @@ mod tests {
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
             cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
         });
 
         // "dead" sorts first in pool order, so PreferFirstEligible tries it,

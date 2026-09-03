@@ -1,6 +1,7 @@
 use crate::pump::pump;
 use lb_core::{BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimiter};
 use lb_healthcheck::CircuitBreaker;
+use lb_metrics::{BackendMetrics, IntGauge, ListenerMetrics};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,6 +17,22 @@ pub struct TcpContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     pub idle_timeout: Duration,
     /// Present only when `[cluster]` is configured; `None` means single-node.
     pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
+    /// Always present — see the note on `ProxyContext::metrics`.
+    pub metrics: Arc<ListenerMetrics>,
+    pub backend_metrics: HashMap<BackendId, BackendMetrics>,
+}
+
+/// Decrements the active-connection gauge on drop.
+///
+/// `handle_connection` has five early-return paths; a manual decrement at
+/// each would eventually be forgotten and the gauge would drift upward
+/// forever, which is worse than no gauge at all.
+struct ConnectionGuard(IntGauge);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
 }
 
 impl<R: RateLimiter, L: LoadBalancer, C: Clock> TcpContext<R, L, C> {
@@ -69,10 +86,15 @@ where
     L: LoadBalancer,
     C: Clock,
 {
+    ctx.metrics.connections_total.inc();
+    ctx.metrics.active_connections.inc();
+    let _guard = ConnectionGuard(ctx.metrics.active_connections.clone());
+
     // At L4 the peer's IP is the only identity available — there are no
     // headers to key on, and nothing the client sends can be trusted as one.
     let key = peer.ip().to_string();
     if let Decision::Deny { .. } = ctx.rate_limiter.check(&key) {
+        ctx.metrics.ratelimit_rejected_local.inc();
         return ConnectionOutcome::RateLimited;
     }
 
@@ -80,6 +102,7 @@ where
     // the connection: local is free, this is shared state.
     if let Some(cluster) = &ctx.cluster {
         if !cluster.try_admit(&key) {
+            ctx.metrics.ratelimit_rejected_cluster.inc();
             return ConnectionOutcome::RateLimited;
         }
     }
@@ -99,6 +122,9 @@ where
 
         match tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(backend.address)).await {
             Ok(Ok(stream)) => {
+                if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
+                    bm.requests_success.inc();
+                }
                 ctx.circuit_breaker(&backend_id).record_success();
                 ctx.pool.set_circuit_open(&backend_id, false);
                 outbound = Some(stream);
@@ -108,6 +134,9 @@ where
             // backend did not answer. Retrying is safe here in a way it
             // never is at L7: not one client byte has been read yet.
             _ => {
+                if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
+                    bm.requests_failure.inc();
+                }
                 let breaker = ctx.circuit_breaker(&backend_id);
                 breaker.record_failure();
                 ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
@@ -227,6 +256,11 @@ mod tests {
             connect_timeout: Duration::from_millis(500),
             idle_timeout: Duration::from_secs(5),
             cluster: None,
+            metrics: {
+                let registry = lb_metrics::Metrics::new().expect("metrics registry");
+                Arc::new(registry.listener("test", "tcp"))
+            },
+            backend_metrics: HashMap::new(),
         })
     }
 

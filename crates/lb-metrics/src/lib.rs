@@ -4,9 +4,13 @@ mod handles;
 pub use admin::{spawn_admin_server, ReadinessCheck};
 pub use handles::{BackendMetrics, ListenerMetrics, StatusClass};
 
+/// Re-exported so consumer crates can hold metric handles without taking a
+/// direct dependency on the metrics backend.
+pub use prometheus::IntGauge;
+
 use prometheus::{
-    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry, TextEncoder,
+    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// Process-wide metric families. Per-listener and per-backend handles are
@@ -47,10 +51,7 @@ impl Metrics {
             &["listener"],
         )?;
         let active_connections = IntGaugeVec::new(
-            Opts::new(
-                "lb_active_connections",
-                "Currently open client connections",
-            ),
+            Opts::new("lb_active_connections", "Currently open client connections"),
             &["listener"],
         )?;
         let connections_total = IntCounterVec::new(
@@ -86,11 +87,8 @@ impl Metrics {
             &["listener", "backend", "outcome"],
         )?;
         let upstream_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "lb_upstream_duration_seconds",
-                "Backend response duration",
-            )
-            .buckets(latency_buckets()),
+            HistogramOpts::new("lb_upstream_duration_seconds", "Backend response duration")
+                .buckets(latency_buckets()),
             &["listener", "backend"],
         )?;
         let cluster_peer_sync = IntCounterVec::new(
@@ -152,9 +150,7 @@ impl Metrics {
             request_duration: self.request_duration.with_label_values(&[name]),
             active_connections: self.active_connections.with_label_values(&[name]),
             connections_total: self.connections_total.with_label_values(&[name]),
-            ratelimit_rejected_local: self
-                .ratelimit_rejected
-                .with_label_values(&[name, "local"]),
+            ratelimit_rejected_local: self.ratelimit_rejected.with_label_values(&[name, "local"]),
             ratelimit_rejected_cluster: self
                 .ratelimit_rejected
                 .with_label_values(&[name, "cluster"]),
@@ -269,7 +265,10 @@ mod tests {
         // malformed (a bare label brace would break scraping).
         assert!(text.contains("# HELP lb_requests_total"));
         assert!(text.contains("# TYPE lb_requests_total counter"));
-        for line in text.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        for line in text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
             assert!(
                 line.split_whitespace().count() >= 2,
                 "malformed exposition line: {line}"
@@ -300,7 +299,9 @@ mod tests {
             "le",
         ];
         for line in text.lines().filter(|l| !l.starts_with('#')) {
-            let Some(start) = line.find('{') else { continue };
+            let Some(start) = line.find('{') else {
+                continue;
+            };
             let Some(end) = line.find('}') else { continue };
             for pair in line[start + 1..end].split(',') {
                 let Some(name) = pair.split('=').next() else {
