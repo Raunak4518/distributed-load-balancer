@@ -1,0 +1,29 @@
+[server]
+listen = "0.0.0.0:8080"
+max_request_body_bytes = 1048576
+forward_timeout_ms = 5000
+
+[[backends]]
+id = "b1"
+address = "127.0.0.1:9001"
+weight = 1
+
+[[backends]]
+id = "b2"
+address = "127.0.0.1:9002"
+weight = 1
+
+[health_check]
+path = "/health"
+interval_ms = 2000
+timeout_ms = 500
+failure_threshold = 3
+cooldown_ms = 5000
+
+[rate_limit]
+key = "source_ip"
+rate_per_sec = 50
+burst = 100
+
+[load_balancing]
+strategy = "round_robin"
