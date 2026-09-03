@@ -7,3 +7,6 @@ edition.workspace = true
 test-util = []
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "1"
