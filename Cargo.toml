@@ -7,6 +7,7 @@ members = [
     "crates/lb-healthcheck",
     "crates/lb-proxy",
     "crates/lb-tcp",
+    "crates/lb-cluster",
     "crates/lb-server",
 ]
 

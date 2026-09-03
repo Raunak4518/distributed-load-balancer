@@ -1,0 +1,270 @@
+use dashmap::DashMap;
+use std::collections::HashMap;
+
+/// Per-key request counts, partitioned by the node that admitted them and
+/// bucketed by Unix epoch second.
+///
+/// This is a G-Counter CRDT. Each cell `(key, node_id, epoch_second)` has
+/// exactly one writer — the node named by `node_id` — and only ever grows.
+/// That is what makes the merge a per-cell `max`: once a second has elapsed
+/// the cell is frozen at its true value, so `max` converges to it regardless
+/// of message ordering, duplication, or delay.
+///
+/// Note the two directions carefully, because getting them the wrong way
+/// round silently breaks the limiter: counts are **summed across nodes**
+/// (consumption is additive) and **maxed within a single node's cell**
+/// (that cell has one writer).
+pub struct CounterStore {
+    window_secs: u64,
+    keys: DashMap<String, KeyCounts>,
+}
+
+#[derive(Default)]
+struct KeyCounts {
+    /// node_id -> (epoch_second -> count)
+    per_node: HashMap<String, HashMap<u64, u64>>,
+}
+
+impl KeyCounts {
+    fn total_in_window(&self, now_secs: u64, window_secs: u64) -> u64 {
+        let cutoff = now_secs.saturating_sub(window_secs.saturating_sub(1));
+        self.per_node
+            .values()
+            .flat_map(|buckets| buckets.iter())
+            .filter(|(epoch, _)| **epoch >= cutoff && **epoch <= now_secs)
+            .map(|(_, count)| *count)
+            .sum()
+    }
+
+    fn prune(&mut self, now_secs: u64, window_secs: u64) {
+        let cutoff = now_secs.saturating_sub(window_secs.saturating_sub(1));
+        for buckets in self.per_node.values_mut() {
+            buckets.retain(|epoch, _| *epoch >= cutoff);
+        }
+        self.per_node.retain(|_, buckets| !buckets.is_empty());
+    }
+}
+
+impl CounterStore {
+    pub fn new(window_secs: u64) -> Self {
+        CounterStore {
+            window_secs: window_secs.max(1),
+            keys: DashMap::new(),
+        }
+    }
+
+    /// Atomically decides whether this request fits the cluster budget and,
+    /// if so, records it against `node_id`'s current bucket.
+    ///
+    /// The sum and the increment happen under one entry lock, so a single
+    /// node never over-admits against its own view. The only slack in the
+    /// system is cross-node propagation delay.
+    pub fn try_admit(&self, key: &str, node_id: &str, now_secs: u64, limit: u64) -> bool {
+        let mut entry = self.keys.entry(key.to_string()).or_default();
+        if entry.total_in_window(now_secs, self.window_secs) >= limit {
+            return false;
+        }
+        *entry
+            .per_node
+            .entry(node_id.to_string())
+            .or_default()
+            .entry(now_secs)
+            .or_insert(0) += 1;
+        true
+    }
+
+    pub fn total_in_window(&self, key: &str, now_secs: u64) -> u64 {
+        self.keys
+            .get(key)
+            .map(|k| k.total_in_window(now_secs, self.window_secs))
+            .unwrap_or(0)
+    }
+
+    /// Merges a peer's view of its own cells. Per-cell `max`, never sum:
+    /// re-receiving the same update must not inflate the count.
+    pub fn merge(&self, key: &str, node_id: &str, buckets: &[(u64, u64)]) {
+        let mut entry = self.keys.entry(key.to_string()).or_default();
+        let node_buckets = entry.per_node.entry(node_id.to_string()).or_default();
+        for (epoch, count) in buckets {
+            let slot = node_buckets.entry(*epoch).or_insert(0);
+            *slot = (*slot).max(*count);
+        }
+    }
+
+    /// Our own in-window cells, for pushing to peers. A node is only
+    /// authoritative for its own counts and never relays anyone else's.
+    pub fn snapshot_own(&self, node_id: &str, now_secs: u64) -> Vec<(String, Vec<(u64, u64)>)> {
+        let cutoff = now_secs.saturating_sub(self.window_secs.saturating_sub(1));
+        let mut out = Vec::new();
+        for item in self.keys.iter() {
+            let Some(buckets) = item.value().per_node.get(node_id) else {
+                continue;
+            };
+            let in_window: Vec<(u64, u64)> = buckets
+                .iter()
+                .filter(|(epoch, _)| **epoch >= cutoff)
+                .map(|(epoch, count)| (*epoch, *count))
+                .collect();
+            if !in_window.is_empty() {
+                out.push((item.key().clone(), in_window));
+            }
+        }
+        out
+    }
+
+    pub fn prune(&self, now_secs: u64) {
+        let window = self.window_secs;
+        self.keys.retain(|_, counts| {
+            counts.prune(now_secs, window);
+            !counts.per_node.is_empty()
+        });
+    }
+
+    #[cfg(test)]
+    fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_700_000_000;
+
+    #[test]
+    fn admits_until_the_limit_then_refuses() {
+        let store = CounterStore::new(10);
+        for _ in 0..3 {
+            assert!(store.try_admit("k", "n1", NOW, 3));
+        }
+        assert!(!store.try_admit("k", "n1", NOW, 3));
+        assert_eq!(store.total_in_window("k", NOW), 3);
+    }
+
+    #[test]
+    fn a_refused_request_is_not_counted() {
+        let store = CounterStore::new(10);
+        assert!(store.try_admit("k", "n1", NOW, 1));
+        assert!(!store.try_admit("k", "n1", NOW, 1));
+        assert!(!store.try_admit("k", "n1", NOW, 1));
+        // Still 1: refusals must not inflate the count, or a blocked client
+        // would push its own window out forever.
+        assert_eq!(store.total_in_window("k", NOW), 1);
+    }
+
+    #[test]
+    fn counts_from_different_nodes_are_summed() {
+        let store = CounterStore::new(10);
+        store.merge("k", "n1", &[(NOW, 4)]);
+        store.merge("k", "n2", &[(NOW, 6)]);
+        // Additive across nodes — this is the property Trap 1 in the spec
+        // gets wrong by using max.
+        assert_eq!(store.total_in_window("k", NOW), 10);
+    }
+
+    #[test]
+    fn one_nodes_counts_reduce_anothers_budget() {
+        let store = CounterStore::new(10);
+        store.merge("k", "peer", &[(NOW, 9)]);
+        assert!(store.try_admit("k", "me", NOW, 10)); // 10th request
+        assert!(!store.try_admit("k", "me", NOW, 10)); // budget exhausted by peer
+    }
+
+    #[test]
+    fn keys_are_independent() {
+        let store = CounterStore::new(10);
+        assert!(store.try_admit("a", "n1", NOW, 1));
+        assert!(store.try_admit("b", "n1", NOW, 1));
+        assert!(!store.try_admit("a", "n1", NOW, 1));
+    }
+
+    #[test]
+    fn counts_outside_the_window_are_excluded() {
+        let store = CounterStore::new(10);
+        store.merge("k", "n1", &[(NOW - 20, 100)]); // long past
+        store.merge("k", "n1", &[(NOW, 2)]);
+        assert_eq!(store.total_in_window("k", NOW), 2);
+    }
+
+    #[test]
+    fn window_edge_is_inclusive_at_both_ends() {
+        let store = CounterStore::new(10);
+        // A 10s window covers [NOW-9, NOW].
+        store.merge("k", "n1", &[(NOW - 9, 1), (NOW - 10, 1), (NOW, 1)]);
+        assert_eq!(store.total_in_window("k", NOW), 2);
+    }
+
+    #[test]
+    fn merge_is_idempotent() {
+        let store = CounterStore::new(10);
+        store.merge("k", "n1", &[(NOW, 5)]);
+        store.merge("k", "n1", &[(NOW, 5)]);
+        store.merge("k", "n1", &[(NOW, 5)]);
+        // A duplicated message must not inflate anything — this is why the
+        // merge is max and not +=.
+        assert_eq!(store.total_in_window("k", NOW), 5);
+    }
+
+    #[test]
+    fn merge_is_commutative() {
+        let a = CounterStore::new(10);
+        a.merge("k", "n1", &[(NOW, 3)]);
+        a.merge("k", "n2", &[(NOW, 7)]);
+
+        let b = CounterStore::new(10);
+        b.merge("k", "n2", &[(NOW, 7)]);
+        b.merge("k", "n1", &[(NOW, 3)]);
+
+        assert_eq!(a.total_in_window("k", NOW), b.total_in_window("k", NOW));
+    }
+
+    #[test]
+    fn merge_is_associative_and_order_independent_for_one_node() {
+        // Out-of-order delivery of the same node's successive counts must
+        // converge to the highest, not the last-received.
+        let a = CounterStore::new(10);
+        a.merge("k", "n1", &[(NOW, 2)]);
+        a.merge("k", "n1", &[(NOW, 9)]);
+        a.merge("k", "n1", &[(NOW, 5)]); // stale message arriving late
+
+        assert_eq!(a.total_in_window("k", NOW), 9);
+    }
+
+    #[test]
+    fn snapshot_returns_only_our_own_in_window_cells() {
+        let store = CounterStore::new(10);
+        store.merge("k", "me", &[(NOW, 2), (NOW - 50, 99)]);
+        store.merge("k", "other", &[(NOW, 7)]);
+
+        let snap = store.snapshot_own("me", NOW);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, "k");
+        assert_eq!(snap[0].1, vec![(NOW, 2)]);
+    }
+
+    #[test]
+    fn prune_drops_out_of_window_cells_and_empty_keys() {
+        let store = CounterStore::new(10);
+        store.merge("stale", "n1", &[(NOW - 100, 5)]);
+        store.merge("fresh", "n1", &[(NOW, 5)]);
+        assert_eq!(store.key_count(), 2);
+
+        store.prune(NOW);
+
+        assert_eq!(store.key_count(), 1);
+        assert_eq!(store.total_in_window("fresh", NOW), 5);
+        assert_eq!(store.total_in_window("stale", NOW), 0);
+    }
+
+    #[test]
+    fn counts_age_out_as_time_advances() {
+        let store = CounterStore::new(10);
+        assert!(store.try_admit("k", "n1", NOW, 1));
+        assert!(!store.try_admit("k", "n1", NOW, 1));
+        // Ten seconds later the old bucket has left the window, so the
+        // budget is available again. This is also why a dead peer needs no
+        // explicit expiry: its counts simply age out.
+        assert!(store.try_admit("k", "n1", NOW + 10, 1));
+    }
+}

@@ -630,6 +630,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-cluster"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "lb-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lb-core"
 version = "0.1.0"
 dependencies = [
