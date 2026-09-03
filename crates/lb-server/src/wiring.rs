@@ -1,4 +1,6 @@
 use lb_balancer::RoundRobin;
+use lb_cluster::{ClusterNode, ListenerCoordinator};
+use lb_core::ClusterCoordinator;
 use lb_core::{Backend, BackendPool, Config, ListenerConfig, Protocol, SystemClock};
 use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
@@ -13,6 +15,7 @@ use std::time::Duration;
 
 pub type HttpContext = ProxyContext<Gcra<SystemClock>, RoundRobin, SystemClock>;
 pub type TcpAppContext = TcpContext<Gcra<SystemClock>, RoundRobin, SystemClock>;
+pub type AppClusterNode = ClusterNode<SystemClock>;
 
 /// One configured listener, ready to accept. An enum rather than a trait:
 /// this is a genuinely closed set, and `serve_listener` must match on it
@@ -55,11 +58,31 @@ pub struct WiredApp {
     pub listeners: Vec<ListenerRuntime>,
     pub background_tasks: Vec<tokio::task::JoinHandle<()>>,
     pub drain_timeout: Duration,
+    /// Present only when `[cluster]` is configured.
+    pub cluster: Option<ClusterSetup>,
+}
+
+/// Everything `run` needs to start peer coordination, kept separate from the
+/// per-listener wiring so binding can happen alongside the traffic listeners.
+pub struct ClusterSetup {
+    pub node: Arc<AppClusterNode>,
+    pub listen: SocketAddr,
+    pub peers: Vec<SocketAddr>,
+    pub sync_interval: Duration,
 }
 
 pub fn build_app(config: &Config) -> WiredApp {
     let mut listeners = Vec::with_capacity(config.listeners.len());
     let mut background_tasks = Vec::new();
+
+    // One cluster node per process, shared by every listener.
+    let cluster_node = config.cluster.as_ref().map(|c| {
+        Arc::new(ClusterNode::new(
+            c.node_id.clone(),
+            c.window_secs,
+            SystemClock,
+        ))
+    });
 
     for lc in &config.listeners {
         let backends: Vec<Backend> = lc
@@ -96,6 +119,21 @@ pub fn build_app(config: &Config) -> WiredApp {
 
         spawn_health_checkers(lc, &backends, &pool, &mut background_tasks);
 
+        // The global cap is the sustained rate over the whole window; the
+        // local GCRA continues to shape bursts inside it.
+        let cluster_coordinator: Option<Arc<dyn ClusterCoordinator>> =
+            match (&cluster_node, &config.cluster) {
+                (Some(node), Some(cc)) => {
+                    let limit = (lc.rate_limit.rate_per_sec * cc.window_secs as f64).ceil() as u64;
+                    Some(Arc::new(ListenerCoordinator::new(
+                        Arc::clone(node),
+                        lc.name.clone(),
+                        limit.max(1),
+                    )))
+                }
+                _ => None,
+            };
+
         listeners.push(match lc.protocol {
             Protocol::Http => ListenerRuntime::Http {
                 name: lc.name.clone(),
@@ -109,6 +147,7 @@ pub fn build_app(config: &Config) -> WiredApp {
                     rate_limit_key: lc.rate_limit.key.clone(),
                     forward_timeout: lc.forward_timeout(),
                     max_request_body_bytes: lc.max_request_body_bytes(),
+                    cluster: cluster_coordinator,
                 }),
             },
             Protocol::Tcp => ListenerRuntime::Tcp {
@@ -121,15 +160,27 @@ pub fn build_app(config: &Config) -> WiredApp {
                     circuit_breakers,
                     connect_timeout: lc.connect_timeout(),
                     idle_timeout: lc.idle_timeout(),
+                    cluster: cluster_coordinator,
                 }),
             },
         });
     }
 
+    let cluster = match (cluster_node, config.cluster.as_ref()) {
+        (Some(node), Some(cc)) => Some(ClusterSetup {
+            node,
+            listen: cc.listen,
+            peers: cc.peers.clone(),
+            sync_interval: cc.sync_interval(),
+        }),
+        _ => None,
+    };
+
     WiredApp {
         listeners,
         background_tasks,
         drain_timeout: Duration::from_millis(config.server.drain_timeout_ms),
+        cluster,
     }
 }
 

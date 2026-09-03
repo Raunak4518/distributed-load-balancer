@@ -10,6 +10,36 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     pub listeners: Vec<ListenerConfig>,
+    /// Absent means single-node: no peer listener, no coordination, and
+    /// behaviour identical to Phases 1-2.
+    #[serde(default)]
+    pub cluster: Option<ClusterConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    pub node_id: String,
+    pub listen: SocketAddr,
+    #[serde(default)]
+    pub peers: Vec<SocketAddr>,
+    #[serde(default = "default_sync_interval_ms")]
+    pub sync_interval_ms: u64,
+    #[serde(default = "default_window_secs")]
+    pub window_secs: u64,
+}
+
+fn default_sync_interval_ms() -> u64 {
+    200
+}
+
+fn default_window_secs() -> u64 {
+    10
+}
+
+impl ClusterConfig {
+    pub fn sync_interval(&self) -> Duration {
+        Duration::from_millis(self.sync_interval_ms)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -179,6 +209,36 @@ impl Config {
                 )));
             }
             l.validate()?;
+        }
+
+        if let Some(cluster) = &self.cluster {
+            if cluster.node_id.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "cluster.node_id must not be empty".into(),
+                ));
+            }
+            if cluster.sync_interval_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "cluster.sync_interval_ms must be positive".into(),
+                ));
+            }
+            if cluster.window_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "cluster.window_secs must be positive".into(),
+                ));
+            }
+            if cluster.peers.contains(&cluster.listen) {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.peers contains this node's own listen address {} — peers must list only the other nodes",
+                    cluster.listen
+                )));
+            }
+            if let Some(clash) = self.listeners.iter().find(|l| l.listen == cluster.listen) {
+                return Err(ConfigError::Invalid(format!(
+                    "cluster.listen {} is already used by listener '{}'",
+                    cluster.listen, clash.name
+                )));
+            }
         }
         Ok(())
     }
@@ -377,6 +437,46 @@ mod tests {
     #[test]
     fn rejects_non_positive_rate() {
         let text = VALID.replace("rate_per_sec = 50", "rate_per_sec = 0");
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    const CLUSTER: &str = r#"
+        [cluster]
+        node_id = "lb-1"
+        listen = "127.0.0.1:7946"
+        peers = ["127.0.0.1:7947"]
+    "#;
+
+    #[test]
+    fn parses_cluster_section_with_defaults() {
+        let text = format!("{CLUSTER}{VALID}");
+        let cfg = Config::parse(&text).unwrap();
+        let cluster = cfg.cluster.expect("cluster section should parse");
+        assert_eq!(cluster.node_id, "lb-1");
+        assert_eq!(cluster.sync_interval_ms, 200);
+        assert_eq!(cluster.window_secs, 10);
+    }
+
+    #[test]
+    fn cluster_is_optional() {
+        assert!(Config::parse(VALID).unwrap().cluster.is_none());
+    }
+
+    #[test]
+    fn rejects_peers_containing_our_own_listen_address() {
+        let text = format!("{}{VALID}", CLUSTER.replace("7947", "7946"));
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_cluster_listen_clashing_with_a_traffic_listener() {
+        let text = format!("{}{VALID}", CLUSTER.replace("127.0.0.1:7946", "0.0.0.0:8080"));
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_empty_node_id() {
+        let text = format!("{}{VALID}", CLUSTER.replace(r#""lb-1""#, r#""""#));
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
     }
 

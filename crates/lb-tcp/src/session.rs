@@ -14,6 +14,8 @@ pub struct TcpContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
+    /// Present only when `[cluster]` is configured; `None` means single-node.
+    pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
 }
 
 impl<R: RateLimiter, L: LoadBalancer, C: Clock> TcpContext<R, L, C> {
@@ -72,6 +74,14 @@ where
     let key = peer.ip().to_string();
     if let Decision::Deny { .. } = ctx.rate_limiter.check(&key) {
         return ConnectionOutcome::RateLimited;
+    }
+
+    // The cluster budget is consulted only after the local limiter allowed
+    // the connection: local is free, this is shared state.
+    if let Some(cluster) = &ctx.cluster {
+        if !cluster.try_admit(&key) {
+            return ConnectionOutcome::RateLimited;
+        }
     }
 
     ctx.refresh_circuit_state();
@@ -216,6 +226,7 @@ mod tests {
             circuit_breakers,
             connect_timeout: Duration::from_millis(500),
             idle_timeout: Duration::from_secs(5),
+            cluster: None,
         })
     }
 

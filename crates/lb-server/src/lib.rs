@@ -1,7 +1,9 @@
 mod shutdown;
 mod wiring;
 
-pub use wiring::{build_app, HttpContext, ListenerRuntime, TcpAppContext, WiredApp};
+pub use wiring::{
+    build_app, AppClusterNode, ClusterSetup, HttpContext, ListenerRuntime, TcpAppContext, WiredApp,
+};
 
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -19,6 +21,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         listeners,
         background_tasks,
         drain_timeout,
+        cluster,
     } = build_app(&config);
 
     // Bind every listener before serving any of them, so a port conflict or
@@ -47,6 +50,37 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         bound.push((listener, runtime));
     }
 
+    // Bound here alongside the traffic listeners so a port clash fails
+    // startup, rather than surfacing once we are already serving.
+    let mut cluster_tasks = Vec::new();
+    if let Some(setup) = cluster {
+        let peer_listener = TcpListener::bind(setup.listen).await.map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!(
+                    "cluster peer listener could not bind {}: {err}",
+                    setup.listen
+                ),
+            )
+        })?;
+        eprintln!(
+            "cluster node '{}' peer listener on {} ({} peer(s))",
+            setup.node.node_id(),
+            peer_listener.local_addr()?,
+            setup.peers.len()
+        );
+        cluster_tasks.push(lb_cluster::spawn_peer_listener(
+            Arc::clone(&setup.node),
+            peer_listener,
+        ));
+        cluster_tasks.push(lb_cluster::spawn_sync_loop(
+            Arc::clone(&setup.node),
+            setup.peers.clone(),
+            setup.sync_interval,
+            Duration::from_secs(2),
+        ));
+    }
+
     // One shutdown signal fans out to every accept loop.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -67,7 +101,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     for task in listener_tasks {
         let _ = task.await;
     }
-    for task in background_tasks {
+    for task in background_tasks.into_iter().chain(cluster_tasks) {
         task.abort();
     }
     Ok(())

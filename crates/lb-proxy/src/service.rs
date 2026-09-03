@@ -26,6 +26,8 @@ pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     pub rate_limit_key: RateLimitKeySource,
     pub forward_timeout: Duration,
     pub max_request_body_bytes: usize,
+    /// Present only when `[cluster]` is configured; `None` means single-node.
+    pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
 }
 
 impl<R: RateLimiter, L: LoadBalancer, C: Clock> ProxyContext<R, L, C> {
@@ -125,6 +127,17 @@ where
             resp.headers_mut().insert(header::RETRY_AFTER, value);
         }
         return Ok(resp);
+    }
+
+    // The cluster budget is consulted only after the local limiter allowed
+    // the request: local is free, this is shared state.
+    if let Some(cluster) = &ctx.cluster {
+        if !cluster.try_admit(&key) {
+            return Ok(simple_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded",
+            ));
+        }
     }
 
     // CircuitBreaker's Open -> HalfOpen transition is evaluated lazily inside
@@ -323,6 +336,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
+            cluster: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -339,6 +353,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
+            cluster: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -364,6 +379,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
+            cluster: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -390,6 +406,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
+            cluster: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -424,6 +441,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
+            cluster: None,
         });
 
         // "dead" sorts first in pool order, so PreferFirstEligible tries it,
