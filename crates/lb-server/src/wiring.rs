@@ -148,11 +148,10 @@ fn spawn_health_checkers(
         let config = ActiveCheckConfig { interval };
         match lc.protocol {
             Protocol::Http => {
-                let path = lc
-                    .health_check
-                    .path
-                    .clone()
-                    .expect("config validation guarantees http listeners have a health_check.path");
+                let path =
+                    lc.health_check.path.clone().expect(
+                        "config validation guarantees http listeners have a health_check.path",
+                    );
                 tasks.push(spawn_active_checker(
                     b.clone(),
                     pool.clone(),

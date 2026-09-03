@@ -1,29 +1,62 @@
 [server]
-listen = "0.0.0.0:8080"
+drain_timeout_ms = 10000
+
+# ── HTTP (L7) listener ────────────────────────────────────────────────
+[[listeners]]
+name     = "web"
+protocol = "http"
+listen   = "0.0.0.0:8080"
+forward_timeout_ms     = 5000
 max_request_body_bytes = 1048576
-forward_timeout_ms = 5000
 
-[[backends]]
-id = "b1"
-address = "127.0.0.1:9001"
-weight = 1
+  [[listeners.backends]]
+  id = "web1"
+  address = "127.0.0.1:9001"
+  weight  = 1
 
-[[backends]]
-id = "b2"
-address = "127.0.0.1:9002"
-weight = 1
+  [[listeners.backends]]
+  id = "web2"
+  address = "127.0.0.1:9002"
+  weight  = 1
 
-[health_check]
-path = "/health"
-interval_ms = 2000
-timeout_ms = 500
-failure_threshold = 3
-cooldown_ms = 5000
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 2000
+  timeout_ms = 500
+  failure_threshold = 3
+  cooldown_ms = 5000
 
-[rate_limit]
-key = "source_ip"
-rate_per_sec = 50
-burst = 100
+  [listeners.rate_limit]
+  key = "source_ip"          # or "header:X-API-Key"
+  rate_per_sec = 50
+  burst = 100
 
-[load_balancing]
-strategy = "round_robin"
+  [listeners.load_balancing]
+  strategy = "round_robin"
+
+# ── TCP (L4) listener ─────────────────────────────────────────────────
+[[listeners]]
+name     = "postgres"
+protocol = "tcp"
+listen   = "0.0.0.0:5432"
+connect_timeout_ms = 2000
+idle_timeout_ms    = 300000
+
+  [[listeners.backends]]
+  id = "pg1"
+  address = "10.0.0.5:5432"
+
+  [listeners.health_check]
+  # no `path` — a TCP backend is probed by connecting, not by GET
+  interval_ms = 2000
+  timeout_ms = 500
+  failure_threshold = 3
+  cooldown_ms = 5000
+
+  [listeners.rate_limit]
+  key = "source_ip"          # the only valid key at L4 — there are no headers
+  rate_per_sec = 10
+  burst = 20
+
+  [listeners.load_balancing]
+  strategy = "round_robin"

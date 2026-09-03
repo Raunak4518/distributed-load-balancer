@@ -25,7 +25,18 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     // permission error fails startup outright instead of half-starting.
     let mut bound = Vec::with_capacity(listeners.len());
     for runtime in listeners {
-        let listener = TcpListener::bind(runtime.listen()).await?;
+        // Name the listener in the error: a bare "address in use" gives an
+        // operator no clue which of several listeners is the problem.
+        let listener = TcpListener::bind(runtime.listen()).await.map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!(
+                    "listener '{}' could not bind {}: {err}",
+                    runtime.name(),
+                    runtime.listen()
+                ),
+            )
+        })?;
         let actual = listener.local_addr()?;
         eprintln!(
             "listener '{}' ({}) on {}",

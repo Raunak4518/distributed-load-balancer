@@ -9,7 +9,6 @@ pub mod ratelimit;
 
 pub use backend::{Backend, BackendId};
 pub use balancer::LoadBalancer;
-pub use health::HealthProbe;
 #[cfg(feature = "test-util")]
 pub use clock::test_util;
 pub use clock::{Clock, SystemClock};
@@ -18,5 +17,6 @@ pub use config::{
     LoadBalancingStrategy, Protocol, RateLimitConfig, RateLimitKeySource, ServerConfig,
 };
 pub use error::ConfigError;
+pub use health::HealthProbe;
 pub use pool::BackendPool;
 pub use ratelimit::{Decision, RateLimiter};

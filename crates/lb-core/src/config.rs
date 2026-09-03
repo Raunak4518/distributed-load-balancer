@@ -186,7 +186,8 @@ impl Config {
 
 impl ListenerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        let invalid = |msg: String| ConfigError::Invalid(format!("listener '{}': {msg}", self.name));
+        let invalid =
+            |msg: String| ConfigError::Invalid(format!("listener '{}': {msg}", self.name));
 
         if self.backends.is_empty() {
             return Err(invalid("at least one backend is required".into()));
@@ -221,7 +222,8 @@ impl ListenerConfig {
             Protocol::Tcp => {
                 if self.health_check.path.is_some() {
                     return Err(invalid(
-                        "health_check.path is http-only — a tcp backend has no path to probe".into(),
+                        "health_check.path is http-only — a tcp backend has no path to probe"
+                            .into(),
                     ));
                 }
                 if self.forward_timeout_ms.is_some() || self.max_request_body_bytes.is_some() {
