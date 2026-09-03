@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/lb-core",
     "crates/lb-ratelimit",
+    "crates/lb-balancer",
 ]
 
 [workspace.package]

@@ -63,6 +63,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-balancer"
+version = "0.1.0"
+dependencies = [
+ "lb-core",
+]
+
+[[package]]
 name = "lb-core"
 version = "0.1.0"
 dependencies = [
