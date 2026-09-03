@@ -15,8 +15,9 @@ pub use clock::test_util;
 pub use clock::{Clock, SystemClock};
 pub use cluster::ClusterCoordinator;
 pub use config::{
-    BackendConfig, ClusterConfig, Config, HealthCheckConfig, ListenerConfig, LoadBalancingConfig,
-    LoadBalancingStrategy, Protocol, RateLimitConfig, RateLimitKeySource, ServerConfig,
+    AdminConfig, BackendConfig, ClusterConfig, Config, HealthCheckConfig, ListenerConfig,
+    LoadBalancingConfig, LoadBalancingStrategy, LogFormat, LoggingConfig, Protocol, RateLimitConfig,
+    RateLimitKeySource, ServerConfig,
 };
 pub use error::ConfigError;
 pub use health::HealthProbe;

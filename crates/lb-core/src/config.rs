@@ -14,6 +14,52 @@ pub struct Config {
     /// behaviour identical to Phases 1-2.
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+    /// Absent disables metrics and health endpoints entirely.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdminConfig {
+    /// Bind privately. This surface exposes internal topology (backend names,
+    /// health, traffic volumes) and must never face the public internet.
+    pub listen: SocketAddr,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    #[serde(default)]
+    pub format: LogFormat,
+    /// Off by default: at 50k req/s, one line per request is ~50,000 lines a
+    /// second. Turning this on is a capacity decision, not a preference.
+    #[serde(default)]
+    pub log_requests: bool,
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        LoggingConfig {
+            format: LogFormat::default(),
+            log_requests: false,
+            sample_rate: default_sample_rate(),
+        }
+    }
+}
+
+fn default_sample_rate() -> f64 {
+    0.01
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    #[default]
+    Json,
+    Pretty,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -239,6 +285,29 @@ impl Config {
                     cluster.listen, clash.name
                 )));
             }
+        }
+
+        if let Some(admin) = &self.admin {
+            if let Some(clash) = self.listeners.iter().find(|l| l.listen == admin.listen) {
+                return Err(ConfigError::Invalid(format!(
+                    "admin.listen {} is already used by listener '{}'",
+                    admin.listen, clash.name
+                )));
+            }
+            if let Some(cluster) = &self.cluster {
+                if cluster.listen == admin.listen {
+                    return Err(ConfigError::Invalid(format!(
+                        "admin.listen {} is already used by cluster.listen",
+                        admin.listen
+                    )));
+                }
+            }
+        }
+
+        if !(0.0..=1.0).contains(&self.logging.sample_rate) {
+            return Err(ConfigError::Invalid(
+                "logging.sample_rate must be between 0.0 and 1.0".into(),
+            ));
         }
         Ok(())
     }
@@ -480,6 +549,38 @@ mod tests {
     #[test]
     fn rejects_empty_node_id() {
         let text = format!("{}{VALID}", CLUSTER.replace(r#""lb-1""#, r#""""#));
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn admin_and_logging_are_optional_with_defaults() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert!(cfg.admin.is_none());
+        assert!(!cfg.logging.log_requests);
+        assert_eq!(cfg.logging.format, LogFormat::Json);
+    }
+
+    #[test]
+    fn parses_admin_and_logging_sections() {
+        let text = format!(
+            "[admin]\nlisten = \"127.0.0.1:9090\"\n\n[logging]\nformat = \"pretty\"\nlog_requests = true\nsample_rate = 0.5\n\n{VALID}"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.admin.unwrap().listen.port(), 9090);
+        assert_eq!(cfg.logging.format, LogFormat::Pretty);
+        assert!(cfg.logging.log_requests);
+        assert_eq!(cfg.logging.sample_rate, 0.5);
+    }
+
+    #[test]
+    fn rejects_admin_listen_clashing_with_a_traffic_listener() {
+        let text = format!("[admin]\nlisten = \"0.0.0.0:8080\"\n\n{VALID}");
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_out_of_range_sample_rate() {
+        let text = format!("[logging]\nsample_rate = 1.5\n\n{VALID}");
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
     }
 
