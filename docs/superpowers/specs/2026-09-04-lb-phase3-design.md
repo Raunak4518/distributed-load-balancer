@@ -48,6 +48,14 @@ counts[key][node_id][epoch_second] = u64
 
 Note the contrast with Trap 1: we sum *across* nodes (consumption is additive) and take max *within* a single node's cell (that cell has one writer). Getting those two operations the right way round is the whole design.
 
+### 3.2.1 This requires wall-clock time, and that is an assumption
+
+Buckets are keyed by **Unix epoch second**, not by a monotonic instant. That is forced: bucket boundaries have to line up *across machines*, and a monotonic clock's origin is per-process, so it cannot express a shared boundary.
+
+The assumption this creates: nodes need roughly-agreeing wall clocks (i.e. NTP, which any serious deployment already runs). The failure mode is graceful rather than sharp — skew of a second or two simply lands a node's contributions in neighbouring buckets, and since the window sums ten of them, the total barely moves. Large skew degrades accuracy but never breaks convergence or safety, because the merge is still a per-cell `max` over cells that only ever grow.
+
+Concretely this means `lb-core`'s `Clock` trait gains a `unix_secs()` method alongside `now()`. The distinction is deliberate and worth keeping straight: `now()` (monotonic) is what GCRA and the circuit breaker need, because they measure *elapsed* time and must be immune to clock jumps; `unix_secs()` is what bucket alignment needs, because it must be *shared*. Using either one for the other's job would be a bug.
+
 ### 3.3 Why staleness handles itself
 
 A dead or partitioned peer stops sending updates. Its buckets then age out of the sliding window within `window_secs`, after which they contribute zero — which is correct, because a node that is down is not admitting traffic either. No explicit peer-expiry policy, no tombstones, no failure detector needed for correctness. `last_seen` is tracked only for operator visibility.
