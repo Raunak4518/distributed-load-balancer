@@ -1,0 +1,20 @@
+[package]
+name = "lb-tcp"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lb-core = { path = "../lb-core" }
+lb-healthcheck = { path = "../lb-healthcheck" }
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+
+[dev-dependencies]
+lb-core = { path = "../lb-core", features = ["test-util"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "test-util",
+] }
