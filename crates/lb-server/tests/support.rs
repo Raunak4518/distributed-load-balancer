@@ -190,3 +190,53 @@ idle_timeout_ms = 5000
 "#
     )
 }
+
+/// One HTTP listener plus a `[cluster]` section, for multi-node tests.
+#[allow(clippy::too_many_arguments)]
+pub fn cluster_config_toml(
+    node_id: &str,
+    cluster_listen: SocketAddr,
+    peers: &[SocketAddr],
+    traffic_listen: SocketAddr,
+    backend: SocketAddr,
+    rate_per_sec: f64,
+    burst: u32,
+    window_secs: u64,
+) -> String {
+    let peer_list: Vec<String> = peers.iter().map(|p| format!("\"{p}\"")).collect();
+    format!(
+        r#"
+[cluster]
+node_id = "{node_id}"
+listen = "{cluster_listen}"
+peers = [{peers}]
+sync_interval_ms = 50
+window_secs = {window_secs}
+
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{traffic_listen}"
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = {rate_per_sec}
+  burst = {burst}
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#,
+        peers = peer_list.join(", ")
+    )
+}

@@ -470,7 +470,10 @@ mod tests {
 
     #[test]
     fn rejects_cluster_listen_clashing_with_a_traffic_listener() {
-        let text = format!("{}{VALID}", CLUSTER.replace("127.0.0.1:7946", "0.0.0.0:8080"));
+        let text = format!(
+            "{}{VALID}",
+            CLUSTER.replace("127.0.0.1:7946", "0.0.0.0:8080")
+        );
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
     }
 

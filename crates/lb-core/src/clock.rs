@@ -78,7 +78,10 @@ pub mod test_util {
 
     impl Clock for FakeClock {
         fn now(&self) -> Instant {
-            self.state.lock().expect("fake clock mutex poisoned").instant
+            self.state
+                .lock()
+                .expect("fake clock mutex poisoned")
+                .instant
         }
 
         fn unix_secs(&self) -> u64 {

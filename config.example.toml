@@ -1,3 +1,15 @@
+# ── Cluster coordination (optional) ───────────────────────────────────
+# Omit this whole section to run as a single node.
+# Enforces the rate limit ACROSS nodes: without it, N nodes each admit
+# `rate_per_sec`, so the effective global limit is N x what you configured.
+# The peer port is UNAUTHENTICATED — bind it to a private interface.
+# [cluster]
+# node_id          = "lb-1"                  # must be unique per node
+# listen           = "127.0.0.1:7946"        # peer sync port
+# peers            = ["127.0.0.1:7947"]      # the OTHER nodes
+# sync_interval_ms = 200
+# window_secs      = 10
+
 [server]
 drain_timeout_ms = 10000
 

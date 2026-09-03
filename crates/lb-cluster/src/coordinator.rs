@@ -158,7 +158,10 @@ mod tests {
         // After sync, a fresh node sees A's counts and refuses.
         let b2 = node("b2", clock.clone());
         let coord_b2 = ListenerCoordinator::new(b2.clone(), "web", 4);
-        assert_eq!(b2.merge_message(&a.snapshot_message()), MergeOutcome::Merged);
+        assert_eq!(
+            b2.merge_message(&a.snapshot_message()),
+            MergeOutcome::Merged
+        );
         assert!(!coord_b2.try_admit("1.2.3.4"));
     }
 

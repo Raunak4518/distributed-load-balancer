@@ -190,7 +190,11 @@ mod tests {
         let mut converged = false;
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if receiver.store().total_in_window("web\u{1}k", clock.unix_secs()) == 1 {
+            if receiver
+                .store()
+                .total_in_window("web\u{1}k", clock.unix_secs())
+                == 1
+            {
                 converged = true;
                 break;
             }
@@ -208,7 +212,9 @@ mod tests {
         // Send junk that is not a valid frame.
         {
             let mut junk = TcpStream::connect(addr).await.unwrap();
-            junk.write_all(b"absolutely not a valid frame").await.unwrap();
+            junk.write_all(b"absolutely not a valid frame")
+                .await
+                .unwrap();
             junk.shutdown().await.unwrap();
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -227,11 +233,18 @@ mod tests {
         let mut converged = false;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if receiver.store().total_in_window("web\u{1}k", clock.unix_secs()) == 1 {
+            if receiver
+                .store()
+                .total_in_window("web\u{1}k", clock.unix_secs())
+                == 1
+            {
                 converged = true;
                 break;
             }
         }
-        assert!(converged, "listener stopped working after a malformed frame");
+        assert!(
+            converged,
+            "listener stopped working after a malformed frame"
+        );
     }
 }
