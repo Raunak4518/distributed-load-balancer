@@ -3,11 +3,13 @@ pub mod balancer;
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod health;
 pub mod pool;
 pub mod ratelimit;
 
 pub use backend::{Backend, BackendId};
 pub use balancer::LoadBalancer;
+pub use health::HealthProbe;
 #[cfg(feature = "test-util")]
 pub use clock::test_util;
 pub use clock::{Clock, SystemClock};

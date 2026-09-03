@@ -1,29 +1,29 @@
-use lb_core::{Backend, BackendPool};
+use lb_core::{Backend, BackendPool, HealthProbe};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
 
 pub struct ActiveCheckConfig {
-    pub path: String,
     pub interval: Duration,
-    pub timeout: Duration,
 }
 
-pub fn spawn_active_checker(
+/// Polls one backend on an interval and publishes the result into the pool's
+/// "administratively healthy" flag. What counts as healthy is entirely the
+/// probe's business — this loop only schedules it.
+pub fn spawn_active_checker<P>(
     backend: Backend,
     pool: Arc<BackendPool>,
     config: ActiveCheckConfig,
-    client: reqwest::Client,
-) -> tokio::task::JoinHandle<()> {
+    probe: P,
+) -> tokio::task::JoinHandle<()>
+where
+    P: HealthProbe + 'static,
+{
     tokio::spawn(async move {
-        let url = format!("http://{}{}", backend.address, config.path);
         let mut ticker = time::interval(config.interval);
         loop {
             ticker.tick().await;
-            let healthy = match time::timeout(config.timeout, client.get(&url).send()).await {
-                Ok(Ok(resp)) => resp.status().is_success(),
-                _ => false,
-            };
+            let healthy = probe.probe(&backend).await;
             pool.set_active_healthy(&backend.id, healthy);
         }
     })
@@ -32,6 +32,7 @@ pub fn spawn_active_checker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::HttpProbe;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -52,11 +53,9 @@ mod tests {
             backend.clone(),
             pool.clone(),
             ActiveCheckConfig {
-                path: "/health".into(),
                 interval: Duration::from_millis(20),
-                timeout: Duration::from_millis(200),
             },
-            reqwest::Client::new(),
+            HttpProbe::new("/health", Duration::from_millis(200)),
         );
 
         time::sleep(Duration::from_millis(60)).await;
@@ -74,20 +73,47 @@ mod tests {
             .await;
 
         let backend = Backend::new("b1", *mock.address(), 1);
-        let pool = Arc::new(BackendPool::new(vec![backend.clone()])); // starts healthy by default
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
 
         let handle = spawn_active_checker(
             backend.clone(),
             pool.clone(),
             ActiveCheckConfig {
-                path: "/health".into(),
                 interval: Duration::from_millis(20),
-                timeout: Duration::from_millis(200),
             },
-            reqwest::Client::new(),
+            HttpProbe::new("/health", Duration::from_millis(200)),
         );
 
         time::sleep(Duration::from_millis(60)).await;
+        assert!(!pool.is_eligible(&backend.id));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn marks_backend_unhealthy_when_tcp_port_is_closed() {
+        use crate::probe::TcpConnectProbe;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let backend = Backend::new("b1", addr, 1);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let handle = spawn_active_checker(
+            backend.clone(),
+            pool.clone(),
+            ActiveCheckConfig {
+                interval: Duration::from_millis(20),
+            },
+            TcpConnectProbe::new(Duration::from_millis(100)),
+        );
+
+        // Wait comfortably longer than the probe's own timeout: on Windows a
+        // connect to a closed port hangs until it times out rather than being
+        // refused immediately, so the first probe only resolves at ~100ms.
+        time::sleep(Duration::from_millis(300)).await;
         assert!(!pool.is_eligible(&backend.id));
         handle.abort();
     }

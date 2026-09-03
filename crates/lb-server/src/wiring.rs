@@ -1,7 +1,7 @@
 use lb_balancer::RoundRobin;
 use lb_core::BackendPool;
 use lb_core::{Backend, Config, SystemClock};
-use lb_healthcheck::{spawn_active_checker, ActiveCheckConfig, CircuitBreaker};
+use lb_healthcheck::{spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe};
 use lb_proxy::ProxyContext;
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
 use std::collections::HashMap;
@@ -60,17 +60,17 @@ pub fn build_context(config: &Config) -> WiredApp {
         Duration::from_secs(60),
     )];
 
-    let http_client = reqwest::Client::new();
     for b in &backends {
         background_tasks.push(spawn_active_checker(
             b.clone(),
             pool.clone(),
             ActiveCheckConfig {
-                path: config.health_check.path.clone(),
                 interval: Duration::from_millis(config.health_check.interval_ms),
-                timeout: Duration::from_millis(config.health_check.timeout_ms),
             },
-            http_client.clone(),
+            HttpProbe::new(
+                config.health_check.path.clone(),
+                Duration::from_millis(config.health_check.timeout_ms),
+            ),
         ));
     }
 
