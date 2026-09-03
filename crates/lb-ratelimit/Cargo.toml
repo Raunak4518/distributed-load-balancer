@@ -1,0 +1,11 @@
+[package]
+name = "lb-ratelimit"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lb-core = { path = "../lb-core" }
+dashmap = "6"
+
+[dev-dependencies]
+lb-core = { path = "../lb-core", features = ["test-util"] }
