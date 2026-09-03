@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 lb-core = { path = "../lb-core" }
 tokio = { version = "1", features = ["rt", "time", "macros"] }
+reqwest = "0.12"
 
 [dev-dependencies]
 lb-core = { path = "../lb-core", features = ["test-util"] }
+wiremock = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
