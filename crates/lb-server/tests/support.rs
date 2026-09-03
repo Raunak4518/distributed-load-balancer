@@ -63,29 +63,32 @@ pub fn config_toml(
 ) -> String {
     let backends_toml: String = backends
         .iter()
-        .map(|(id, addr)| format!("[[backends]]\nid = \"{id}\"\naddress = \"{addr}\"\n\n"))
+        .map(|(id, addr)| {
+            format!("  [[listeners.backends]]\n  id = \"{id}\"\n  address = \"{addr}\"\n\n")
+        })
         .collect();
     format!(
         r#"
-        [server]
-        listen = "{listen}"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
 
-        {backends_toml}
+{backends_toml}
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 50
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
 
-        [health_check]
-        path = "/health"
-        interval_ms = 50
-        timeout_ms = 200
-        failure_threshold = 2
-        cooldown_ms = 300
+  [listeners.rate_limit]
+  key = "header:X-Client"
+  rate_per_sec = {rate_per_sec}
+  burst = {burst}
 
-        [rate_limit]
-        key = "header:X-Client"
-        rate_per_sec = {rate_per_sec}
-        burst = {burst}
-
-        [load_balancing]
-        strategy = "round_robin"
-        "#
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
     )
 }

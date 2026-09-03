@@ -684,6 +684,7 @@ dependencies = [
  "lb-healthcheck",
  "lb-proxy",
  "lb-ratelimit",
+ "lb-tcp",
  "reqwest",
  "tokio",
 ]

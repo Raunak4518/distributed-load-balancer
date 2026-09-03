@@ -1,32 +1,78 @@
 use crate::error::ConfigError;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub server: ServerConfig,
+    pub listeners: Vec<ListenerConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_drain_timeout_ms")]
+    pub drain_timeout_ms: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        ServerConfig {
+            drain_timeout_ms: default_drain_timeout_ms(),
+        }
+    }
+}
+
+fn default_drain_timeout_ms() -> u64 {
+    10_000
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol {
+    Http,
+    Tcp,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListenerConfig {
+    pub name: String,
+    pub protocol: Protocol,
+    pub listen: SocketAddr,
+
+    // HTTP-only
+    pub forward_timeout_ms: Option<u64>,
+    pub max_request_body_bytes: Option<usize>,
+
+    // TCP-only
+    pub connect_timeout_ms: Option<u64>,
+    pub idle_timeout_ms: Option<u64>,
+
     pub backends: Vec<BackendConfig>,
     pub health_check: HealthCheckConfig,
     pub rate_limit: RateLimitConfig,
     pub load_balancing: LoadBalancingConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ServerConfig {
-    pub listen: SocketAddr,
-    #[serde(default = "default_max_request_body_bytes")]
-    pub max_request_body_bytes: usize,
-    #[serde(default = "default_forward_timeout_ms")]
-    pub forward_timeout_ms: u64,
-}
+impl ListenerConfig {
+    pub fn forward_timeout(&self) -> Duration {
+        Duration::from_millis(self.forward_timeout_ms.unwrap_or(5_000))
+    }
 
-fn default_max_request_body_bytes() -> usize {
-    1024 * 1024
-}
+    pub fn max_request_body_bytes(&self) -> usize {
+        self.max_request_body_bytes.unwrap_or(1024 * 1024)
+    }
 
-fn default_forward_timeout_ms() -> u64 {
-    5000
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms.unwrap_or(2_000))
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.idle_timeout_ms.unwrap_or(300_000))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -43,7 +89,9 @@ fn default_weight() -> u32 {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthCheckConfig {
-    pub path: String,
+    /// Required for HTTP listeners, forbidden for TCP listeners (there is
+    /// nothing to GET on a Postgres port).
+    pub path: Option<String>,
     pub interval_ms: u64,
     pub timeout_ms: u64,
     pub failure_threshold: u32,
@@ -108,28 +156,84 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if self.backends.is_empty() {
+        if self.listeners.is_empty() {
             return Err(ConfigError::Invalid(
-                "at least one backend is required".into(),
+                "at least one listener is required".into(),
             ));
         }
+
+        let mut names = HashSet::new();
+        let mut addresses = HashSet::new();
+
+        for l in &self.listeners {
+            if !names.insert(&l.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate listener name: {}",
+                    l.name
+                )));
+            }
+            if !addresses.insert(l.listen) {
+                return Err(ConfigError::Invalid(format!(
+                    "listener '{}' reuses listen address {} — two listeners cannot bind the same address",
+                    l.name, l.listen
+                )));
+            }
+            l.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl ListenerConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |msg: String| ConfigError::Invalid(format!("listener '{}': {msg}", self.name));
+
+        if self.backends.is_empty() {
+            return Err(invalid("at least one backend is required".into()));
+        }
+        let mut ids = HashSet::new();
+        for b in &self.backends {
+            if !ids.insert(&b.id) {
+                return Err(invalid(format!("duplicate backend id: {}", b.id)));
+            }
+        }
+
         if self.rate_limit.rate_per_sec <= 0.0 {
-            return Err(ConfigError::Invalid(
-                "rate_limit.rate_per_sec must be positive".into(),
-            ));
+            return Err(invalid("rate_limit.rate_per_sec must be positive".into()));
         }
         if self.rate_limit.burst == 0 {
-            return Err(ConfigError::Invalid(
-                "rate_limit.burst must be positive".into(),
-            ));
+            return Err(invalid("rate_limit.burst must be positive".into()));
         }
-        let mut seen = std::collections::HashSet::new();
-        for b in &self.backends {
-            if !seen.insert(&b.id) {
-                return Err(ConfigError::Invalid(format!(
-                    "duplicate backend id: {}",
-                    b.id
-                )));
+
+        match self.protocol {
+            Protocol::Http => {
+                if self.health_check.path.is_none() {
+                    return Err(invalid(
+                        "health_check.path is required for http listeners".into(),
+                    ));
+                }
+                if self.connect_timeout_ms.is_some() || self.idle_timeout_ms.is_some() {
+                    return Err(invalid(
+                        "connect_timeout_ms/idle_timeout_ms are tcp-only settings".into(),
+                    ));
+                }
+            }
+            Protocol::Tcp => {
+                if self.health_check.path.is_some() {
+                    return Err(invalid(
+                        "health_check.path is http-only — a tcp backend has no path to probe".into(),
+                    ));
+                }
+                if self.forward_timeout_ms.is_some() || self.max_request_body_bytes.is_some() {
+                    return Err(invalid(
+                        "forward_timeout_ms/max_request_body_bytes are http-only settings".into(),
+                    ));
+                }
+                if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
+                    return Err(invalid(format!(
+                        "rate_limit.key 'header:{name}' is http-only — a tcp listener has no headers to read, use 'source_ip'"
+                    )));
+                }
             }
         }
         Ok(())
@@ -141,85 +245,131 @@ mod tests {
     use super::*;
 
     const VALID: &str = r#"
-        [server]
+        [[listeners]]
+        name = "web"
+        protocol = "http"
         listen = "0.0.0.0:8080"
 
-        [[backends]]
-        id = "b1"
-        address = "127.0.0.1:9001"
+          [[listeners.backends]]
+          id = "web1"
+          address = "127.0.0.1:9001"
 
-        [[backends]]
-        id = "b2"
-        address = "127.0.0.1:9002"
-        weight = 2
+          [listeners.health_check]
+          path = "/health"
+          interval_ms = 2000
+          timeout_ms = 500
+          failure_threshold = 3
+          cooldown_ms = 5000
 
-        [health_check]
-        path = "/health"
-        interval_ms = 2000
-        timeout_ms = 500
-        failure_threshold = 3
-        cooldown_ms = 5000
+          [listeners.rate_limit]
+          key = "source_ip"
+          rate_per_sec = 50
+          burst = 100
 
-        [rate_limit]
-        key = "source_ip"
-        rate_per_sec = 50
-        burst = 100
+          [listeners.load_balancing]
+          strategy = "round_robin"
 
-        [load_balancing]
-        strategy = "round_robin"
+        [[listeners]]
+        name = "postgres"
+        protocol = "tcp"
+        listen = "0.0.0.0:5432"
+
+          [[listeners.backends]]
+          id = "pg1"
+          address = "10.0.0.5:5432"
+
+          [listeners.health_check]
+          interval_ms = 2000
+          timeout_ms = 500
+          failure_threshold = 3
+          cooldown_ms = 5000
+
+          [listeners.rate_limit]
+          key = "source_ip"
+          rate_per_sec = 10
+          burst = 20
+
+          [listeners.load_balancing]
+          strategy = "round_robin"
     "#;
 
     #[test]
-    fn parses_valid_config() {
+    fn parses_mixed_protocol_config() {
         let cfg = Config::parse(VALID).expect("valid config should parse");
-        assert_eq!(cfg.backends.len(), 2);
-        assert_eq!(cfg.backends[0].weight, 1); // default applied
-        assert_eq!(cfg.backends[1].weight, 2);
-        assert_eq!(cfg.rate_limit.key, RateLimitKeySource::SourceIp);
+        assert_eq!(cfg.listeners.len(), 2);
+        assert_eq!(cfg.listeners[0].protocol, Protocol::Http);
+        assert_eq!(cfg.listeners[1].protocol, Protocol::Tcp);
+        assert_eq!(cfg.server.drain_timeout_ms, 10_000); // default applied
+        assert_eq!(cfg.listeners[0].max_request_body_bytes(), 1024 * 1024);
         assert_eq!(
-            cfg.load_balancing.strategy,
-            LoadBalancingStrategy::RoundRobin
-        );
-        assert_eq!(cfg.server.max_request_body_bytes, 1024 * 1024); // default applied
-    }
-
-    #[test]
-    fn parses_header_based_rate_limit_key() {
-        let text = VALID.replace(r#"key = "source_ip""#, r#"key = "header:X-API-Key""#);
-        let cfg = Config::parse(&text).unwrap();
-        assert_eq!(
-            cfg.rate_limit.key,
-            RateLimitKeySource::Header("X-API-Key".into())
+            cfg.listeners[1].idle_timeout(),
+            Duration::from_millis(300_000)
         );
     }
 
     #[test]
-    fn rejects_empty_backends() {
-        const NO_BACKENDS: &str = r#"
-            backends = []
+    fn rejects_empty_listeners() {
+        let text = "listeners = []";
+        assert!(matches!(Config::parse(text), Err(ConfigError::Invalid(_))));
+    }
 
-            [server]
-            listen = "0.0.0.0:8080"
+    #[test]
+    fn rejects_duplicate_listener_names() {
+        let text = VALID.replace(r#"name = "postgres""#, r#"name = "web""#);
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
 
-            [health_check]
-            path = "/health"
-            interval_ms = 2000
-            timeout_ms = 500
-            failure_threshold = 3
-            cooldown_ms = 5000
+    #[test]
+    fn rejects_duplicate_listen_addresses() {
+        let text = VALID.replace(r#"listen = "0.0.0.0:5432""#, r#"listen = "0.0.0.0:8080""#);
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
 
-            [rate_limit]
-            key = "source_ip"
-            rate_per_sec = 50
-            burst = 100
+    #[test]
+    fn rejects_http_listener_without_health_path() {
+        let text = VALID.replace("          path = \"/health\"\n", "");
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
 
-            [load_balancing]
-            strategy = "round_robin"
-        "#;
-        assert!(matches!(
-            Config::parse(NO_BACKENDS),
-            Err(ConfigError::Invalid(_))
-        ));
+    #[test]
+    fn rejects_tcp_listener_with_health_path() {
+        // Give the tcp listener a path by adding one to its health_check.
+        let text = VALID.replace(
+            "          [listeners.health_check]\n          interval_ms = 2000\n          timeout_ms = 500\n          failure_threshold = 3\n          cooldown_ms = 5000\n\n          [listeners.rate_limit]\n          key = \"source_ip\"\n          rate_per_sec = 10",
+            "          [listeners.health_check]\n          path = \"/health\"\n          interval_ms = 2000\n          timeout_ms = 500\n          failure_threshold = 3\n          cooldown_ms = 5000\n\n          [listeners.rate_limit]\n          key = \"source_ip\"\n          rate_per_sec = 10",
+        );
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_header_rate_limit_key_on_tcp_listener() {
+        let text = VALID.replace(
+            "          key = \"source_ip\"\n          rate_per_sec = 10",
+            "          key = \"header:X-API-Key\"\n          rate_per_sec = 10",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("http-only"),
+            "error should explain headers don't exist at L4, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_http_only_setting_on_tcp_listener() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:5432\"",
+            "        listen = \"0.0.0.0:5432\"\n        max_request_body_bytes = 1024",
+        );
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_tcp_only_setting_on_http_listener() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        idle_timeout_ms = 1000",
+        );
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
     }
 
     #[test]
@@ -229,14 +379,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_backend_ids() {
-        let text = VALID.replace(r#"id = "b2""#, r#"id = "b1""#);
+    fn rejects_duplicate_backend_ids_within_a_listener() {
+        let text = VALID.replace(
+            "          [[listeners.backends]]\n          id = \"web1\"\n          address = \"127.0.0.1:9001\"",
+            "          [[listeners.backends]]\n          id = \"web1\"\n          address = \"127.0.0.1:9001\"\n\n          [[listeners.backends]]\n          id = \"web1\"\n          address = \"127.0.0.1:9002\"",
+        );
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
-    }
-
-    #[test]
-    fn rejects_unknown_rate_limit_key_format() {
-        let text = VALID.replace(r#"key = "source_ip""#, r#"key = "nonsense""#);
-        assert!(Config::parse(&text).is_err());
     }
 }

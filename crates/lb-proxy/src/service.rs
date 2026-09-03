@@ -11,6 +11,7 @@ use lb_core::{
 use lb_healthcheck::CircuitBreaker;
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,18 +58,12 @@ fn simple_response(status: StatusCode, body: &'static str) -> Response<ProxyBody
     resp
 }
 
-fn extract_key(req: &Request<Incoming>, source: &RateLimitKeySource) -> String {
+fn extract_key(req: &Request<Incoming>, source: &RateLimitKeySource, peer_ip: IpAddr) -> String {
     match source {
-        RateLimitKeySource::SourceIp => {
-            // Populated by the connection-level wiring in lb-server (Task 11);
-            // falls back to a shared bucket if genuinely absent so we fail
-            // safe (rate limited together) rather than failing open.
-            req.headers()
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string()
-        }
+        // The connection's real peer address, not a client-supplied header.
+        // Trusting X-Forwarded-For here would let any client mint itself a
+        // fresh rate-limit bucket just by changing the header.
+        RateLimitKeySource::SourceIp => peer_ip.to_string(),
         RateLimitKeySource::Header(name) => req
             .headers()
             .get(name.as_str())
@@ -116,13 +111,14 @@ fn build_outbound_request(
 pub async fn handle<R, L, C>(
     req: Request<Incoming>,
     ctx: Arc<ProxyContext<R, L, C>>,
+    peer_ip: IpAddr,
 ) -> Result<Response<ProxyBody>, Infallible>
 where
     R: RateLimiter,
     L: LoadBalancer,
     C: Clock,
 {
-    let key = extract_key(&req, &ctx.rate_limit_key);
+    let key = extract_key(&req, &ctx.rate_limit_key, peer_ip);
     if let Decision::Deny { retry_after } = ctx.rate_limiter.check(&key) {
         let mut resp = simple_response(StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded");
         if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string()) {
@@ -293,7 +289,7 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| handle(req, ctx.clone()));
+            let svc = service_fn(move |req| handle(req, ctx.clone(), "127.0.0.1".parse().unwrap()));
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
 

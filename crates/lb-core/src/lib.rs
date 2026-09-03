@@ -14,8 +14,8 @@ pub use health::HealthProbe;
 pub use clock::test_util;
 pub use clock::{Clock, SystemClock};
 pub use config::{
-    BackendConfig, Config, HealthCheckConfig, LoadBalancingConfig, LoadBalancingStrategy,
-    RateLimitConfig, RateLimitKeySource, ServerConfig,
+    BackendConfig, Config, HealthCheckConfig, ListenerConfig, LoadBalancingConfig,
+    LoadBalancingStrategy, Protocol, RateLimitConfig, RateLimitKeySource, ServerConfig,
 };
 pub use error::ConfigError;
 pub use pool::BackendPool;
