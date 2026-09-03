@@ -79,6 +79,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-healthcheck"
+version = "0.1.0"
+dependencies = [
+ "lb-core",
+ "tokio",
+]
+
+[[package]]
 name = "lb-ratelimit"
 version = "0.1.0"
 dependencies = [

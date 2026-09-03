@@ -1,0 +1,11 @@
+[package]
+name = "lb-healthcheck"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lb-core = { path = "../lb-core" }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+[dev-dependencies]
+lb-core = { path = "../lb-core", features = ["test-util"] }

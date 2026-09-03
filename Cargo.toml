@@ -4,6 +4,7 @@ members = [
     "crates/lb-core",
     "crates/lb-ratelimit",
     "crates/lb-balancer",
+    "crates/lb-healthcheck",
 ]
 
 [workspace.package]
