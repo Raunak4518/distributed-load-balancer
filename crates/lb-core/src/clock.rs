@@ -26,7 +26,9 @@ pub mod test_util {
 
     impl FakeClock {
         pub fn new() -> Self {
-            FakeClock { current: Arc::new(Mutex::new(Instant::now())) }
+            FakeClock {
+                current: Arc::new(Mutex::new(Instant::now())),
+            }
         }
 
         pub fn advance(&self, d: std::time::Duration) {

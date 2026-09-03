@@ -24,7 +24,11 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(id: impl Into<String>, address: SocketAddr, weight: u32) -> Self {
-        Backend { id: BackendId::new(id), address, weight }
+        Backend {
+            id: BackendId::new(id),
+            address,
+            weight,
+        }
     }
 }
 

@@ -675,6 +675,8 @@ dependencies = [
 name = "lb-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http-body-util",
  "hyper",
  "hyper-util",
  "lb-balancer",

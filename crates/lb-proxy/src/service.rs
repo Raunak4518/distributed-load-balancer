@@ -5,7 +5,9 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
-use lb_core::{BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimitKeySource, RateLimiter};
+use lb_core::{
+    BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimitKeySource, RateLimiter,
+};
 use lb_healthcheck::CircuitBreaker;
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -34,15 +36,23 @@ impl<R: RateLimiter, L: LoadBalancer, C: Clock> ProxyContext<R, L, C> {
 }
 
 fn empty_body() -> ProxyBody {
-    Empty::<Bytes>::new().map_err(|never| match never {}).boxed()
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 fn text_body(text: &'static str) -> ProxyBody {
-    Full::new(Bytes::from_static(text.as_bytes())).map_err(|never| match never {}).boxed()
+    Full::new(Bytes::from_static(text.as_bytes()))
+        .map_err(|never| match never {})
+        .boxed()
 }
 
 fn simple_response(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
-    let mut resp = Response::new(if body.is_empty() { empty_body() } else { text_body(body) });
+    let mut resp = Response::new(if body.is_empty() {
+        empty_body()
+    } else {
+        text_body(body)
+    });
     *resp.status_mut() = status;
     resp
 }
@@ -83,7 +93,11 @@ fn build_outbound_request(
     body: Bytes,
     backend: &lb_core::Backend,
 ) -> Request<Full<Bytes>> {
-    let path_and_query = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
     let uri = hyper::Uri::builder()
         .scheme("http")
         .authority(backend.address.to_string())
@@ -94,7 +108,9 @@ fn build_outbound_request(
     for (name, value) in parts.headers.iter() {
         builder = builder.header(name, value);
     }
-    builder.body(Full::new(body)).expect("forwarded request is well-formed")
+    builder
+        .body(Full::new(body))
+        .expect("forwarded request is well-formed")
 }
 
 pub async fn handle<R, L, C>(
@@ -133,13 +149,21 @@ where
     let (parts, body) = req.into_parts();
     let bytes = match read_bounded(body, ctx.max_request_body_bytes).await {
         Ok(b) => b,
-        Err(()) => return Ok(simple_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")),
+        Err(()) => {
+            return Ok(simple_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large",
+            ))
+        }
     };
 
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     for attempt in 0..2u8 {
         let Some(backend_id) = ctx.balancer.pick(&ctx.pool) else {
-            return Ok(simple_response(StatusCode::SERVICE_UNAVAILABLE, "no healthy backend"));
+            return Ok(simple_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no healthy backend",
+            ));
         };
         let backend = ctx
             .pool
@@ -192,7 +216,9 @@ mod tests {
     struct AlwaysDeny;
     impl RateLimiter for AlwaysDeny {
         fn check(&self, _key: &str) -> Decision {
-            Decision::Deny { retry_after: Duration::from_secs(1) }
+            Decision::Deny {
+                retry_after: Duration::from_secs(1),
+            }
         }
     }
 
@@ -234,12 +260,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let io = TokioIo::new(stream);
                 tokio::spawn(async move {
                     let svc = service_fn(move |_req: Request<Incoming>| async move {
                         Ok::<_, Infallible>(
-                            Response::builder().status(status).body(Full::new(Bytes::from_static(body.as_bytes()))).unwrap(),
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                .unwrap(),
                         )
                     });
                     let _ = http1::Builder::new().serve_connection(io, svc).await;
@@ -267,7 +298,10 @@ mod tests {
         });
 
         let client = build_client();
-        let req = Request::builder().uri(format!("http://{addr}/")).body(Full::new(Bytes::new())).unwrap();
+        let req = Request::builder()
+            .uri(format!("http://{addr}/"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
         let resp = client.request(req).await.unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
@@ -320,7 +354,10 @@ mod tests {
         let backend = Backend::new("b1", backend_addr, 1);
         let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
         let mut breakers = HashMap::new();
-        breakers.insert(backend.id.clone(), CircuitBreaker::new(3, Duration::from_secs(5), FakeClock::new()));
+        breakers.insert(
+            backend.id.clone(),
+            CircuitBreaker::new(3, Duration::from_secs(5), FakeClock::new()),
+        );
 
         let ctx = Arc::new(ProxyContext {
             rate_limiter: Arc::new(AlwaysAllow),
@@ -343,7 +380,10 @@ mod tests {
         let backend = Backend::new("b1", dead_addr, 1);
         let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
         let mut breakers = HashMap::new();
-        breakers.insert(backend.id.clone(), CircuitBreaker::new(3, Duration::from_secs(5), FakeClock::new()));
+        breakers.insert(
+            backend.id.clone(),
+            CircuitBreaker::new(3, Duration::from_secs(5), FakeClock::new()),
+        );
 
         let ctx = Arc::new(ProxyContext {
             rate_limiter: Arc::new(AlwaysAllow),
@@ -370,8 +410,14 @@ mod tests {
 
         let clock = FakeClock::new();
         let mut breakers = HashMap::new();
-        breakers.insert(dead.id.clone(), CircuitBreaker::new(1, Duration::from_secs(60), clock.clone()));
-        breakers.insert(healthy.id.clone(), CircuitBreaker::new(1, Duration::from_secs(60), clock.clone()));
+        breakers.insert(
+            dead.id.clone(),
+            CircuitBreaker::new(1, Duration::from_secs(60), clock.clone()),
+        );
+        breakers.insert(
+            healthy.id.clone(),
+            CircuitBreaker::new(1, Duration::from_secs(60), clock.clone()),
+        );
 
         let ctx = Arc::new(ProxyContext {
             rate_limiter: Arc::new(AlwaysAllow),

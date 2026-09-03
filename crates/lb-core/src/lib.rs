@@ -8,9 +8,9 @@ pub mod ratelimit;
 
 pub use backend::{Backend, BackendId};
 pub use balancer::LoadBalancer;
-pub use clock::{Clock, SystemClock};
 #[cfg(feature = "test-util")]
 pub use clock::test_util;
+pub use clock::{Clock, SystemClock};
 pub use config::{
     BackendConfig, Config, HealthCheckConfig, LoadBalancingConfig, LoadBalancingStrategy,
     RateLimitConfig, RateLimitKeySource, ServerConfig,

@@ -28,10 +28,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn periodically_sweeps_idle_keys() {
         let clock = FakeClock::new();
-        let limiter = Arc::new(Gcra::new(GcraConfig { rate_per_sec: 10.0, burst: 1 }, clock.clone()));
+        let limiter = Arc::new(Gcra::new(
+            GcraConfig {
+                rate_per_sec: 10.0,
+                burst: 1,
+            },
+            clock.clone(),
+        ));
         limiter.check("stale");
 
-        let _handle = spawn_sweeper(limiter.clone(), Duration::from_millis(50), Duration::from_millis(10));
+        let _handle = spawn_sweeper(
+            limiter.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        );
 
         clock.advance(Duration::from_secs(1));
         // advance tokio's paused virtual time so the interval actually ticks

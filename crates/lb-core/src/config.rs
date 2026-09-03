@@ -73,7 +73,9 @@ impl TryFrom<String> for RateLimitKeySource {
         } else if let Some(header) = s.strip_prefix("header:") {
             Ok(RateLimitKeySource::Header(header.to_string()))
         } else {
-            Err(format!("invalid rate_limit.key '{s}': expected 'source_ip' or 'header:<name>'"))
+            Err(format!(
+                "invalid rate_limit.key '{s}': expected 'source_ip' or 'header:<name>'"
+            ))
         }
     }
 }
@@ -92,8 +94,10 @@ pub enum LoadBalancingStrategy {
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path_ref = path.as_ref();
-        let text = std::fs::read_to_string(path_ref)
-            .map_err(|source| ConfigError::Io { path: path_ref.display().to_string(), source })?;
+        let text = std::fs::read_to_string(path_ref).map_err(|source| ConfigError::Io {
+            path: path_ref.display().to_string(),
+            source,
+        })?;
         Self::parse(&text)
     }
 
@@ -105,18 +109,27 @@ impl Config {
 
     fn validate(&self) -> Result<(), ConfigError> {
         if self.backends.is_empty() {
-            return Err(ConfigError::Invalid("at least one backend is required".into()));
+            return Err(ConfigError::Invalid(
+                "at least one backend is required".into(),
+            ));
         }
         if self.rate_limit.rate_per_sec <= 0.0 {
-            return Err(ConfigError::Invalid("rate_limit.rate_per_sec must be positive".into()));
+            return Err(ConfigError::Invalid(
+                "rate_limit.rate_per_sec must be positive".into(),
+            ));
         }
         if self.rate_limit.burst == 0 {
-            return Err(ConfigError::Invalid("rate_limit.burst must be positive".into()));
+            return Err(ConfigError::Invalid(
+                "rate_limit.burst must be positive".into(),
+            ));
         }
         let mut seen = std::collections::HashSet::new();
         for b in &self.backends {
             if !seen.insert(&b.id) {
-                return Err(ConfigError::Invalid(format!("duplicate backend id: {}", b.id)));
+                return Err(ConfigError::Invalid(format!(
+                    "duplicate backend id: {}",
+                    b.id
+                )));
             }
         }
         Ok(())
@@ -163,7 +176,10 @@ mod tests {
         assert_eq!(cfg.backends[0].weight, 1); // default applied
         assert_eq!(cfg.backends[1].weight, 2);
         assert_eq!(cfg.rate_limit.key, RateLimitKeySource::SourceIp);
-        assert_eq!(cfg.load_balancing.strategy, LoadBalancingStrategy::RoundRobin);
+        assert_eq!(
+            cfg.load_balancing.strategy,
+            LoadBalancingStrategy::RoundRobin
+        );
         assert_eq!(cfg.server.max_request_body_bytes, 1024 * 1024); // default applied
     }
 
@@ -171,7 +187,10 @@ mod tests {
     fn parses_header_based_rate_limit_key() {
         let text = VALID.replace(r#"key = "source_ip""#, r#"key = "header:X-API-Key""#);
         let cfg = Config::parse(&text).unwrap();
-        assert_eq!(cfg.rate_limit.key, RateLimitKeySource::Header("X-API-Key".into()));
+        assert_eq!(
+            cfg.rate_limit.key,
+            RateLimitKeySource::Header("X-API-Key".into())
+        );
     }
 
     #[test]
@@ -197,7 +216,10 @@ mod tests {
             [load_balancing]
             strategy = "round_robin"
         "#;
-        assert!(matches!(Config::parse(NO_BACKENDS), Err(ConfigError::Invalid(_))));
+        assert!(matches!(
+            Config::parse(NO_BACKENDS),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 
     #[test]

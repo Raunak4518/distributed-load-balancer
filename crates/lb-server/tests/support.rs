@@ -21,7 +21,9 @@ pub async fn spawn_counting_backend(status: StatusCode) -> (SocketAddr, Arc<Atom
 
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
             let io = TokioIo::new(stream);
             let count = count_clone.clone();
             tokio::spawn(async move {
@@ -30,12 +32,18 @@ pub async fn spawn_counting_backend(status: StatusCode) -> (SocketAddr, Arc<Atom
                     async move {
                         if req.uri().path() == "/health" {
                             return Ok::<_, Infallible>(
-                                Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
                             );
                         }
                         count.fetch_add(1, Ordering::SeqCst);
                         Ok::<_, Infallible>(
-                            Response::builder().status(status).body(Full::new(Bytes::new())).unwrap(),
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
                         )
                     }
                 });
@@ -47,7 +55,12 @@ pub async fn spawn_counting_backend(status: StatusCode) -> (SocketAddr, Arc<Atom
     (addr, count)
 }
 
-pub fn config_toml(listen: &str, backends: &[(&str, SocketAddr)], rate_per_sec: f64, burst: u32) -> String {
+pub fn config_toml(
+    listen: &str,
+    backends: &[(&str, SocketAddr)],
+    rate_per_sec: f64,
+    burst: u32,
+) -> String {
     let backends_toml: String = backends
         .iter()
         .map(|(id, addr)| format!("[[backends]]\nid = \"{id}\"\naddress = \"{addr}\"\n\n"))

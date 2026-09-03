@@ -8,7 +8,9 @@ pub struct RoundRobin {
 
 impl RoundRobin {
     pub fn new() -> Self {
-        RoundRobin { cursor: AtomicUsize::new(0) }
+        RoundRobin {
+            cursor: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -44,8 +46,12 @@ mod tests {
         assert_eq!(
             picks,
             vec![
-                BackendId::new("b1"), BackendId::new("b2"), BackendId::new("b3"),
-                BackendId::new("b1"), BackendId::new("b2"), BackendId::new("b3"),
+                BackendId::new("b1"),
+                BackendId::new("b2"),
+                BackendId::new("b3"),
+                BackendId::new("b1"),
+                BackendId::new("b2"),
+                BackendId::new("b3"),
             ]
         );
     }

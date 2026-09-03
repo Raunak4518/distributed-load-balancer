@@ -1,6 +1,6 @@
 use lb_balancer::RoundRobin;
-use lb_core::{Backend, Config, SystemClock};
 use lb_core::BackendPool;
+use lb_core::{Backend, Config, SystemClock};
 use lb_healthcheck::{spawn_active_checker, ActiveCheckConfig, CircuitBreaker};
 use lb_proxy::ProxyContext;
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
@@ -36,7 +36,10 @@ pub fn build_context(config: &Config) -> WiredApp {
     }
 
     let rate_limiter = Arc::new(Gcra::new(
-        GcraConfig { rate_per_sec: config.rate_limit.rate_per_sec, burst: config.rate_limit.burst },
+        GcraConfig {
+            rate_per_sec: config.rate_limit.rate_per_sec,
+            burst: config.rate_limit.burst,
+        },
         SystemClock,
     ));
 
@@ -51,7 +54,11 @@ pub fn build_context(config: &Config) -> WiredApp {
         max_request_body_bytes: config.server.max_request_body_bytes,
     });
 
-    let mut background_tasks = vec![spawn_sweeper(rate_limiter, Duration::from_secs(30), Duration::from_secs(60))];
+    let mut background_tasks = vec![spawn_sweeper(
+        rate_limiter,
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+    )];
 
     let http_client = reqwest::Client::new();
     for b in &backends {
@@ -67,7 +74,10 @@ pub fn build_context(config: &Config) -> WiredApp {
         ));
     }
 
-    WiredApp { context, background_tasks }
+    WiredApp {
+        context,
+        background_tasks,
+    }
 }
 
 #[cfg(test)]

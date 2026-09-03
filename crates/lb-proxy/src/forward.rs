@@ -59,12 +59,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let io = TokioIo::new(stream);
                 tokio::spawn(async move {
                     let svc = service_fn(move |_req: Request<Incoming>| async move {
                         Ok::<_, Infallible>(
-                            Response::builder().status(status).body(Full::new(Bytes::new())).unwrap(),
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
                         )
                     });
                     let _ = http1::Builder::new().serve_connection(io, svc).await;
@@ -102,6 +107,9 @@ mod tests {
             .unwrap();
 
         let result = forward(&client, req, Duration::from_secs(1)).await;
-        assert!(matches!(result, Err(ForwardError::Connect | ForwardError::Timeout)));
+        assert!(matches!(
+            result,
+            Err(ForwardError::Connect | ForwardError::Timeout)
+        ));
     }
 }

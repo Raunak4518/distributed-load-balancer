@@ -19,7 +19,13 @@ async fn distributes_requests_round_robin_across_backends() {
     let (addr2, count2) = spawn_counting_backend(StatusCode::OK).await;
     let listen = free_addr().await;
 
-    let config = Config::parse(&config_toml(&listen.to_string(), &[("b1", addr1), ("b2", addr2)], 1000.0, 1000)).unwrap();
+    let config = Config::parse(&config_toml(
+        &listen.to_string(),
+        &[("b1", addr1), ("b2", addr2)],
+        1000.0,
+        1000,
+    ))
+    .unwrap();
     tokio::spawn(lb_server::run(config));
     tokio::time::sleep(Duration::from_millis(100)).await; // let the listener bind
 
@@ -33,7 +39,10 @@ async fn distributes_requests_round_robin_across_backends() {
             .unwrap();
     }
 
-    assert_eq!(count1.load(Ordering::SeqCst) + count2.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        count1.load(Ordering::SeqCst) + count2.load(Ordering::SeqCst),
+        4
+    );
     assert_eq!(count1.load(Ordering::SeqCst), 2);
     assert_eq!(count2.load(Ordering::SeqCst), 2);
 }
@@ -50,7 +59,12 @@ async fn rate_limits_a_bursty_client_with_429() {
     let client = reqwest::Client::new();
     let mut statuses = vec![];
     for _ in 0..4 {
-        let resp = client.get(format!("http://{listen}/")).header("X-Client", "same-client").send().await.unwrap();
+        let resp = client
+            .get(format!("http://{listen}/"))
+            .header("X-Client", "same-client")
+            .send()
+            .await
+            .unwrap();
         statuses.push(resp.status());
     }
 
@@ -65,7 +79,13 @@ async fn fails_over_when_a_backend_stops_responding() {
     let (healthy_addr, healthy_count) = spawn_counting_backend(StatusCode::OK).await;
     let listen = free_addr().await;
 
-    let config = Config::parse(&config_toml(&listen.to_string(), &[("dead", dead_addr), ("alive", healthy_addr)], 1000.0, 1000)).unwrap();
+    let config = Config::parse(&config_toml(
+        &listen.to_string(),
+        &[("dead", dead_addr), ("alive", healthy_addr)],
+        1000.0,
+        1000,
+    ))
+    .unwrap();
     tokio::spawn(lb_server::run(config));
     tokio::time::sleep(Duration::from_millis(100)).await;
 

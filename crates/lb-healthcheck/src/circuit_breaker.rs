@@ -43,7 +43,10 @@ impl<C: Clock> CircuitBreaker<C> {
     fn maybe_transition_to_half_open(&self) {
         let mut state = self.state.lock().expect("circuit breaker mutex poisoned");
         if *state == CircuitState::Open {
-            let opened_at = *self.opened_at.lock().expect("circuit breaker mutex poisoned");
+            let opened_at = *self
+                .opened_at
+                .lock()
+                .expect("circuit breaker mutex poisoned");
             if let Some(t) = opened_at {
                 if self.clock.now().duration_since(t) >= self.cooldown {
                     *state = CircuitState::HalfOpen;
@@ -73,7 +76,10 @@ impl<C: Clock> CircuitBreaker<C> {
 
     fn trip(&self, state: &mut CircuitState) {
         *state = CircuitState::Open;
-        *self.opened_at.lock().expect("circuit breaker mutex poisoned") = Some(self.clock.now());
+        *self
+            .opened_at
+            .lock()
+            .expect("circuit breaker mutex poisoned") = Some(self.clock.now());
         self.consecutive_failures.store(0, Ordering::SeqCst);
     }
 }
@@ -85,7 +91,10 @@ mod tests {
 
     fn breaker(threshold: u32, cooldown: Duration) -> (CircuitBreaker<FakeClock>, FakeClock) {
         let clock = FakeClock::new();
-        (CircuitBreaker::new(threshold, cooldown, clock.clone()), clock)
+        (
+            CircuitBreaker::new(threshold, cooldown, clock.clone()),
+            clock,
+        )
     }
 
     #[test]

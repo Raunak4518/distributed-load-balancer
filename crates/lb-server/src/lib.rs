@@ -18,7 +18,10 @@ const DRAIN_DEADLINE: Duration = Duration::from_secs(10);
 
 pub async fn run(config: Config) -> std::io::Result<()> {
     let listen_addr = config.server.listen;
-    let WiredApp { context, background_tasks } = build_context(&config);
+    let WiredApp {
+        context,
+        background_tasks,
+    } = build_context(&config);
 
     let listener = TcpListener::bind(listen_addr).await?;
     eprintln!("listening on {listen_addr}");
@@ -57,7 +60,10 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     })
     .await;
     if drained.is_err() {
-        eprintln!("drain deadline exceeded, aborting {} remaining connection(s)", connections.len());
+        eprintln!(
+            "drain deadline exceeded, aborting {} remaining connection(s)",
+            connections.len()
+        );
         connections.abort_all();
     }
 

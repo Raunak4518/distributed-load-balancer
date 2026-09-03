@@ -18,14 +18,20 @@ impl<C: Clock> Gcra<C> {
     pub fn new(config: GcraConfig, clock: C) -> Self {
         let period = Duration::from_secs_f64(1.0 / config.rate_per_sec);
         let tau = period.saturating_mul(config.burst.max(1));
-        Gcra { period, tau, clock, state: DashMap::new() }
+        Gcra {
+            period,
+            tau,
+            clock,
+            state: DashMap::new(),
+        }
     }
 
     /// Evicts keys whose theoretical arrival time is more than `idle_after`
     /// behind the clock, so idle clients don't grow the map forever.
     pub fn sweep(&self, idle_after: Duration) {
         let now = self.clock.now();
-        self.state.retain(|_, tat| *tat > now || now.duration_since(*tat) < idle_after);
+        self.state
+            .retain(|_, tat| *tat > now || now.duration_since(*tat) < idle_after);
     }
 }
 
@@ -43,7 +49,9 @@ impl<C: Clock> RateLimiter for Gcra<C> {
             *entry = new_tat;
             Decision::Allow
         } else {
-            Decision::Deny { retry_after: allow_at - now }
+            Decision::Deny {
+                retry_after: allow_at - now,
+            }
         }
     }
 }
@@ -56,7 +64,13 @@ mod tests {
 
     fn limiter(rate_per_sec: f64, burst: u32) -> (Gcra<FakeClock>, FakeClock) {
         let clock = FakeClock::new();
-        let gcra = Gcra::new(GcraConfig { rate_per_sec, burst }, clock.clone());
+        let gcra = Gcra::new(
+            GcraConfig {
+                rate_per_sec,
+                burst,
+            },
+            clock.clone(),
+        );
         (gcra, clock)
     }
 

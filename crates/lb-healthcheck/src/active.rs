@@ -51,7 +51,11 @@ mod tests {
         let handle = spawn_active_checker(
             backend.clone(),
             pool.clone(),
-            ActiveCheckConfig { path: "/health".into(), interval: Duration::from_millis(20), timeout: Duration::from_millis(200) },
+            ActiveCheckConfig {
+                path: "/health".into(),
+                interval: Duration::from_millis(20),
+                timeout: Duration::from_millis(200),
+            },
             reqwest::Client::new(),
         );
 
@@ -75,7 +79,11 @@ mod tests {
         let handle = spawn_active_checker(
             backend.clone(),
             pool.clone(),
-            ActiveCheckConfig { path: "/health".into(), interval: Duration::from_millis(20), timeout: Duration::from_millis(200) },
+            ActiveCheckConfig {
+                path: "/health".into(),
+                interval: Duration::from_millis(20),
+                timeout: Duration::from_millis(200),
+            },
             reqwest::Client::new(),
         );
 

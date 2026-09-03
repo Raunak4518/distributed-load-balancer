@@ -49,13 +49,17 @@ impl BackendPool {
     }
 
     pub fn is_eligible(&self, id: &BackendId) -> bool {
-        self.states
-            .get(id)
-            .is_some_and(|s| s.active_healthy.load(Ordering::SeqCst) && !s.circuit_open.load(Ordering::SeqCst))
+        self.states.get(id).is_some_and(|s| {
+            s.active_healthy.load(Ordering::SeqCst) && !s.circuit_open.load(Ordering::SeqCst)
+        })
     }
 
     pub fn eligible_backends(&self) -> Vec<BackendId> {
-        self.order.iter().filter(|id| self.is_eligible(id)).cloned().collect()
+        self.order
+            .iter()
+            .filter(|id| self.is_eligible(id))
+            .cloned()
+            .collect()
     }
 
     pub fn all_backend_ids(&self) -> &[BackendId] {
@@ -78,7 +82,10 @@ mod tests {
     #[test]
     fn all_backends_start_eligible() {
         let pool = pool_of(&["b1", "b2"]);
-        assert_eq!(pool.eligible_backends(), vec![BackendId::new("b1"), BackendId::new("b2")]);
+        assert_eq!(
+            pool.eligible_backends(),
+            vec![BackendId::new("b1"), BackendId::new("b2")]
+        );
     }
 
     #[test]
