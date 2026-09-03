@@ -6,6 +6,7 @@ members = [
     "crates/lb-balancer",
     "crates/lb-healthcheck",
     "crates/lb-proxy",
+    "crates/lb-server",
 ]
 
 [workspace.package]
