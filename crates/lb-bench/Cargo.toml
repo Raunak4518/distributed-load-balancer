@@ -1,0 +1,15 @@
+[package]
+name = "lb-bench"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lb-core = { path = "../lb-core" }
+lb-ratelimit = { path = "../lb-ratelimit" }
+lb-balancer = { path = "../lb-balancer" }
+lb-healthcheck = { path = "../lb-healthcheck" }
+lb-cluster = { path = "../lb-cluster" }
+
+[[bin]]
+name = "lb-bench"
+path = "src/main.rs"

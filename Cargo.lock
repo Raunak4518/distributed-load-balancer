@@ -630,6 +630,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lb-bench"
+version = "0.1.0"
+dependencies = [
+ "lb-balancer",
+ "lb-cluster",
+ "lb-core",
+ "lb-healthcheck",
+ "lb-ratelimit",
+]
+
+[[package]]
 name = "lb-cluster"
 version = "0.1.0"
 dependencies = [
