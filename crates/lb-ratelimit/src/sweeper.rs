@@ -32,6 +32,7 @@ mod tests {
             GcraConfig {
                 rate_per_sec: 10.0,
                 burst: 1,
+                max_tracked_keys: usize::MAX,
             },
             clock.clone(),
         ));

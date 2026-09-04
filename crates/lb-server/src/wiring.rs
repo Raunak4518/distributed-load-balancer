@@ -130,6 +130,7 @@ pub fn build_app(config: &Config) -> WiredApp {
             GcraConfig {
                 rate_per_sec: lc.rate_limit.rate_per_sec,
                 burst: lc.rate_limit.burst,
+                max_tracked_keys: lc.rate_limit.max_tracked_keys,
             },
             SystemClock,
         ));

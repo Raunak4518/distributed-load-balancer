@@ -100,6 +100,9 @@ fn bench_gcra_check() {
         GcraConfig {
             rate_per_sec: 1e9,
             burst: 1_000_000,
+            // Unbounded here so the benchmark measures GCRA itself rather
+            // than the cardinality cap.
+            max_tracked_keys: usize::MAX,
         },
         SystemClock,
     );
