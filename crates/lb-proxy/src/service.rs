@@ -34,6 +34,48 @@ pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     /// `[admin]` section controls *exposure*, not collection.
     pub metrics: Arc<ListenerMetrics>,
     pub backend_metrics: HashMap<BackendId, BackendMetrics>,
+    /// Access-log settings. Logging every request at 50k req/s is ~50,000
+    /// lines a second, so it is off unless explicitly enabled and sampled.
+    pub access_log: AccessLog,
+}
+
+/// Sampled per-request access logging.
+pub struct AccessLog {
+    pub enabled: bool,
+    /// Log one request in every `sample_every`. Derived from `sample_rate`
+    /// at wiring time so the hot path does no floating-point work.
+    pub sample_every: u64,
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl AccessLog {
+    pub fn new(enabled: bool, sample_rate: f64) -> Self {
+        let sample_every = if sample_rate <= 0.0 {
+            u64::MAX
+        } else {
+            (1.0 / sample_rate).round().max(1.0) as u64
+        };
+        AccessLog {
+            enabled,
+            sample_every,
+            counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::new(false, 0.0)
+    }
+
+    /// Deterministic 1-in-N sampling off a counter rather than drawing a
+    /// random number per request — cheaper, and gives an exact rate.
+    fn should_log(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(self.sample_every)
+    }
 }
 
 impl<R: RateLimiter, L: LoadBalancer, C: Clock> ProxyContext<R, L, C> {
@@ -127,17 +169,44 @@ where
     C: Clock,
 {
     let started = std::time::Instant::now();
-    let result = handle_inner(req, Arc::clone(&ctx), peer_ip).await;
+
+    // Generated here, never taken from an inbound header: at the edge an
+    // X-Request-Id is attacker-controlled and could be used to forge or
+    // collide log entries.
+    let request_id = uuid::Uuid::new_v4();
+    let method = req.method().clone();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+
+    let mut result = handle_inner(req, Arc::clone(&ctx), peer_ip).await;
 
     // Recorded in exactly one place so no early return can forget to. The
     // inner function has six return sites; duplicating this at each of them
     // would be a bug waiting to happen.
-    if let Ok(resp) = &result {
+    if let Ok(resp) = &mut result {
+        let status = resp.status();
         ctx.metrics
-            .record_status(StatusClass::from_code(resp.status().as_u16()));
-        ctx.metrics
-            .request_duration
-            .observe(started.elapsed().as_secs_f64());
+            .record_status(StatusClass::from_code(status.as_u16()));
+        let elapsed = started.elapsed();
+        ctx.metrics.request_duration.observe(elapsed.as_secs_f64());
+
+        if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
+            resp.headers_mut().insert("x-request-id", value);
+        }
+
+        if ctx.access_log.should_log() {
+            tracing::info!(
+                request_id = %request_id,
+                method = %method,
+                path = %path,
+                status = status.as_u16(),
+                duration_ms = elapsed.as_millis() as u64,
+                "request"
+            );
+        }
     }
     result
 }
@@ -402,6 +471,7 @@ mod tests {
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -421,6 +491,7 @@ mod tests {
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -449,6 +520,7 @@ mod tests {
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -478,6 +550,7 @@ mod tests {
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -515,6 +588,7 @@ mod tests {
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
         });
 
         // "dead" sorts first in pool order, so PreferFirstEligible tries it,

@@ -44,11 +44,11 @@ pub async fn run(config: Config) -> std::io::Result<()> {
             )
         })?;
         let actual = listener.local_addr()?;
-        eprintln!(
-            "listener '{}' ({}) on {}",
-            runtime.name(),
-            runtime.protocol_name(),
-            actual
+        tracing::info!(
+            listener = %runtime.name(),
+            protocol = runtime.protocol_name(),
+            addr = %actual,
+            "listener bound"
         );
         bound.push((listener, runtime));
     }
@@ -66,11 +66,11 @@ pub async fn run(config: Config) -> std::io::Result<()> {
                 ),
             )
         })?;
-        eprintln!(
-            "cluster node '{}' peer listener on {} ({} peer(s))",
-            setup.node.node_id(),
-            peer_listener.local_addr()?,
-            setup.peers.len()
+        tracing::info!(
+            node_id = %setup.node.node_id(),
+            addr = %peer_listener.local_addr()?,
+            peers = setup.peers.len(),
+            "cluster peer listener bound"
         );
         cluster_tasks.push(lb_cluster::spawn_peer_listener(
             Arc::clone(&setup.node),
@@ -92,7 +92,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
                 format!("admin listener could not bind {admin_addr}: {err}"),
             )
         })?;
-        eprintln!("admin listener on {}", admin_listener.local_addr()?);
+        tracing::info!(addr = %admin_listener.local_addr()?, "admin listener bound");
 
         // Ready when any listener has somewhere to forward. If every backend
         // is down, this instance should leave rotation — but stay alive, since
@@ -120,7 +120,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     }
 
     shutdown::wait_for_shutdown_signal().await;
-    eprintln!("shutdown signal received, draining in-flight connections");
+    tracing::info!("shutdown signal received, draining in-flight connections");
     let _ = shutdown_tx.send(true);
 
     for task in listener_tasks {
@@ -148,7 +148,7 @@ async fn serve_listener(
                 Ok((stream, peer)) => spawn_connection(&runtime, &mut connections, stream, peer),
                 // A transient accept error (e.g. fd exhaustion) must not kill
                 // the listener permanently.
-                Err(err) => eprintln!("accept error on '{}': {err}", runtime.name()),
+                Err(err) => tracing::warn!(listener = %runtime.name(), error = %err, "accept failed"),
             },
             _ = shutdown.changed() => break,
         }
@@ -159,10 +159,10 @@ async fn serve_listener(
     })
     .await;
     if drained.is_err() {
-        eprintln!(
-            "listener '{}': drain deadline exceeded, aborting {} connection(s)",
-            runtime.name(),
-            connections.len()
+        tracing::warn!(
+            listener = %runtime.name(),
+            remaining = connections.len(),
+            "drain deadline exceeded, aborting connections"
         );
         connections.abort_all();
     }
@@ -182,7 +182,7 @@ fn spawn_connection(
             connections.spawn(async move {
                 let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
                 if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
-                    eprintln!("connection error: {err}");
+                    tracing::debug!(error = %err, "client connection error");
                 }
             });
         }

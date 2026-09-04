@@ -172,6 +172,10 @@ pub fn build_app(config: &Config) -> WiredApp {
                     cluster: cluster_coordinator,
                     metrics: Arc::clone(&listener_metrics),
                     backend_metrics,
+                    access_log: lb_proxy::AccessLog::new(
+                        config.logging.log_requests,
+                        config.logging.sample_rate,
+                    ),
                 }),
             },
             Protocol::Tcp => ListenerRuntime::Tcp {

@@ -41,10 +41,11 @@ async fn handle_peer_connection<C>(
         match read_message(&mut stream).await {
             Ok(msg) => {
                 if node.merge_message(&msg) == MergeOutcome::OwnNodeIdEcho {
-                    eprintln!(
-                        "cluster: peer {peer} announced node_id '{}', which is ours — \
-                         two nodes share a node_id, and their counts will collide",
-                        msg.node_id
+                    tracing::error!(
+                        peer = %peer,
+                        node_id = %msg.node_id,
+                        "peer announced our own node_id — two nodes share a node_id \
+                         and their counts will collide"
                     );
                 }
             }
