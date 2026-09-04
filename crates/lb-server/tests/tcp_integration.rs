@@ -25,7 +25,7 @@ async fn proxies_tcp_bytes_end_to_end() {
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    support::wait_until_listening(listen).await;
 
     let echoed = tcp_roundtrip(listen, b"hello over tcp").await.unwrap();
     assert_eq!(echoed, b"hello over tcp");
@@ -36,16 +36,20 @@ async fn rate_limited_tcp_connection_is_closed_with_no_data() {
     let (backend_addr, count) = spawn_echo_backend().await;
     let listen = free_addr().await;
 
-    // burst of 2: the first two connections pass, the third is refused.
+    // Burst of 3, not 2: `wait_until_listening` opens one real connection,
+    // and a TCP listener rate-limits *connections*, so the readiness probe
+    // itself consumes one unit of budget. It costs exactly one — a failed
+    // connect is refused before the limiter sees it — so accounting for it
+    // is deterministic. That leaves two for the assertions below.
     let config = Config::parse(&tcp_config_toml(
         &listen.to_string(),
         &[("b1", backend_addr)],
         2.0,
-        2,
+        3,
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    support::wait_until_listening(listen).await;
 
     assert_eq!(tcp_roundtrip(listen, b"one").await.unwrap(), b"one");
     assert_eq!(tcp_roundtrip(listen, b"two").await.unwrap(), b"two");
@@ -81,7 +85,7 @@ async fn fails_over_to_a_healthy_tcp_backend() {
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    support::wait_until_listening(listen).await;
 
     for _ in 0..4 {
         let echoed = tcp_roundtrip(listen, b"ping").await.unwrap();
@@ -151,7 +155,9 @@ listen = "{tcp_listen}"
 
     let config = Config::parse(&config_text).unwrap();
     tokio::spawn(lb_server::run(config));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Both listeners must be up before either side is exercised.
+    support::wait_until_listening(http_listen).await;
+    support::wait_until_listening(tcp_listen).await;
 
     // HTTP side works...
     let resp = reqwest::Client::new()

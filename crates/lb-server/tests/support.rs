@@ -212,6 +212,7 @@ listen = "{cluster_listen}"
 peers = [{peers}]
 sync_interval_ms = 50
 window_secs = {window_secs}
+shared_secret = "integration-test-secret"
 
 [[listeners]]
 name = "web"
@@ -279,4 +280,20 @@ listen = "{traffic_listen}"
   strategy = "round_robin"
 "#
     )
+}
+
+/// Waits until `addr` accepts a TCP connection, or the deadline passes.
+///
+/// Replaces `sleep(150ms)` after starting a server. A fixed sleep is a race:
+/// it passes on an idle machine and fails under load, which is exactly the
+/// kind of flake that trains people to ignore test failures.
+pub async fn wait_until_listening(addr: SocketAddr) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("nothing listening on {addr} after 10s");
 }

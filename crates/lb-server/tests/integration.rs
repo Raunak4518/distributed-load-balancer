@@ -27,7 +27,7 @@ async fn distributes_requests_round_robin_across_backends() {
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
-    tokio::time::sleep(Duration::from_millis(100)).await; // let the listener bind
+    support::wait_until_listening(listen).await; // let the listener bind
 
     let client = reqwest::Client::new();
     for i in 0..4 {
@@ -54,7 +54,7 @@ async fn rate_limits_a_bursty_client_with_429() {
 
     let config = Config::parse(&config_toml(&listen.to_string(), &[("b1", addr)], 2.0, 2)).unwrap();
     tokio::spawn(lb_server::run(config));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::new();
     let mut statuses = vec![];
@@ -87,7 +87,7 @@ async fn fails_over_when_a_backend_stops_responding() {
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::new();
     let mut ok_count = 0;

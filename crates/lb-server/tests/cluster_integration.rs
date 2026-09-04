@@ -61,7 +61,8 @@ async fn one_nodes_traffic_exhausts_the_budget_for_another() {
 
     tokio::spawn(lb_server::run(config_a));
     tokio::spawn(lb_server::run(config_b));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    support::wait_until_listening(traffic_a).await;
+    support::wait_until_listening(traffic_b).await;
 
     // Node A spends the entire global budget of 20.
     let mut admitted_a = 0;
@@ -126,7 +127,8 @@ listen = "{listen}"
 
     tokio::spawn(lb_server::run(Config::parse(&solo(traffic_a)).unwrap()));
     tokio::spawn(lb_server::run(Config::parse(&solo(traffic_b)).unwrap()));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    support::wait_until_listening(traffic_a).await;
+    support::wait_until_listening(traffic_b).await;
 
     for _ in 0..5 {
         assert_eq!(get(traffic_a).await, StatusCode::OK);
@@ -166,7 +168,9 @@ async fn three_nodes_hold_the_global_limit_within_the_documented_bound() {
         .unwrap();
         tokio::spawn(lb_server::run(config));
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    for addr in &traffic {
+        support::wait_until_listening(*addr).await;
+    }
 
     let global_limit = 20; // rate 2/s * 10s window
 

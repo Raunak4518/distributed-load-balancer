@@ -72,6 +72,14 @@ pub struct ClusterConfig {
     pub sync_interval_ms: u64,
     #[serde(default = "default_window_secs")]
     pub window_secs: u64,
+    /// Name of the environment variable holding the peer-sync secret.
+    /// Preferred: config files end up in version control, secrets should not.
+    #[serde(default)]
+    pub shared_secret_env: Option<String>,
+    /// Literal secret. Accepted for tests and constrained environments; the
+    /// environment-variable form is preferred.
+    #[serde(default)]
+    pub shared_secret: Option<String>,
 }
 
 fn default_sync_interval_ms() -> u64 {
@@ -85,6 +93,34 @@ fn default_window_secs() -> u64 {
 impl ClusterConfig {
     pub fn sync_interval(&self) -> Duration {
         Duration::from_millis(self.sync_interval_ms)
+    }
+
+    /// Resolves the peer-sync secret.
+    ///
+    /// Deliberately not done during `parse`: reading the environment is a
+    /// side effect, and config parsing should be pure so tests can exercise
+    /// it without touching global state. `lb-server` calls this at startup,
+    /// before anything binds, so a missing secret fails fast.
+    pub fn resolve_secret(&self) -> Result<Vec<u8>, ConfigError> {
+        let secret = match (&self.shared_secret_env, &self.shared_secret) {
+            (Some(var), None) => std::env::var(var).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "cluster.shared_secret_env names '{var}', but that environment variable is not set"
+                ))
+            })?,
+            (None, Some(literal)) => literal.clone(),
+            _ => {
+                return Err(ConfigError::Invalid(
+                    "cluster requires exactly one of shared_secret_env or shared_secret".into(),
+                ))
+            }
+        };
+        if secret.is_empty() {
+            return Err(ConfigError::Invalid(
+                "cluster peer secret must not be empty".into(),
+            ));
+        }
+        Ok(secret.into_bytes())
     }
 }
 
@@ -127,6 +163,12 @@ pub struct ListenerConfig {
     pub connect_timeout_ms: Option<u64>,
     pub idle_timeout_ms: Option<u64>,
 
+    // Edge hardening — defaults applied by the accessors below.
+    pub max_connections: Option<usize>,
+    pub max_connections_per_ip: Option<usize>,
+    pub header_read_timeout_ms: Option<u64>,
+    pub body_read_timeout_ms: Option<u64>,
+
     pub backends: Vec<BackendConfig>,
     pub health_check: HealthCheckConfig,
     pub rate_limit: RateLimitConfig,
@@ -148,6 +190,28 @@ impl ListenerConfig {
 
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_millis(self.idle_timeout_ms.unwrap_or(300_000))
+    }
+
+    pub fn max_connections(&self) -> usize {
+        self.max_connections.unwrap_or(10_000)
+    }
+
+    /// A global cap alone protects the process but not its users: one
+    /// attacker could otherwise consume the whole budget.
+    pub fn max_connections_per_ip(&self) -> usize {
+        self.max_connections_per_ip.unwrap_or(100)
+    }
+
+    /// Caps how long a client may take to send the request head. Without
+    /// this, dribbling headers holds a connection open indefinitely.
+    pub fn header_read_timeout(&self) -> Duration {
+        Duration::from_millis(self.header_read_timeout_ms.unwrap_or(5_000))
+    }
+
+    /// Caps how long a client may take to send the body. A size limit alone
+    /// is not a bound: 1 MiB at one byte per second is eleven days.
+    pub fn body_read_timeout(&self) -> Duration {
+        Duration::from_millis(self.body_read_timeout_ms.unwrap_or(10_000))
     }
 }
 
@@ -179,6 +243,15 @@ pub struct RateLimitConfig {
     pub key: RateLimitKeySource,
     pub rate_per_sec: f64,
     pub burst: u32,
+    /// Caps how many distinct keys are tracked. Beyond this, new keys share
+    /// one overflow budget — see the Phase 5 design for why that beats
+    /// rejecting newcomers or evicting established clients.
+    #[serde(default = "default_max_tracked_keys")]
+    pub max_tracked_keys: usize,
+}
+
+fn default_max_tracked_keys() -> usize {
+    100_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -285,6 +358,18 @@ impl Config {
                     cluster.listen, clash.name
                 )));
             }
+            // Mandatory: an optional security control defaults to off and
+            // stays off. Deliberate break with Phase 3 configs — the peer
+            // port influences rate-limiting decisions, so unauthenticated
+            // access to it is a denial-of-service vector.
+            match (&cluster.shared_secret_env, &cluster.shared_secret) {
+                (Some(_), None) | (None, Some(_)) => {}
+                _ => {
+                    return Err(ConfigError::Invalid(
+                        "cluster requires exactly one of shared_secret_env or shared_secret".into(),
+                    ))
+                }
+            }
         }
 
         if let Some(admin) = &self.admin {
@@ -333,6 +418,27 @@ impl ListenerConfig {
         }
         if self.rate_limit.burst == 0 {
             return Err(invalid("rate_limit.burst must be positive".into()));
+        }
+        if self.rate_limit.max_tracked_keys == 0 {
+            return Err(invalid(
+                "rate_limit.max_tracked_keys must be positive".into(),
+            ));
+        }
+
+        if self.max_connections() == 0 || self.max_connections_per_ip() == 0 {
+            return Err(invalid(
+                "max_connections and max_connections_per_ip must be positive".into(),
+            ));
+        }
+        if self.max_connections_per_ip() > self.max_connections() {
+            return Err(invalid(
+                "max_connections_per_ip cannot exceed max_connections".into(),
+            ));
+        }
+        if self.header_read_timeout().is_zero() || self.body_read_timeout().is_zero() {
+            return Err(invalid(
+                "header_read_timeout_ms and body_read_timeout_ms must be positive".into(),
+            ));
         }
 
         match self.protocol {
@@ -509,11 +615,20 @@ mod tests {
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
     }
 
+    /// Phase 3 shape: valid then, rejected now because it has no secret.
+    const CLUSTER_NO_SECRET: &str = r#"
+        [cluster]
+        node_id = "lb-1"
+        listen = "127.0.0.1:7946"
+        peers = ["127.0.0.1:7947"]
+    "#;
+
     const CLUSTER: &str = r#"
         [cluster]
         node_id = "lb-1"
         listen = "127.0.0.1:7946"
         peers = ["127.0.0.1:7947"]
+        shared_secret = "test-secret"
     "#;
 
     #[test]
@@ -582,6 +697,77 @@ mod tests {
     fn rejects_out_of_range_sample_rate() {
         let text = format!("[logging]\nsample_rate = 1.5\n\n{VALID}");
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn listener_limits_have_defaults() {
+        let cfg = Config::parse(VALID).unwrap();
+        let l = &cfg.listeners[0];
+        assert_eq!(l.max_connections(), 10_000);
+        assert_eq!(l.max_connections_per_ip(), 100);
+        assert_eq!(l.header_read_timeout(), Duration::from_millis(5_000));
+        assert_eq!(l.body_read_timeout(), Duration::from_millis(10_000));
+        assert_eq!(l.rate_limit.max_tracked_keys, 100_000);
+    }
+
+    #[test]
+    fn rejects_per_ip_cap_above_global_cap() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"
+        max_connections = 10
+        max_connections_per_ip = 100",
+        );
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn cluster_without_a_secret_is_rejected() {
+        let text = format!("{CLUSTER_NO_SECRET}{VALID}");
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn cluster_with_both_secret_sources_is_rejected() {
+        let text = format!(
+            "{}{VALID}",
+            CLUSTER.replace(
+                "shared_secret = \"test-secret\"",
+                "shared_secret = \"a\"
+        shared_secret_env = \"SOME_VAR\""
+            )
+        );
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn resolves_a_literal_secret() {
+        let cfg = Config::parse(&format!("{CLUSTER}{VALID}")).unwrap();
+        assert_eq!(
+            cfg.cluster.unwrap().resolve_secret().unwrap(),
+            b"test-secret".to_vec()
+        );
+    }
+
+    #[test]
+    fn rejects_an_empty_secret() {
+        let text = format!("{}{VALID}", CLUSTER.replace("test-secret", ""));
+        let cfg = Config::parse(&text).unwrap();
+        assert!(cfg.cluster.unwrap().resolve_secret().is_err());
+    }
+
+    #[test]
+    fn reports_a_missing_environment_variable() {
+        let text = format!(
+            "{}{VALID}",
+            CLUSTER.replace(
+                "shared_secret = \"test-secret\"",
+                "shared_secret_env = \"LB_DEFINITELY_UNSET_VARIABLE_XYZ\""
+            )
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let err = cfg.cluster.unwrap().resolve_secret().unwrap_err();
+        assert!(format!("{err}").contains("not set"));
     }
 
     #[test]
