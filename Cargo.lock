@@ -885,6 +885,8 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "thiserror",
+ "tokio",
+ "tokio-rustls",
  "x509-parser",
 ]
 

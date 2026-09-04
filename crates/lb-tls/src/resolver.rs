@@ -106,9 +106,7 @@ impl rustls::server::ResolvesServerCert for SniResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[path = "../../../tests/support/mod.rs"]
-    #[allow(clippy::duplicate_mod)]
-    mod support;
+    use crate::test_support as support;
 
     fn store(specs: &[(&str, &[&str])]) -> CertStore {
         let dir = std::env::temp_dir().join(format!("lbsni-{}", nanos()));

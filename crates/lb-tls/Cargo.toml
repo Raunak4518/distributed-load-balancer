@@ -9,9 +9,15 @@ lb-core = { path = "../lb-core" }
 # which is a real build risk on this machine. Every TLS crate below must
 # agree on the provider or install_default() conflicts at runtime.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
 x509-parser = "0.16"
 thiserror = "1"
+# `time` for the handshake timeout in `accept()`. `AsyncRead`/`AsyncWrite`
+# (used only as trait bounds) need no feature at all -- do not add io-util
+# here, it belongs to the extension traits the tests use, not this crate.
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
 rcgen = "0.13"
+tokio = { version = "1", features = ["rt", "time", "net", "macros", "io-util"] }

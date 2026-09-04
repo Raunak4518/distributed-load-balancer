@@ -80,11 +80,7 @@ fn leaf_not_after(leaf: &CertificateDer<'_>) -> Result<i64, TlsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `#[path]` here is relative to the directory owned by this inline
-    // `tests` module (src/certs/tests/), not the crate root — hence three
-    // levels up to reach `crates/lb-tls/` and back down into `tests/`.
-    #[path = "../../../tests/support/mod.rs"]
-    mod support;
+    use crate::test_support as support;
 
     fn cfg(dir: &std::path::Path, stem: &str, names: &[&str]) -> CertificateConfig {
         let (cert_file, key_file) = support::write_pair(dir, stem, names);
