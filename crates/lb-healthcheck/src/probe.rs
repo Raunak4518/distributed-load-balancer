@@ -80,7 +80,7 @@ mod tests {
         });
 
         let probe = TcpConnectProbe::new(Duration::from_millis(500));
-        let backend = Backend::new("b1", addr, 1);
+        let backend = Backend::new("b1", addr, 1, None);
         assert!(probe.probe(&backend).await);
     }
 
@@ -92,7 +92,7 @@ mod tests {
         drop(listener);
 
         let probe = TcpConnectProbe::new(Duration::from_millis(300));
-        let backend = Backend::new("b1", addr, 1);
+        let backend = Backend::new("b1", addr, 1, None);
         assert!(!probe.probe(&backend).await);
     }
 }

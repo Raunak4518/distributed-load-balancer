@@ -20,14 +20,30 @@ pub struct Backend {
     pub id: BackendId,
     pub address: SocketAddr,
     pub weight: u32,
+    /// The name on the backend's certificate, which is a different fact from
+    /// the address we dial: backends are addressed as `IP:port`, but
+    /// certificates are issued for hostnames. Carrying it separately is what
+    /// lets SNI and hostname verification check the certificate's name
+    /// rather than the address the connection happened to be made to.
+    ///
+    /// `None` for backends that are never spoken to over TLS. Config
+    /// validation requires it whenever `backend_tls` is set, so an empty
+    /// name never reaches a TLS handshake.
+    pub server_name: Option<String>,
 }
 
 impl Backend {
-    pub fn new(id: impl Into<String>, address: SocketAddr, weight: u32) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        address: SocketAddr,
+        weight: u32,
+        server_name: Option<String>,
+    ) -> Self {
         Backend {
             id: BackendId::new(id),
             address,
             weight,
+            server_name,
         }
     }
 }
@@ -39,10 +55,26 @@ mod tests {
 
     #[test]
     fn backend_new_sets_all_fields() {
-        let b = Backend::new("b1", "127.0.0.1:9001".parse().unwrap(), 3);
+        let b = Backend::new(
+            "b1",
+            "127.0.0.1:9001".parse().unwrap(),
+            3,
+            Some("b1.internal".to_string()),
+        );
         assert_eq!(b.id, BackendId::new("b1"));
         assert_eq!(b.address.to_string(), "127.0.0.1:9001");
         assert_eq!(b.weight, 3);
+        assert_eq!(b.server_name.as_deref(), Some("b1.internal"));
+    }
+
+    /// The address is where we dial; the name is what the certificate has to
+    /// say. Conflating them is the mistake this field exists to prevent, so
+    /// a backend with no configured name must not silently acquire its IP as
+    /// one.
+    #[test]
+    fn a_backend_without_a_configured_name_has_none() {
+        let b = Backend::new("b1", "127.0.0.1:9001".parse().unwrap(), 1, None);
+        assert_eq!(b.server_name, None);
     }
 
     #[test]

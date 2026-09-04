@@ -10,3 +10,9 @@ test-util = []
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+# `AsyncRead`/`AsyncWrite` only, for the `ProxyStream` trait bound in
+# transport.rs. Those two traits need no feature at all: no runtime, no
+# `net`, no `io-util`. This crate defines boundaries and does no I/O,
+# and adding a feature here would be the first step towards it doing
+# some.
+tokio = { version = "1", default-features = false }

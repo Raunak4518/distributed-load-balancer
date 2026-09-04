@@ -53,6 +53,7 @@ fn pool_of(n: usize) -> BackendPool {
                 format!("backend-{i}"),
                 format!("127.0.0.1:{}", 9000 + i).parse().unwrap(),
                 1,
+                None,
             )
         })
         .collect();

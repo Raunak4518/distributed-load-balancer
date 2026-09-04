@@ -790,6 +790,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror",
+ "tokio",
  "toml",
 ]
 
@@ -826,10 +827,12 @@ dependencies = [
  "http",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "lb-core",
  "lb-healthcheck",
  "lb-metrics",
+ "lb-tls",
  "tokio",
  "tracing",
  "uuid",

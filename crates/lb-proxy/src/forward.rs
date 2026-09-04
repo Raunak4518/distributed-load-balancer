@@ -7,7 +7,11 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use std::time::Duration;
 
-pub type ProxyClient = Client<HttpConnector, Full<Bytes>>;
+/// Always an HTTPS-capable connector, even for plaintext backends:
+/// `https_or_http()` speaks whichever the URL scheme asks for, so one type
+/// serves both and the client stays a single concrete type rather than a
+/// generic parameter threaded through every context in the crate.
+pub type ProxyClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 /// Connect timeout (time to establish the TCP connection) and pool idle
 /// timeout (how long a kept-alive backend connection may sit unused before
@@ -17,9 +21,32 @@ pub type ProxyClient = Client<HttpConnector, Full<Bytes>>;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn build_client() -> ProxyClient {
-    let mut connector = HttpConnector::new();
-    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+/// Builds the forwarding client.
+///
+/// `Some` re-encrypts to backends using that listener's trust roots and
+/// verification policy; `None` forwards plaintext. The pool is what makes
+/// re-encryption affordable at L7: backend handshakes amortise across
+/// keep-alive instead of being paid per request.
+pub fn build_client(backend_tls: Option<&lb_tls::BackendConnector>) -> ProxyClient {
+    let connector = match backend_tls {
+        Some(b) => b.https_connector(),
+        // No backend TLS configured. This connector will only ever be given
+        // `http://` URLs -- `build_outbound_request` picks the scheme from
+        // the same setting -- so the roots it loads are never consulted;
+        // they exist because `https_or_http()` is what keeps `ProxyClient` a
+        // single type across both cases.
+        None => {
+            let mut http = HttpConnector::new();
+            http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+            http.enforce_http(false);
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .expect("a native root store is loadable")
+                .https_or_http()
+                .enable_http1()
+                .wrap_connector(http)
+        }
+    };
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .build(connector)
@@ -82,7 +109,7 @@ mod tests {
     #[tokio::test]
     async fn forwards_and_returns_backend_response() {
         let addr = spawn_fixed_response_backend(StatusCode::OK).await;
-        let client = build_client();
+        let client = build_client(None);
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
@@ -100,9 +127,37 @@ mod tests {
         // unlike most Unix TCP stacks, a closed loopback port does not
         // reliably send an immediate RST, so this test accepts either
         // variant. lb-proxy's own retry logic treats them identically.
-        let client = build_client();
+        let client = build_client(None);
         let req = Request::builder()
             .uri("http://127.0.0.1:1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let result = forward(&client, req, Duration::from_secs(1)).await;
+        assert!(matches!(
+            result,
+            Err(ForwardError::Connect | ForwardError::Timeout)
+        ));
+    }
+
+    /// A re-encrypting listener forwards `https://` URLs, which the plain
+    /// `HttpConnector` this client used to be built on would have rejected
+    /// outright as an unsupported scheme. Whether the certificate is
+    /// *trusted* is the connector's business, proven against a live
+    /// handshake in `lb-tls` and end to end in `lb-server`.
+    #[tokio::test]
+    async fn a_client_built_from_a_backend_connector_speaks_https() {
+        let connector = lb_tls::BackendConnector::new(&lb_core::BackendTlsConfig {
+            ca_file: None,
+            danger_accept_invalid_certs: false,
+        })
+        .unwrap();
+        let client = build_client(Some(&connector));
+        // Nothing is listening, so this fails at connect -- but it fails
+        // there rather than at "invalid URL for connector", which is the
+        // distinction being drawn.
+        let req = Request::builder()
+            .uri("https://127.0.0.1:1/")
             .body(Full::new(Bytes::new()))
             .unwrap();
 

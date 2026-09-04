@@ -52,7 +52,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let backend = Backend::new("b1", *mock.address(), 1);
+        let backend = Backend::new("b1", *mock.address(), 1, None);
         let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
         pool.set_active_healthy(&backend.id, false); // start unhealthy to prove the checker flips it
 
@@ -80,7 +80,7 @@ mod tests {
             .mount(&mock)
             .await;
 
-        let backend = Backend::new("b1", *mock.address(), 1);
+        let backend = Backend::new("b1", *mock.address(), 1, None);
         let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
 
         let handle = spawn_active_checker(
@@ -107,7 +107,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
 
-        let backend = Backend::new("b1", addr, 1);
+        let backend = Backend::new("b1", addr, 1, None);
         let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
 
         let handle = spawn_active_checker(

@@ -561,3 +561,501 @@ async fn a_tls_tcp_listener_proxies_bytes_to_a_plaintext_backend() {
     assert_eq!(&echoed, b"ping over tls");
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Re-encrypting to backends
+// ---------------------------------------------------------------------------
+
+/// A backend that speaks TLS to real traffic and plaintext to the health
+/// probe, counting every non-health request *that arrived over TLS*.
+///
+/// Counting only the TLS ones is deliberate: it is what makes the
+/// trusted-backend test below fail if forwarding ever regresses to
+/// plaintext, which would otherwise still answer 200 and look like a pass.
+///
+/// The dual behaviour is a workaround with a shelf life: until Task 9 the
+/// active HTTP probe still speaks plaintext, so a TLS-only backend would be
+/// marked unhealthy within milliseconds of startup and every test below
+/// would get a 503 for a reason that has nothing to do with what it is
+/// testing. Sniffing the first byte (0x16 is a TLS handshake record) keeps
+/// the backend eligible so these tests measure the forwarding path.
+async fn spawn_tls_backend(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    lb_tls::install_crypto_provider();
+
+    let tls_cfg = lb_core::TlsConfig {
+        certificates: vec![lb_core::CertificateConfig {
+            name: "backend".into(),
+            cert_file: cert.to_path_buf(),
+            key_file: key.to_path_buf(),
+            hostnames: vec!["localhost".into()],
+        }],
+        handshake_timeout_ms: Some(5_000),
+        min_version: None,
+        reload_interval_secs: None,
+        hsts_max_age_secs: None,
+    };
+    let acceptor = std::sync::Arc::new(lb_tls::TlsAcceptor::new(&tls_cfg, &[b"http/1.1"]).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let hits = std::sync::Arc::clone(&count);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = std::sync::Arc::clone(&acceptor);
+            let hits = std::sync::Arc::clone(&hits);
+            tokio::spawn(async move {
+                let mut first = [0u8; 1];
+                let is_tls = matches!(stream.peek(&mut first).await, Ok(1) if first[0] == 0x16);
+                let svc = hyper::service::service_fn(move |req: hyper::Request<_>| {
+                    let hits = std::sync::Arc::clone(&hits);
+                    async move {
+                        if is_tls && req.uri().path() != "/health" {
+                            hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                            http_body_util::Full::new(bytes::Bytes::new()),
+                        ))
+                    }
+                });
+                if is_tls {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                        .await;
+                } else {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                        .await;
+                }
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// `tls_http_config` plus a `[listeners.backend_tls]` section, a
+/// `server_name` on the backend, and an optional `[admin]` listener.
+///
+/// The backend's `server_name` is `localhost` rather than something like
+/// `backend.internal` because at L7 the forwarding authority *is* the
+/// server name, so it has to resolve. `backend.internal` would fail in DNS
+/// long before any certificate was looked at.
+fn backend_tls_config(
+    listen: SocketAddr,
+    backend: SocketAddr,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    ca_file: Option<&std::path::Path>,
+    danger: bool,
+    admin: Option<SocketAddr>,
+) -> String {
+    let ca_line = match ca_file {
+        Some(p) => format!(
+            "  ca_file = \"{}\"\n",
+            p.display().to_string().replace('\\', "\\\\")
+        ),
+        None => String::new(),
+    };
+    let admin_section = match admin {
+        Some(a) => format!("[admin]\nlisten = \"{a}\"\n"),
+        None => String::new(),
+    };
+    format!(
+        r#"
+{admin_section}
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+
+  [listeners.tls]
+  handshake_timeout_ms = 5000
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "{cert}"
+    key_file = "{key}"
+    hostnames = ["localhost"]
+
+  [listeners.backend_tls]
+  danger_accept_invalid_certs = {danger}
+{ca_line}
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+  server_name = "localhost"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#,
+        cert = cert.display().to_string().replace('\\', "\\\\"),
+        key = key.display().to_string().replace('\\', "\\\\"),
+    )
+}
+
+/// A client that trusts the load balancer's own self-signed certificate.
+/// This is the harness accepting a certificate it generated seconds ago; it
+/// says nothing about what the load balancer accepts from its backends,
+/// which is what these tests are about.
+fn trusting_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+}
+
+/// The certificate is self-signed and in no trust store, so verification
+/// must fail. This is the behaviour that makes re-encryption worth anything:
+/// encryption without authentication does not address the threat that
+/// motivates it.
+///
+/// It is also the test Task 7's reviewer deferred — until now nothing proved
+/// `BackendConnector` rejected anything, because it had never completed a
+/// handshake.
+#[tokio::test]
+async fn an_untrusted_backend_certificate_is_refused() {
+    let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
+    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+
+    let config = Config::parse(&backend_tls_config(
+        listen, backend, &cert, &key, /* ca_file */ None, /* danger */ false, None,
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let resp = trusting_client()
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        502,
+        "an untrusted backend was proxied to anyway"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the request reached a backend whose certificate we could not verify"
+    );
+}
+
+/// A plaintext listener with no `[listeners.backend_tls]` still forwards to
+/// its backend over plaintext, unchanged by this phase.
+#[tokio::test]
+async fn a_listener_without_backend_tls_still_forwards_plaintext() {
+    let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 100)).unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let resp = trusting_client()
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// The same backend, with its certificate supplied as the trust root — the
+/// internal-PKI case `ca_file` exists for. Without this control, the test
+/// above would pass just as well if forwarding were broken outright.
+#[tokio::test]
+async fn a_backend_trusted_via_ca_file_is_proxied_to() {
+    let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
+    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        Some(&bcert),
+        false,
+        None,
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let resp = trusting_client()
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    // Counted only for TLS connections, so a regression to plaintext
+    // forwarding fails here rather than quietly answering 200.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// `danger_accept_invalid_certs` must genuinely bypass verification — the
+/// same backend the first test refuses is proxied to here — and must say so
+/// where an operator will see it. A gauge that is never set is the same as
+/// no gauge at all.
+#[tokio::test]
+async fn the_danger_flag_forwards_to_an_unverifiable_backend_and_is_visible() {
+    let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
+    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let admin = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        None,
+        true,
+        Some(admin),
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+    support::wait_until_listening(admin).await;
+
+    let resp = trusting_client()
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let body = reqwest::get(format!("http://{admin}/metrics"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains(r#"lb_backend_tls_verification_disabled{listener="web"} 1"#),
+        "the danger flag is not visible on /metrics:\n{body}"
+    );
+}
+
+/// An unreadable `ca_file` is operator input in exactly the same class as an
+/// unreadable certificate: it must fail startup, not leave a bound port that
+/// rejects every backend at the first request.
+#[tokio::test]
+async fn an_unreadable_ca_file_fails_startup_with_an_error() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let (dir, cert, key) = cert_files(&["localhost"]);
+    let missing = dir.join("this-ca-was-never-written.crt");
+
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        Some(&missing),
+        false,
+        None,
+    ))
+    .unwrap();
+
+    let err = lb_server::run(config)
+        .await
+        .expect_err("an unreadable ca_file must fail startup");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("web"),
+        "the error must name the listener that could not start: {err}"
+    );
+}
+
+fn reencrypting_tcp_config(
+    listen: SocketAddr,
+    backend: SocketAddr,
+    ca_file: &std::path::Path,
+) -> String {
+    format!(
+        r#"
+[[listeners]]
+name = "tcp-front"
+protocol = "tcp"
+listen = "{listen}"
+connect_timeout_ms = 2000
+idle_timeout_ms = 5000
+
+  [listeners.backend_tls]
+  ca_file = "{ca}"
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+  server_name = "backend.internal"
+
+  [listeners.health_check]
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#,
+        ca = ca_file.display().to_string().replace('\\', "\\\\"),
+    )
+}
+
+/// A TLS echo backend, for the L4 half. Unlike the HTTP fixture above it has
+/// no plaintext mode and needs none: `TcpConnectProbe` only opens a socket.
+async fn spawn_tls_echo_backend(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    lb_tls::install_crypto_provider();
+
+    let tls_cfg = lb_core::TlsConfig {
+        certificates: vec![lb_core::CertificateConfig {
+            name: "backend".into(),
+            cert_file: cert.to_path_buf(),
+            key_file: key.to_path_buf(),
+            hostnames: vec!["backend.internal".into()],
+        }],
+        handshake_timeout_ms: Some(5_000),
+        min_version: None,
+        reload_interval_secs: None,
+        hsts_max_age_secs: None,
+    };
+    let acceptor = std::sync::Arc::new(lb_tls::TlsAcceptor::new(&tls_cfg, &[]).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = std::sync::Arc::new(AtomicUsize::new(0));
+    let hits = std::sync::Arc::clone(&count);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = std::sync::Arc::clone(&acceptor);
+            let hits = std::sync::Arc::clone(&hits);
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 1024];
+                loop {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if tls.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// The L4 half of re-encryption, end to end: a plaintext TCP listener whose
+/// outbound leg is TLS. `lb-tcp` has no TLS dependency at all — it is handed
+/// an `OutboundTransport` by the wiring and pumps whatever comes back — so
+/// this is the test that the seam is actually connected.
+///
+/// Note the backend's `server_name` is `backend.internal`, a name that does
+/// not resolve anywhere: at L4 the connection is already open before the
+/// handshake starts, so the name is used for SNI and verification only,
+/// never for DNS.
+#[tokio::test]
+async fn a_tcp_listener_re_encrypts_to_a_tls_backend() {
+    let (_bdir, bcert, bkey) = cert_files(&["backend.internal"]);
+    let (backend, handshakes) = spawn_tls_echo_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+
+    let config = Config::parse(&reencrypting_tcp_config(listen, backend, &bcert)).unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(10),
+        support::tcp_roundtrip(listen, b"ping over re-encrypted tcp"),
+    )
+    .await
+    .expect("no echo came back within 10s")
+    .expect("the round trip failed");
+
+    assert_eq!(echoed, b"ping over re-encrypted tcp");
+    assert!(
+        handshakes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the backend never completed a TLS handshake"
+    );
+}
+
+/// The mirror image: the same backend, with nothing trusting its
+/// certificate. Plaintext must not be the fallback, so no bytes get through.
+#[tokio::test]
+async fn a_tcp_listener_refuses_an_untrusted_backend() {
+    let (_bdir, bcert, bkey) = cert_files(&["backend.internal"]);
+    let (backend, _handshakes) = spawn_tls_echo_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    // A different self-signed certificate as the trust root: a real,
+    // non-empty trust store that simply does not vouch for this backend.
+    let (_odir, other, _okey) = cert_files(&["someone.else"]);
+
+    let config = Config::parse(&reencrypting_tcp_config(listen, backend, &other)).unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(10),
+        support::tcp_roundtrip(listen, b"ping"),
+    )
+    .await
+    .expect("the connection was held open instead of being closed");
+
+    // Either the connection was reset or it closed with nothing on it; what
+    // must never happen is the echo coming back, which would mean the bytes
+    // were proxied to a backend we could not verify.
+    let bytes = echoed.unwrap_or_default();
+    assert!(
+        bytes.is_empty(),
+        "bytes were proxied to an unverifiable backend: {bytes:?}"
+    );
+}

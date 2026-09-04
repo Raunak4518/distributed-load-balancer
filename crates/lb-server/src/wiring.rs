@@ -147,6 +147,16 @@ pub fn build_app(
     // listener/backend below — never on the request path.
     let metrics = Arc::new(Metrics::new().expect("metric names are valid and unique"));
 
+    // Built here for the same reason as the acceptors above: an unreadable
+    // `ca_file` is operator input, and must fail startup rather than turn
+    // every backend request into a verification error. One connector per
+    // listener, so the same trust roots and verification policy serve both
+    // the L7 client and the L4 transport built from it below.
+    let mut backend_connectors = Vec::with_capacity(config.listeners.len());
+    for lc in &config.listeners {
+        backend_connectors.push(build_backend_connector(lc, &metrics)?);
+    }
+
     // One cluster node per process, shared by every listener.
     let cluster_node = match (config.cluster.as_ref(), cluster_secret) {
         (Some(c), Some(secret)) => Some(Arc::new(ClusterNode::new(
@@ -158,11 +168,16 @@ pub fn build_app(
         _ => None,
     };
 
-    for (lc, tls) in config.listeners.iter().zip(tls_acceptors) {
+    for ((lc, tls), backend_tls) in config
+        .listeners
+        .iter()
+        .zip(tls_acceptors)
+        .zip(backend_connectors)
+    {
         let backends: Vec<Backend> = lc
             .backends
             .iter()
-            .map(|b| Backend::new(b.id.clone(), b.address, b.weight))
+            .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
             .collect();
         let pool = Arc::new(BackendPool::new(backends.clone()));
         pools.push(Arc::clone(&pool));
@@ -249,7 +264,8 @@ pub fn build_app(
                     balancer: Arc::new(RoundRobin::new()),
                     pool,
                     circuit_breakers,
-                    client: lb_proxy::build_client(),
+                    client: lb_proxy::build_client(backend_tls.as_deref()),
+                    backend_tls: backend_tls.is_some(),
                     rate_limit_key: lc.rate_limit.key.clone(),
                     forward_timeout: lc.forward_timeout(),
                     max_request_body_bytes: lc.max_request_body_bytes(),
@@ -277,6 +293,13 @@ pub fn build_app(
                     circuit_breakers,
                     connect_timeout: lc.connect_timeout(),
                     idle_timeout: lc.idle_timeout(),
+                    // The one place the L4 data plane's re-encryption is
+                    // chosen. `lb-tcp` sees a trait object and never learns
+                    // which TLS implementation is behind it.
+                    backend_tls: backend_tls.map(|c| {
+                        Arc::new(lb_tls::BackendTlsTransport::new(&c))
+                            as Arc<dyn lb_core::OutboundTransport>
+                    }),
                     cluster: cluster_coordinator,
                     metrics: Arc::clone(&listener_metrics),
                     backend_metrics,
@@ -339,6 +362,50 @@ fn build_tls_acceptor(
         )
     })?;
     Ok(Some(Arc::new(acceptor)))
+}
+
+/// Builds one listener's backend connector, if it has a
+/// `[listeners.backend_tls]` section, and makes the danger flag visible.
+///
+/// The warning and the gauge are here rather than at the config layer
+/// because this is the moment the policy becomes real. `danger_accept_invalid_certs`
+/// encrypts backend traffic without authenticating it, which does not address
+/// the threat encryption is there for -- so it says so at every startup and
+/// sets a series a dashboard can alert on, instead of living undiscovered in
+/// a config file for two years.
+fn build_backend_connector(
+    lc: &ListenerConfig,
+    metrics: &Metrics,
+) -> Result<Option<Arc<lb_tls::BackendConnector>>, std::io::Error> {
+    let Some(cfg) = &lc.backend_tls else {
+        return Ok(None);
+    };
+    let connector = lb_tls::BackendConnector::new(cfg).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "listener '{}' could not load its backend TLS trust roots: {err}",
+                lc.name
+            ),
+        )
+    })?;
+
+    let disabled = connector.verification_disabled();
+    if disabled {
+        tracing::warn!(
+            listener = %lc.name,
+            "backend TLS certificate verification is DISABLED — traffic to \
+             backends is encrypted but NOT authenticated"
+        );
+    }
+    // Set either way, so a listener that does verify publishes a flat zero
+    // rather than a gap: to an alert those look identical.
+    metrics
+        .backend_tls_verification_disabled
+        .with_label_values(&[&lc.name])
+        .set(i64::from(disabled));
+
+    Ok(Some(Arc::new(connector)))
 }
 
 /// The listener's protocol picks the probe — an HTTP listener always wants an

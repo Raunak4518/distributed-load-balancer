@@ -7,6 +7,7 @@ pub mod error;
 pub mod health;
 pub mod pool;
 pub mod ratelimit;
+pub mod transport;
 
 pub use backend::{Backend, BackendId};
 pub use balancer::LoadBalancer;
@@ -24,3 +25,4 @@ pub use error::ConfigError;
 pub use health::HealthProbe;
 pub use pool::BackendPool;
 pub use ratelimit::{Decision, RateLimiter};
+pub use transport::{OutboundTransport, ProxyStream, WrapFuture};

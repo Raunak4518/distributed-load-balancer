@@ -1,5 +1,8 @@
 use crate::pump::pump;
-use lb_core::{BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimiter};
+use lb_core::{
+    Backend, BackendId, BackendPool, Clock, Decision, LoadBalancer, OutboundTransport, ProxyStream,
+    RateLimiter,
+};
 use lb_healthcheck::CircuitBreaker;
 use lb_metrics::{BackendMetrics, IntGauge, ListenerMetrics};
 use std::collections::HashMap;
@@ -15,6 +18,14 @@ pub struct TcpContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
+    /// Present only when this listener re-encrypts to its backends; `None`
+    /// means the outbound leg is plaintext.
+    ///
+    /// A trait object rather than a concrete TLS type on purpose: it is what
+    /// keeps `lb-tcp` free of any TLS dependency at all. The L4 data plane
+    /// asks for a connection to be wrapped and pumps whatever it gets back,
+    /// exactly as it is already generic over the inbound stream.
+    pub backend_tls: Option<Arc<dyn OutboundTransport>>,
     /// Present only when `[cluster]` is configured; `None` means single-node.
     pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
     /// Always present — see the note on `ProxyContext::metrics`.
@@ -52,6 +63,54 @@ impl<R: RateLimiter, L: LoadBalancer, C: Clock> TcpContext<R, L, C> {
                 self.pool.set_circuit_open(id, breaker.is_open());
             }
         }
+    }
+}
+
+/// Completes the outbound leg: the TCP connection, and the TLS handshake on
+/// top of it when this listener re-encrypts.
+///
+/// `None` means the backend did not give us a usable connection, and it is
+/// deliberately the same answer for a refused connect, a connect timeout and
+/// a failed handshake. A backend we cannot hand bytes to is a backend that
+/// did not answer, whichever step failed, so the caller records one outcome
+/// and retries once.
+async fn establish<R, L, C>(
+    ctx: &TcpContext<R, L, C>,
+    backend: &Backend,
+) -> Option<Box<dyn ProxyStream>>
+where
+    R: RateLimiter,
+    L: LoadBalancer,
+    C: Clock,
+{
+    let stream = match tokio::time::timeout(
+        ctx.connect_timeout,
+        TcpStream::connect(backend.address),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        // Either the connect failed or it timed out; both mean this backend
+        // did not answer.
+        _ => return None,
+    };
+    let stream: Box<dyn ProxyStream> = Box::new(stream);
+
+    match (&ctx.backend_tls, &backend.server_name) {
+        // L4 does not pool, and should not: a TCP session is 1:1 with a
+        // client connection. So every proxied connection pays one backend
+        // handshake -- inherent to L4, not a defect.
+        (Some(transport), Some(server_name)) => transport
+            .wrap(stream, server_name.clone(), ctx.connect_timeout)
+            .await
+            .ok(),
+        // Config validation requires a `server_name` on every backend of a
+        // listener that sets `backend_tls`, so this is unreachable through
+        // the config. It is spelled out rather than folded into the
+        // plaintext arm because falling back to plaintext would silently
+        // defeat the encryption that was asked for.
+        (Some(_), None) => None,
+        (None, _) => Some(stream),
     }
 }
 
@@ -115,7 +174,7 @@ where
 
     ctx.refresh_circuit_state();
 
-    let mut outbound: Option<TcpStream> = None;
+    let mut outbound: Option<Box<dyn ProxyStream>> = None;
     for attempt in 0..2u8 {
         let Some(backend_id) = ctx.balancer.pick(&ctx.pool) else {
             return ConnectionOutcome::NoBackend;
@@ -126,8 +185,8 @@ where
             .expect("picked id exists in the pool it was picked from")
             .clone();
 
-        match tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(backend.address)).await {
-            Ok(Ok(stream)) => {
+        match establish(&ctx, &backend).await {
+            Some(stream) => {
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_success.inc();
                 }
@@ -136,10 +195,11 @@ where
                 outbound = Some(stream);
                 break;
             }
-            // Either the connect failed or it timed out; both mean this
-            // backend did not answer. Retrying is safe here in a way it
-            // never is at L7: not one client byte has been read yet.
-            _ => {
+            // The connect failed, timed out, or the handshake did not
+            // complete; all three mean this backend did not answer.
+            // Retrying is safe here in a way it never is at L7: not one
+            // client byte has been read yet.
+            None => {
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_failure.inc();
                 }
@@ -164,9 +224,9 @@ where
     // non-blocking poll, so the two directions never wait on each other for
     // longer than one syscall.
     let (client_read, client_write) = tokio::io::split(inbound);
-    // The backend side is still ours to open, and is always a plain socket,
-    // so it keeps the lock-free split.
-    let (backend_read, backend_write) = outbound.into_split();
+    // The backend side is split the same way, and for the same reason: it is
+    // a plain socket only when the listener does not re-encrypt.
+    let (backend_read, backend_write) = tokio::io::split(outbound);
 
     // try_join! (not select!): each direction must finish on its own. With
     // select!, the first EOF would tear down the whole connection and break
@@ -188,7 +248,6 @@ where
 mod tests {
     use super::*;
     use lb_core::test_util::FakeClock;
-    use lb_core::Backend;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -269,6 +328,7 @@ mod tests {
             circuit_breakers,
             connect_timeout: Duration::from_millis(500),
             idle_timeout: Duration::from_secs(5),
+            backend_tls: None,
             cluster: None,
             metrics: {
                 let registry = lb_metrics::Metrics::new().expect("metrics registry");
@@ -316,7 +376,7 @@ mod tests {
         let ctx = context(
             AllowAll,
             FirstEligible,
-            vec![Backend::new("b1", backend_addr, 1)],
+            vec![Backend::new("b1", backend_addr, 1, None)],
         );
 
         let (outcome, echoed) = run_session(ctx, b"ping").await;
@@ -337,7 +397,7 @@ mod tests {
         let ctx = context(
             DenyAll,
             FirstEligible,
-            vec![Backend::new("b1", backend_addr, 1)],
+            vec![Backend::new("b1", backend_addr, 1, None)],
         );
 
         let (outcome, echoed) = run_session(ctx, b"ping").await;
@@ -351,6 +411,105 @@ mod tests {
         let ctx = context(AllowAll, NoBackendPicker, vec![]);
         let (outcome, _) = run_session(ctx, b"ping").await;
         assert_eq!(outcome, ConnectionOutcome::NoBackend);
+    }
+
+    /// A stand-in for the real transport `lb-tls` provides. It upper-cases
+    /// everything written towards the backend, which is a visible,
+    /// byte-level proof that the *wrapped* stream is the one the data plane
+    /// pumps through -- not merely that `wrap` was called and its result
+    /// dropped on the floor.
+    ///
+    /// `fail_first` makes the first wrap fail, so a handshake failure can be
+    /// exercised separately from a connect failure.
+    struct ShoutingTransport {
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+        fail_first: bool,
+    }
+
+    impl ShoutingTransport {
+        fn new(fail_first: bool) -> Self {
+            ShoutingTransport {
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_first,
+            }
+        }
+    }
+
+    impl lb_core::OutboundTransport for ShoutingTransport {
+        fn wrap(
+            &self,
+            stream: Box<dyn lb_core::ProxyStream>,
+            server_name: String,
+            _timeout: Duration,
+        ) -> lb_core::WrapFuture<'_> {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(server_name);
+                calls.len() == 1
+            };
+            let fail = self.fail_first && first;
+            Box::pin(async move {
+                if fail {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "handshake refused",
+                    ));
+                }
+                Ok(Box::new(Shouting(stream)) as Box<dyn lb_core::ProxyStream>)
+            })
+        }
+    }
+
+    /// `context`, plus an outbound transport. Set after construction rather
+    /// than threaded through `context`'s signature, so the four plaintext
+    /// tests above stay unchanged.
+    fn context_with_transport<R: RateLimiter, L: LoadBalancer>(
+        rate_limiter: R,
+        balancer: L,
+        backends: Vec<Backend>,
+        transport: Arc<dyn lb_core::OutboundTransport>,
+    ) -> Arc<TcpContext<R, L, FakeClock>> {
+        let mut ctx = context(rate_limiter, balancer, backends);
+        Arc::get_mut(&mut ctx).expect("sole owner").backend_tls = Some(transport);
+        ctx
+    }
+
+    /// Upper-cases bytes on their way to the backend; reads pass through.
+    struct Shouting(Box<dyn lb_core::ProxyStream>);
+
+    impl tokio::io::AsyncRead for Shouting {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for Shouting {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let shouted = buf.to_ascii_uppercase();
+            std::pin::Pin::new(&mut self.0).poll_write(cx, &shouted)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
     }
 
     #[tokio::test]
@@ -367,8 +526,8 @@ mod tests {
             AllowAll,
             FirstEligible,
             vec![
-                Backend::new("dead", dead_addr, 1),
-                Backend::new("alive", healthy_addr, 1),
+                Backend::new("dead", dead_addr, 1, None),
+                Backend::new("alive", healthy_addr, 1, None),
             ],
         );
 
@@ -383,5 +542,109 @@ mod tests {
             }
         );
         assert!(ctx.circuit_breaker(&BackendId::new("dead")).is_open());
+    }
+
+    /// The point of the seam: `lb-tcp` never names a TLS crate, it asks
+    /// whatever `OutboundTransport` it was handed to wrap the connection and
+    /// pumps whatever comes back.
+    #[tokio::test]
+    async fn a_configured_transport_wraps_the_outbound_connection() {
+        let backend_addr = spawn_echo_backend().await;
+        let transport = Arc::new(ShoutingTransport::new(false));
+        let calls = Arc::clone(&transport.calls);
+        let ctx = context_with_transport(
+            AllowAll,
+            FirstEligible,
+            vec![Backend::new(
+                "b1",
+                backend_addr,
+                1,
+                Some("b1.internal".to_string()),
+            )],
+            transport,
+        );
+
+        let (outcome, echoed) = run_session(ctx, b"ping").await;
+
+        // The echo backend saw upper case, so the wrapped stream -- not the
+        // raw socket -- is what the two pumps were joined on.
+        assert_eq!(echoed, b"PING");
+        assert_eq!(
+            outcome,
+            ConnectionOutcome::Completed {
+                bytes_to_backend: 4,
+                bytes_to_client: 4
+            }
+        );
+        // The name on the certificate, not the address that was dialled.
+        assert_eq!(calls.lock().unwrap().as_slice(), ["b1.internal"]);
+    }
+
+    /// A handshake that fails is a backend that did not answer: same metrics,
+    /// same breaker, same retry. The retry stays safe for the reason it
+    /// always has been -- not one client byte has been read yet.
+    #[tokio::test]
+    async fn a_failed_wrap_is_recorded_and_retried_like_a_connect_failure() {
+        let first_addr = spawn_echo_backend().await;
+        let second_addr = spawn_echo_backend().await;
+        let transport = Arc::new(ShoutingTransport::new(true));
+        let ctx = context_with_transport(
+            AllowAll,
+            FirstEligible,
+            vec![
+                Backend::new("first", first_addr, 1, Some("first.internal".to_string())),
+                Backend::new(
+                    "second",
+                    second_addr,
+                    1,
+                    Some("second.internal".to_string()),
+                ),
+            ],
+            transport,
+        );
+
+        let (outcome, echoed) = run_session(ctx.clone(), b"retry").await;
+
+        assert_eq!(echoed, b"RETRY");
+        assert_eq!(
+            outcome,
+            ConnectionOutcome::Completed {
+                bytes_to_backend: 5,
+                bytes_to_client: 5
+            }
+        );
+        // Recorded against the backend whose handshake failed, exactly as a
+        // refused connect would have been.
+        assert!(ctx.circuit_breaker(&BackendId::new("first")).is_open());
+    }
+
+    /// Config validation requires a `server_name` on every backend of a
+    /// re-encrypting listener. If that guard were ever bypassed, falling back
+    /// to plaintext would silently defeat the encryption that was asked for,
+    /// so the connection fails instead.
+    #[tokio::test]
+    async fn a_backend_with_no_server_name_is_never_proxied_to_in_plaintext() {
+        let backend_addr = spawn_echo_backend().await;
+        let transport = Arc::new(ShoutingTransport::new(false));
+        let calls = Arc::clone(&transport.calls);
+        let ctx = context_with_transport(
+            AllowAll,
+            FirstEligible,
+            vec![Backend::new("b1", backend_addr, 1, None)],
+            transport,
+        );
+
+        let (outcome, echoed) = run_session(ctx, b"ping").await;
+
+        // The refusal is recorded like any other backend failure, which
+        // trips this fixture's threshold-of-one breaker and leaves nothing
+        // eligible for the retry -- the same path a single backend with a
+        // refused connect takes.
+        assert_eq!(outcome, ConnectionOutcome::NoBackend);
+        assert!(echoed.is_empty(), "bytes reached a backend in plaintext");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "a nameless backend must not reach the transport at all"
+        );
     }
 }

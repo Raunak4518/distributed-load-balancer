@@ -40,6 +40,11 @@ pub struct Metrics {
     tls_handshake_duration: HistogramVec,
     tls_certificate_reloads: IntCounterVec,
     tls_certificate_expiry_timestamp_seconds: IntGaugeVec,
+    /// Public, and resolved at the call site rather than in `listener()`,
+    /// because it must exist only for listeners that actually re-encrypt: a
+    /// zero here on a plaintext-backend listener would read as "backend TLS
+    /// is on and verifying", which is a lie a dashboard would repeat.
+    pub backend_tls_verification_disabled: IntGaugeVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -185,6 +190,18 @@ impl Metrics {
             &["listener", "cert"],
         )?;
 
+        // 1 when this listener forwards to backends without verifying their
+        // certificates. Alert on it: traffic is encrypted but not
+        // authenticated, which does not address the threat encryption is
+        // there for.
+        let backend_tls_verification_disabled = IntGaugeVec::new(
+            Opts::new(
+                "lb_backend_tls_verification_disabled",
+                "1 when backend certificate verification is disabled for this listener",
+            ),
+            &["listener"],
+        )?;
+
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
         registry.register(Box::new(active_connections.clone()))?;
@@ -204,6 +221,7 @@ impl Metrics {
         registry.register(Box::new(tls_handshake_duration.clone()))?;
         registry.register(Box::new(tls_certificate_reloads.clone()))?;
         registry.register(Box::new(tls_certificate_expiry_timestamp_seconds.clone()))?;
+        registry.register(Box::new(backend_tls_verification_disabled.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -226,6 +244,7 @@ impl Metrics {
             tls_handshake_duration,
             tls_certificate_reloads,
             tls_certificate_expiry_timestamp_seconds,
+            backend_tls_verification_disabled,
         })
     }
 
@@ -511,6 +530,32 @@ mod tests {
         );
     }
 
+    /// `danger_accept_invalid_certs` must be visible on a dashboard rather
+    /// than living undiscovered in a config file, which means the series has
+    /// to exist and read zero on a listener that does verify -- a gap and a
+    /// zero look identical to an alert otherwise.
+    #[test]
+    fn the_backend_verification_gauge_reports_both_states() {
+        let metrics = Metrics::new().unwrap();
+        metrics
+            .backend_tls_verification_disabled
+            .with_label_values(&["dangerous"])
+            .set(1);
+        metrics
+            .backend_tls_verification_disabled
+            .with_label_values(&["strict"])
+            .set(0);
+        let text = metrics.gather_text();
+        assert!(
+            text.contains(r#"lb_backend_tls_verification_disabled{listener="dangerous"} 1"#),
+            "missing the disabled series in:\n{text}"
+        );
+        assert!(
+            text.contains(r#"lb_backend_tls_verification_disabled{listener="strict"} 0"#),
+            "missing the flat-zero series in:\n{text}"
+        );
+    }
+
     /// Encodes spec section 2.3 as an executable rule: every label name in the
     /// exposition must come from a known, config-derived set. A client IP or
     /// path label would explode Prometheus's series count.
@@ -546,6 +591,10 @@ mod tests {
         tls.tls_certificate_expiry_timestamp_seconds
             .with_label_values(&["web", "primary"])
             .set(1_893_456_000);
+        metrics
+            .backend_tls_verification_disabled
+            .with_label_values(&["web"])
+            .set(1);
         let text = metrics.gather_text();
 
         const ALLOWED: [&str; 11] = [

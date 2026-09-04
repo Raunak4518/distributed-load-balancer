@@ -24,6 +24,13 @@ pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     pub pool: Arc<BackendPool>,
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
     pub client: ProxyClient,
+    /// Whether this listener has a `[listeners.backend_tls]` section.
+    ///
+    /// A listener-level fact, not a per-backend one: it decides the
+    /// forwarding scheme, and reading it off the backend instead would let a
+    /// `server_name` set on a plaintext listener silently upgrade its
+    /// traffic to a scheme nobody asked for.
+    pub backend_tls: bool,
     pub rate_limit_key: RateLimitKeySource,
     pub forward_timeout: Duration,
     pub max_request_body_bytes: usize,
@@ -136,29 +143,50 @@ async fn read_bounded(body: Incoming, max_bytes: usize) -> Result<Bytes, ()> {
     }
 }
 
+/// Rewrites the client's request as the one we send onward.
+///
+/// `None` means this backend cannot be forwarded to at all -- see the
+/// nameless-backend arm below.
 fn build_outbound_request(
     parts: &http::request::Parts,
     body: Bytes,
     backend: &lb_core::Backend,
-) -> Request<Full<Bytes>> {
+    backend_tls: bool,
+) -> Option<Request<Full<Bytes>>> {
     let path_and_query = parts
         .uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
+    let (scheme, authority) = match (backend_tls, backend.server_name.as_deref()) {
+        // The authority is the name on the certificate, not the address we
+        // dial. That is what makes SNI and hostname verification check the
+        // certificate's own name rather than an IP literal no certificate is
+        // ever issued for.
+        (true, Some(name)) => ("https", format!("{name}:{}", backend.address.port())),
+        // Config validation requires a `server_name` on every backend of a
+        // listener that sets `backend_tls`, so this is unreachable through
+        // the config. It is spelled out rather than folded into the plaintext
+        // arm because falling back to `http` would silently defeat the
+        // encryption that was asked for.
+        (true, None) => return None,
+        (false, _) => ("http", backend.address.to_string()),
+    };
     let uri = hyper::Uri::builder()
-        .scheme("http")
-        .authority(backend.address.to_string())
+        .scheme(scheme)
+        .authority(authority)
         .path_and_query(path_and_query)
         .build()
-        .expect("backend address + original path form a valid URI");
+        .expect("backend authority + original path form a valid URI");
     let mut builder = Request::builder().method(parts.method.clone()).uri(uri);
     for (name, value) in parts.headers.iter() {
         builder = builder.header(name, value);
     }
-    builder
-        .body(Full::new(body))
-        .expect("forwarded request is well-formed")
+    Some(
+        builder
+            .body(Full::new(body))
+            .expect("forwarded request is well-formed"),
+    )
 }
 
 pub async fn handle<R, L, C>(
@@ -308,7 +336,17 @@ where
             .backend(&backend_id)
             .expect("picked id exists in the pool it was picked from")
             .clone();
-        let outbound = build_outbound_request(&parts, bytes.clone(), &backend);
+        let Some(outbound) =
+            build_outbound_request(&parts, bytes.clone(), &backend, ctx.backend_tls)
+        else {
+            // Not retried: every backend of this listener would hit the same
+            // misconfiguration, and the one thing we must not do is fall back
+            // to plaintext.
+            return Ok(simple_response(
+                StatusCode::BAD_GATEWAY,
+                "backend is missing the server_name its TLS configuration requires",
+            ));
+        };
         let attempt_started = std::time::Instant::now();
 
         match forward(&ctx.client, outbound, ctx.forward_timeout).await {
@@ -447,7 +485,7 @@ mod tests {
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
 
-        let client = build_client();
+        let client = build_client(None);
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
@@ -481,7 +519,8 @@ mod tests {
             balancer: Arc::new(NoBackend), // would return None if reached; proves we short-circuit
             pool: empty_pool(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(),
+            client: build_client(None),
+            backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -502,7 +541,8 @@ mod tests {
             balancer: Arc::new(NoBackend),
             pool: empty_pool(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(),
+            client: build_client(None),
+            backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -519,7 +559,7 @@ mod tests {
     #[tokio::test]
     async fn successful_forward_returns_backend_response_and_records_success() {
         let backend_addr = spawn_fixed_response_backend(StatusCode::OK, "hi").await;
-        let backend = Backend::new("b1", backend_addr, 1);
+        let backend = Backend::new("b1", backend_addr, 1, None);
         let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
         let mut breakers = HashMap::new();
         breakers.insert(
@@ -532,7 +572,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             circuit_breakers: breakers,
-            client: build_client(),
+            client: build_client(None),
+            backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -550,7 +591,7 @@ mod tests {
     async fn failed_forward_retries_once_then_returns_502() {
         // FixedPick always points at a port nobody is listening on.
         let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let backend = Backend::new("b1", dead_addr, 1);
+        let backend = Backend::new("b1", dead_addr, 1, None);
         let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
         let mut breakers = HashMap::new();
         breakers.insert(
@@ -563,7 +604,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             circuit_breakers: breakers,
-            client: build_client(),
+            client: build_client(None),
+            backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -582,8 +624,8 @@ mod tests {
         let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap(); // refused instantly
         let healthy_addr = spawn_fixed_response_backend(StatusCode::OK, "ok").await;
 
-        let dead = Backend::new("dead", dead_addr, 1);
-        let healthy = Backend::new("healthy", healthy_addr, 1);
+        let dead = Backend::new("dead", dead_addr, 1, None);
+        let healthy = Backend::new("healthy", healthy_addr, 1, None);
         let pool = Arc::new(BackendPool::new(vec![dead.clone(), healthy.clone()]));
 
         let clock = FakeClock::new();
@@ -602,7 +644,8 @@ mod tests {
             balancer: Arc::new(PreferFirstEligible),
             pool: pool.clone(),
             circuit_breakers: breakers,
-            client: build_client(),
+            client: build_client(None),
+            backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -624,5 +667,63 @@ mod tests {
         // to "healthy" without ever touching the tripped backend.
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Turns a request into the outbound one the forwarding client would
+    /// send, without a live backend: what is being asserted is the URI, and a
+    /// real connection would only add flakiness to that.
+    fn outbound_uri_for(backend: &Backend, backend_tls: bool) -> Option<String> {
+        let (parts, _) = Request::builder()
+            .uri("/orders?page=2")
+            .body(())
+            .unwrap()
+            .into_parts();
+        build_outbound_request(&parts, Bytes::new(), backend, backend_tls)
+            .map(|req| req.uri().to_string())
+    }
+
+    /// The whole point of carrying `server_name`: the connection is one
+    /// thing, the identity we demand of it is another. Sending the IP as the
+    /// authority would make SNI and hostname verification check the address
+    /// we happened to dial, which no certificate is issued for.
+    #[test]
+    fn re_encrypting_forwards_to_the_certificate_name_not_the_address() {
+        let backend = Backend::new(
+            "b1",
+            "10.0.0.5:8443".parse().unwrap(),
+            1,
+            Some("web1.internal".to_string()),
+        );
+        assert_eq!(
+            outbound_uri_for(&backend, true).as_deref(),
+            Some("https://web1.internal:8443/orders?page=2")
+        );
+    }
+
+    /// Phase 5 behaviour, unchanged: without `backend_tls` the listener
+    /// forwards plaintext to the configured address, and a `server_name`
+    /// that happens to be set does not quietly upgrade the scheme.
+    #[test]
+    fn without_backend_tls_the_address_is_used_over_plaintext() {
+        let backend = Backend::new(
+            "b1",
+            "10.0.0.5:8080".parse().unwrap(),
+            1,
+            Some("web1.internal".to_string()),
+        );
+        assert_eq!(
+            outbound_uri_for(&backend, false).as_deref(),
+            Some("http://10.0.0.5:8080/orders?page=2")
+        );
+    }
+
+    /// Config validation requires a `server_name` on every backend of a
+    /// re-encrypting listener. If that guard were ever bypassed, forwarding
+    /// in plaintext would silently defeat the encryption that was asked for,
+    /// so no request is built at all.
+    #[test]
+    fn a_re_encrypting_listener_builds_no_request_for_a_nameless_backend() {
+        let backend = Backend::new("b1", "10.0.0.5:8443".parse().unwrap(), 1, None);
+        assert_eq!(outbound_uri_for(&backend, true), None);
     }
 }

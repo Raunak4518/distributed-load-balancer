@@ -33,7 +33,7 @@ mod tests {
     fn pool_of(ids: &[&str]) -> BackendPool {
         let backends = ids
             .iter()
-            .map(|id| Backend::new(*id, "127.0.0.1:9000".parse().unwrap(), 1))
+            .map(|id| Backend::new(*id, "127.0.0.1:9000".parse().unwrap(), 1, None))
             .collect();
         BackendPool::new(backends)
     }
