@@ -28,6 +28,15 @@ pub struct TlsAcceptor {
 
 impl TlsAcceptor {
     pub fn new(cfg: &TlsConfig, alpn: &[&[u8]]) -> Result<Self, TlsError> {
+        // Not merely belt and braces: this constructor is the first thing in
+        // the process to build a rustls type, and it is reachable from any
+        // caller, not just `lb_server::run`. Leaving the install as an
+        // undocumented obligation on the caller would make a forgotten call
+        // a runtime panic in a crate that has no idea rustls is involved.
+        // The call is idempotent, so `run` keeps its own -- that stays the
+        // documented place, this is the one that cannot be forgotten.
+        install_crypto_provider();
+
         let loaded = cfg
             .certificates
             .iter()

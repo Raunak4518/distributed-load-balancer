@@ -120,10 +120,28 @@ pub struct ClusterSetup {
 /// Takes the already-resolved cluster secret rather than reading it here:
 /// `run` resolves it before anything binds, so a missing secret fails
 /// startup instead of surfacing once traffic is flowing.
-pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
+///
+/// Fails rather than panics on bad operator input — a certificate that will
+/// not load is the same class of problem as a port that will not bind, and
+/// deserves the same clean message. `Metrics::new()` still uses `expect`,
+/// because it can only fail on a duplicate metric name, which is a
+/// programming error and not something an operator can cause.
+pub fn build_app(
+    config: &Config,
+    cluster_secret: Option<Vec<u8>>,
+) -> Result<WiredApp, std::io::Error> {
     let mut listeners = Vec::with_capacity(config.listeners.len());
     let mut background_tasks = Vec::new();
     let mut pools = Vec::with_capacity(config.listeners.len());
+
+    // Every acceptor is built before any background task is spawned,
+    // mirroring how `run` binds every listener before serving any of them: a
+    // certificate that will not load should fail startup outright, not
+    // halfway through it with sweepers and health checkers already running.
+    let mut tls_acceptors = Vec::with_capacity(config.listeners.len());
+    for lc in &config.listeners {
+        tls_acceptors.push(build_tls_acceptor(lc)?);
+    }
 
     // One registry per process. Handles are resolved from it once per
     // listener/backend below — never on the request path.
@@ -140,7 +158,7 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
         _ => None,
     };
 
-    for lc in &config.listeners {
+    for (lc, tls) in config.listeners.iter().zip(tls_acceptors) {
         let backends: Vec<Backend> = lc
             .backends
             .iter()
@@ -208,27 +226,6 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
                 _ => None,
             };
 
-        // Built here, not on first connection: an unreadable certificate or
-        // an unusable key must fail startup outright rather than leave a
-        // bound port that can never complete a handshake.
-        let tls = match &lc.tls {
-            Some(tls_cfg) => {
-                // The listener's protocol decides what we are willing to
-                // speak inside the tunnel. Advertising `http/1.1` is the
-                // seam where Phase 8 adds `h2`; at L4 we do not know the
-                // application protocol's name, so we offer none.
-                let alpn: &[&[u8]] = match lc.protocol {
-                    Protocol::Http => &[b"http/1.1"],
-                    Protocol::Tcp => &[],
-                };
-                Some(Arc::new(
-                    lb_tls::TlsAcceptor::new(tls_cfg, alpn)
-                        .unwrap_or_else(|e| panic!("listener '{}': {e}", lc.name)),
-                ))
-            }
-            None => None,
-        };
-
         listeners.push(match lc.protocol {
             Protocol::Http => ListenerRuntime::Http {
                 name: lc.name.clone(),
@@ -287,7 +284,7 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
         _ => None,
     };
 
-    WiredApp {
+    Ok(WiredApp {
         listeners,
         background_tasks,
         drain_timeout: Duration::from_millis(config.server.drain_timeout_ms),
@@ -295,7 +292,39 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
         metrics,
         admin_listen: config.admin.as_ref().map(|a| a.listen),
         pools,
-    }
+    })
+}
+
+/// Builds one listener's TLS acceptor, if it has a `[listeners.tls]` section.
+///
+/// Done at startup rather than on first connection: an unreadable certificate
+/// or an unusable key must fail startup outright rather than leave a bound
+/// port that can never complete a handshake. A mistyped `cert_file` is the
+/// commonest TLS misconfiguration there is, so the error names the listener.
+fn build_tls_acceptor(
+    lc: &ListenerConfig,
+) -> Result<Option<Arc<lb_tls::TlsAcceptor>>, std::io::Error> {
+    let Some(tls_cfg) = &lc.tls else {
+        return Ok(None);
+    };
+    // The listener's protocol decides what we are willing to speak inside
+    // the tunnel. Advertising `http/1.1` is the seam where Phase 8 adds
+    // `h2`; at L4 we do not know the application protocol's name, so we
+    // offer none.
+    let alpn: &[&[u8]] = match lc.protocol {
+        Protocol::Http => &[b"http/1.1"],
+        Protocol::Tcp => &[],
+    };
+    let acceptor = lb_tls::TlsAcceptor::new(tls_cfg, alpn).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "listener '{}' could not load its TLS material: {err}",
+                lc.name
+            ),
+        )
+    })?;
+    Ok(Some(Arc::new(acceptor)))
 }
 
 /// The listener's protocol picks the probe — an HTTP listener always wants an
@@ -402,7 +431,7 @@ mod tests {
     async fn builds_one_runtime_per_listener_with_the_right_protocol() {
         // build_app spawns background tasks, so this needs a Tokio runtime.
         let config = Config::parse(CONFIG).unwrap();
-        let app = build_app(&config, None);
+        let app = build_app(&config, None).unwrap();
 
         assert_eq!(app.listeners.len(), 2);
         assert!(matches!(app.listeners[0], ListenerRuntime::Http { .. }));
@@ -429,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn applies_drain_timeout_default() {
         let config = Config::parse(CONFIG).unwrap();
-        let app = build_app(&config, None);
+        let app = build_app(&config, None).unwrap();
         assert_eq!(app.drain_timeout, Duration::from_millis(10_000));
         for task in app.background_tasks {
             task.abort();

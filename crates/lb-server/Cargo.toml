@@ -38,3 +38,19 @@ http-body-util = "0.1"
 # rustls-tls risks pulling aws-lc-rs into the dev graph, and schannel is
 # entirely independent of the server's rustls+ring stack.
 rcgen = "0.13"
+# A TLS client for the raw-TCP listener test, where there is no HTTP and so
+# no reqwest. Same provider selection as lb-tls — ring, nothing by default —
+# so the test client cannot drag aws-lc-rs into the dev graph. `rustls` is
+# named directly because the test implements a ServerCertVerifier; both are
+# already in the lock via lb-tls, so neither adds a crate.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }

@@ -40,7 +40,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         metrics,
         admin_listen,
         pools,
-    } = build_app(&config, cluster_secret);
+    } = build_app(&config, cluster_secret)?;
 
     // Bind every listener before serving any of them, so a port conflict or
     // permission error fails startup outright instead of half-starting.

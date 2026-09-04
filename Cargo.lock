@@ -863,7 +863,9 @@ dependencies = [
  "lb-tls",
  "rcgen",
  "reqwest",
+ "rustls",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
