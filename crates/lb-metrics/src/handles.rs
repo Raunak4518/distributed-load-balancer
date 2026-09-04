@@ -50,6 +50,15 @@ pub struct ListenerMetrics {
     pub connections_total: IntCounter,
     pub ratelimit_rejected_local: IntCounter,
     pub ratelimit_rejected_cluster: IntCounter,
+
+    // Edge hardening (Phase 5). A limit you cannot see being approached is a
+    // limit you only learn about during an incident.
+    pub connections_rejected_max: IntCounter,
+    pub connections_rejected_per_ip: IntCounter,
+    pub timeouts_header: IntCounter,
+    pub timeouts_body: IntCounter,
+    /// Early warning that the rate-limit overflow bucket is about to engage.
+    pub tracked_keys: IntGauge,
 }
 
 impl ListenerMetrics {

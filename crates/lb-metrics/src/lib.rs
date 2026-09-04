@@ -28,6 +28,12 @@ pub struct Metrics {
     upstream_duration: HistogramVec,
     pub cluster_peer_sync: IntCounterVec,
     pub cluster_tracked_keys: IntGauge,
+
+    // Edge hardening (Phase 5)
+    connections_rejected: IntCounterVec,
+    request_timeouts: IntCounterVec,
+    ratelimit_tracked_keys: IntGaugeVec,
+    pub cluster_auth_failures: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -102,6 +108,34 @@ impl Metrics {
             "lb_cluster_tracked_keys",
             "Distinct rate-limit keys currently tracked",
         )?;
+        let connections_rejected = IntCounterVec::new(
+            Opts::new(
+                "lb_connections_rejected_total",
+                "Connections refused by a limit, by reason",
+            ),
+            &["listener", "reason"],
+        )?;
+        let request_timeouts = IntCounterVec::new(
+            Opts::new(
+                "lb_request_timeouts_total",
+                "Requests aborted on a read timeout, by phase",
+            ),
+            &["listener", "phase"],
+        )?;
+        let ratelimit_tracked_keys = IntGaugeVec::new(
+            Opts::new(
+                "lb_ratelimit_tracked_keys",
+                "Distinct rate-limit keys tracked by this listener",
+            ),
+            &["listener"],
+        )?;
+        let cluster_auth_failures = IntCounterVec::new(
+            Opts::new(
+                "lb_cluster_auth_failures_total",
+                "Peer sync messages rejected for a bad authentication tag",
+            ),
+            &["peer"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -114,6 +148,10 @@ impl Metrics {
         registry.register(Box::new(upstream_duration.clone()))?;
         registry.register(Box::new(cluster_peer_sync.clone()))?;
         registry.register(Box::new(cluster_tracked_keys.clone()))?;
+        registry.register(Box::new(connections_rejected.clone()))?;
+        registry.register(Box::new(request_timeouts.clone()))?;
+        registry.register(Box::new(ratelimit_tracked_keys.clone()))?;
+        registry.register(Box::new(cluster_auth_failures.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -128,6 +166,10 @@ impl Metrics {
             upstream_duration,
             cluster_peer_sync,
             cluster_tracked_keys,
+            connections_rejected,
+            request_timeouts,
+            ratelimit_tracked_keys,
+            cluster_auth_failures,
         })
     }
 
@@ -154,6 +196,15 @@ impl Metrics {
             ratelimit_rejected_cluster: self
                 .ratelimit_rejected
                 .with_label_values(&[name, "cluster"]),
+            connections_rejected_max: self
+                .connections_rejected
+                .with_label_values(&[name, "max_connections"]),
+            connections_rejected_per_ip: self
+                .connections_rejected
+                .with_label_values(&[name, "max_per_ip"]),
+            timeouts_header: self.request_timeouts.with_label_values(&[name, "header"]),
+            timeouts_body: self.request_timeouts.with_label_values(&[name, "body"]),
+            tracked_keys: self.ratelimit_tracked_keys.with_label_values(&[name]),
         }
     }
 
@@ -276,6 +327,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn edge_hardening_metrics_are_exposed() {
+        let metrics = Metrics::new().unwrap();
+        let l = metrics.listener("web", "http");
+        l.connections_rejected_max.inc();
+        l.connections_rejected_per_ip.inc();
+        l.connections_rejected_per_ip.inc();
+        l.timeouts_header.inc();
+        l.timeouts_body.inc();
+        l.tracked_keys.set(7);
+        metrics
+            .cluster_auth_failures
+            .with_label_values(&["10.0.0.9:7946"])
+            .inc();
+
+        let text = metrics.gather_text();
+        assert!(text.contains(r#"reason="max_connections""#));
+        assert!(text.contains(r#"reason="max_per_ip""#));
+        assert!(text.contains(r#"phase="header""#));
+        assert!(text.contains(r#"phase="body""#));
+        assert!(text.contains(r#"lb_ratelimit_tracked_keys{listener="web"} 7"#));
+        assert!(text.contains("lb_cluster_auth_failures_total"));
+    }
+
     /// Encodes spec section 2.3 as an executable rule: every label name in the
     /// exposition must come from a known, config-derived set. A client IP or
     /// path label would explode Prometheus's series count.
@@ -290,10 +365,22 @@ mod tests {
             .cluster_peer_sync
             .with_label_values(&["10.0.0.2:7946", "ok"])
             .inc();
+        metrics
+            .cluster_auth_failures
+            .with_label_values(&["10.0.0.2:7946"])
+            .inc();
+        let hardening = metrics.listener("web", "http");
+        hardening.connections_rejected_max.inc();
+        hardening.connections_rejected_per_ip.inc();
+        hardening.timeouts_header.inc();
+        hardening.timeouts_body.inc();
+        hardening.tracked_keys.set(42);
         let text = metrics.gather_text();
 
-        const ALLOWED: [&str; 8] = [
+        const ALLOWED: [&str; 10] = [
             "listener", "protocol", "status", "backend", "outcome", "layer", "peer",
+            // Phase 5: both drawn from fixed sets in the code, never input.
+            "reason", "phase",
             // `le` is Prometheus's own histogram bucket-boundary label. It is
             // bounded by our bucket count (15), not client-derived.
             "le",
