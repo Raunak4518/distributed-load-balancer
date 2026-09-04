@@ -11,10 +11,9 @@ a Postgres cluster on :5432 at the same time.
 Run several nodes with a `[cluster]` section and the rate limit is enforced
 *globally* rather than per node.
 
-Design docs:
-- [Phase 1 — L7 HTTP](docs/superpowers/specs/2026-09-03-lb-phase1-design.md)
-- [Phase 2 — L4 TCP](docs/superpowers/specs/2026-09-04-lb-phase2-design.md)
-- [Phase 3 — multi-node coordination](docs/superpowers/specs/2026-09-04-lb-phase3-design.md)
+Design documents for each phase (L7 HTTP, L4 TCP, multi-node coordination,
+observability, edge hardening) are kept outside version control, under
+`docs/superpowers/` in the working tree.
 
 ## Run it
 
