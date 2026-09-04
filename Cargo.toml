@@ -9,6 +9,7 @@ members = [
     "crates/lb-tcp",
     "crates/lb-cluster",
     "crates/lb-metrics",
+    "crates/lb-tls",
     "crates/lb-bench",
     "crates/lb-server",
 ]

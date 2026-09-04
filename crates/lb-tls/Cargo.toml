@@ -1,0 +1,17 @@
+[package]
+name = "lb-tls"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+lb-core = { path = "../lb-core" }
+# ring, not the aws-lc-rs default: aws-lc-rs needs cmake and a C toolchain,
+# which is a real build risk on this machine. Every TLS crate below must
+# agree on the provider or install_default() conflicts at runtime.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+x509-parser = "0.16"
+thiserror = "1"
+
+[dev-dependencies]
+rcgen = "0.13"
