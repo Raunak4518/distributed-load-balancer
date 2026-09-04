@@ -47,7 +47,15 @@ pub fn load_certificate(cfg: &CertificateConfig) -> Result<LoadedCert, TlsError>
 
     Ok(LoadedCert {
         name: cfg.name.clone(),
-        hostnames: cfg.hostnames.clone(),
+        // Hostnames are normalized to ASCII lowercase at load time so that
+        // matching is consistent regardless of the operator's casing in config.
+        // This ensures a wildcard cert like *.Example.com does not silently
+        // fail to serve legitimate clients asking for a.example.com.
+        hostnames: cfg
+            .hostnames
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect(),
         key: Arc::new(certified),
         not_after_unix,
     })

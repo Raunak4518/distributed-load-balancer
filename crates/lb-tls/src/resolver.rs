@@ -196,4 +196,17 @@ mod tests {
             "a.example.com resolved to the wildcard certificate instead of its own"
         );
     }
+
+    #[test]
+    fn configured_patterns_are_case_insensitive() {
+        // Hostnames are normalized to lowercase at load time, so a certificate
+        // configured with an uppercase pattern (a plausible operator input)
+        // must still match lowercase SNI from clients.
+        let s = store(&[("upper", &["*.EXAMPLE.COM"]), ("exact", &["A.EXAMPLE.COM"])]);
+        // Wildcard with uppercase pattern must match lowercase SNI.
+        assert!(s.resolve(Some("a.example.com")).is_some());
+        assert!(s.resolve(Some("z.example.com")).is_some());
+        // Exact uppercase pattern must match lowercase SNI.
+        assert!(s.resolve(Some("b.example.com")).is_some());
+    }
 }
