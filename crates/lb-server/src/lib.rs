@@ -1,3 +1,4 @@
+mod limits;
 mod shutdown;
 mod wiring;
 
@@ -152,15 +153,43 @@ async fn serve_listener(
     let mut connections: JoinSet<()> = JoinSet::new();
 
     loop {
-        tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok((stream, peer)) => spawn_connection(&runtime, &mut connections, stream, peer),
-                // A transient accept error (e.g. fd exhaustion) must not kill
-                // the listener permanently.
-                Err(err) => tracing::warn!(listener = %runtime.name(), error = %err, "accept failed"),
+        // Acquire the global permit BEFORE accepting. At capacity we simply
+        // stop calling accept(): the kernel's backlog absorbs the next few
+        // and then refuses connections itself. Accepting first and deciding
+        // after would spend a file descriptor and a task on a connection we
+        // intend to discard — which is what an attacker wants.
+        if runtime.limits().global.available_permits() == 0 {
+            runtime.metrics().connections_rejected_max.inc();
+        }
+        let permit = tokio::select! {
+            acquired = Arc::clone(&runtime.limits().global).acquire_owned() => match acquired {
+                Ok(p) => p,
+                Err(_) => break, // semaphore closed
             },
             _ = shutdown.changed() => break,
-        }
+        };
+
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                // A transient accept error (e.g. fd exhaustion) must not kill
+                // the listener permanently.
+                Err(err) => {
+                    tracing::warn!(listener = %runtime.name(), error = %err, "accept failed");
+                    continue;
+                }
+            },
+            _ = shutdown.changed() => break,
+        };
+
+        // Must follow accept(): the peer address is unknowable before it.
+        let Some(ip_guard) = runtime.limits().per_ip.try_acquire(peer.ip()) else {
+            runtime.metrics().connections_rejected_per_ip.inc();
+            tracing::debug!(listener = %runtime.name(), peer = %peer, "per-IP connection cap reached");
+            continue; // `stream` drops here, closing it
+        };
+
+        spawn_connection(&runtime, &mut connections, stream, peer, permit, ip_guard);
     }
 
     let drained = tokio::time::timeout(drain_timeout, async {
@@ -177,20 +206,43 @@ async fn serve_listener(
     }
 }
 
+/// Spawns the connection handler, moving both limit guards into the task so
+/// every exit path — success, error, panic, drain — releases them.
 fn spawn_connection(
     runtime: &ListenerRuntime,
     connections: &mut JoinSet<()>,
     stream: TcpStream,
     peer: SocketAddr,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    ip_guard: crate::limits::IpGuard,
 ) {
     match runtime {
-        ListenerRuntime::Http { ctx, .. } => {
+        ListenerRuntime::Http {
+            ctx,
+            header_read_timeout,
+            ..
+        } => {
             let ctx = Arc::clone(ctx);
             let io = TokioIo::new(stream);
             let peer_ip = peer.ip();
+            let header_read_timeout = *header_read_timeout;
             connections.spawn(async move {
+                // Held for the life of the connection.
+                let _permit = permit;
+                let _ip_guard = ip_guard;
+
                 let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
-                if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
+                if let Err(err) = http1::Builder::new()
+                    // hyper 1.x has no built-in timer: any timeout feature
+                    // panics unless one is supplied. Must accompany
+                    // `header_read_timeout`, not be assumed.
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    // Caps the time a client may take to send the request
+                    // head — the direct slowloris defence.
+                    .header_read_timeout(header_read_timeout)
+                    .serve_connection(io, svc)
+                    .await
+                {
                     tracing::debug!(error = %err, "client connection error");
                 }
             });
@@ -198,6 +250,8 @@ fn spawn_connection(
         ListenerRuntime::Tcp { ctx, .. } => {
             let ctx = Arc::clone(ctx);
             connections.spawn(async move {
+                let _permit = permit;
+                let _ip_guard = ip_guard;
                 lb_tcp::handle_connection(stream, peer, ctx).await;
             });
         }

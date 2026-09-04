@@ -37,6 +37,9 @@ pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     /// Access-log settings. Logging every request at 50k req/s is ~50,000
     /// lines a second, so it is off unless explicitly enabled and sampled.
     pub access_log: AccessLog,
+    /// Caps how long a client may take to send the body. A size limit alone
+    /// is not a bound: 1 MiB at one byte per second is eleven days.
+    pub body_read_timeout: Duration,
 }
 
 /// Sampled per-request access logging.
@@ -268,13 +271,27 @@ where
     }
 
     let (parts, body) = req.into_parts();
-    let bytes = match read_bounded(body, ctx.max_request_body_bytes).await {
-        Ok(b) => b,
-        Err(()) => {
+    let bytes = match tokio::time::timeout(
+        ctx.body_read_timeout,
+        read_bounded(body, ctx.max_request_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(())) => {
             return Ok(simple_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body too large",
             ))
+        }
+        // 408 is the right answer to a client that took too long, and
+        // distinguishes a slow sender from one that sent too much.
+        Err(_) => {
+            ctx.metrics.timeouts_body.inc();
+            return Ok(simple_response(
+                StatusCode::REQUEST_TIMEOUT,
+                "request body read timed out",
+            ));
         }
     };
 
@@ -472,6 +489,7 @@ mod tests {
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -492,6 +510,7 @@ mod tests {
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -521,6 +540,7 @@ mod tests {
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -551,6 +571,7 @@ mod tests {
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -589,6 +610,7 @@ mod tests {
             metrics: test_metrics(),
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
         });
 
         // "dead" sorts first in pool order, so PreferFirstEligible tries it,

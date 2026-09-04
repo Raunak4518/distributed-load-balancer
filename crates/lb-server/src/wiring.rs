@@ -26,11 +26,16 @@ pub enum ListenerRuntime {
         name: String,
         listen: SocketAddr,
         ctx: Arc<HttpContext>,
+        limits: ConnectionLimits,
+        metrics: Arc<lb_metrics::ListenerMetrics>,
+        header_read_timeout: Duration,
     },
     Tcp {
         name: String,
         listen: SocketAddr,
         ctx: Arc<TcpAppContext>,
+        limits: ConnectionLimits,
+        metrics: Arc<lb_metrics::ListenerMetrics>,
     },
 }
 
@@ -38,6 +43,18 @@ impl ListenerRuntime {
     pub fn name(&self) -> &str {
         match self {
             ListenerRuntime::Http { name, .. } | ListenerRuntime::Tcp { name, .. } => name,
+        }
+    }
+
+    pub fn limits(&self) -> &ConnectionLimits {
+        match self {
+            ListenerRuntime::Http { limits, .. } | ListenerRuntime::Tcp { limits, .. } => limits,
+        }
+    }
+
+    pub fn metrics(&self) -> &Arc<lb_metrics::ListenerMetrics> {
+        match self {
+            ListenerRuntime::Http { metrics, .. } | ListenerRuntime::Tcp { metrics, .. } => metrics,
         }
     }
 
@@ -53,6 +70,16 @@ impl ListenerRuntime {
             ListenerRuntime::Tcp { .. } => "tcp",
         }
     }
+}
+
+/// Per-listener connection caps.
+pub struct ConnectionLimits {
+    /// Global cap. Acquired *before* `accept()` so that at capacity we stop
+    /// accepting and the kernel refuses on our behalf.
+    pub global: Arc<tokio::sync::Semaphore>,
+    /// Per-source cap, checked after `accept()` — the peer address is not
+    /// knowable before then.
+    pub per_ip: Arc<crate::limits::PerIpLimiter>,
 }
 
 pub struct WiredApp {
@@ -116,6 +143,12 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
             Protocol::Tcp => "tcp",
         };
         let listener_metrics = Arc::new(metrics.listener(&lc.name, protocol_name));
+        let connection_limits = ConnectionLimits {
+            global: Arc::new(tokio::sync::Semaphore::new(lc.max_connections())),
+            per_ip: Arc::new(crate::limits::PerIpLimiter::new(
+                lc.max_connections_per_ip(),
+            )),
+        };
         let backend_metrics: HashMap<_, _> = backends
             .iter()
             .map(|b| (b.id.clone(), metrics.backend(&lc.name, &b.id.0)))
@@ -184,7 +217,11 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
                         config.logging.log_requests,
                         config.logging.sample_rate,
                     ),
+                    body_read_timeout: lc.body_read_timeout(),
                 }),
+                limits: connection_limits,
+                metrics: Arc::clone(&listener_metrics),
+                header_read_timeout: lc.header_read_timeout(),
             },
             Protocol::Tcp => ListenerRuntime::Tcp {
                 name: lc.name.clone(),
@@ -200,6 +237,8 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
                     metrics: Arc::clone(&listener_metrics),
                     backend_metrics,
                 }),
+                limits: connection_limits,
+                metrics: Arc::clone(&listener_metrics),
             },
         });
     }

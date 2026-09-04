@@ -12,6 +12,7 @@ lb-proxy = { path = "../lb-proxy" }
 lb-tcp = { path = "../lb-tcp" }
 lb-metrics = { path = "../lb-metrics" }
 lb-cluster = { path = "../lb-cluster" }
+dashmap = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 hyper = { version = "1", features = ["server", "http1"] }

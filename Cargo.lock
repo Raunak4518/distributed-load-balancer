@@ -777,6 +777,7 @@ name = "lb-server"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "dashmap",
  "http-body-util",
  "hyper",
  "hyper-util",
