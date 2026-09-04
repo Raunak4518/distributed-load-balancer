@@ -61,12 +61,11 @@ impl BackendConnector {
                     }
                 }
                 None => {
-                    // System trust store. Individual unreadable/malformed OS
-                    // entries are safe to ignore -- `.certs` is what we add,
-                    // `.errors` just means some native entries didn't parse.
-                    for cert in rustls_native_certs::load_native_certs().certs {
-                        let _ = roots.add(cert);
-                    }
+                    // System trust store. Same discipline as the ca_file
+                    // branch above: an empty result here is exactly as
+                    // dangerous as a ca_file that loads to zero certificates,
+                    // just reachable through the sibling code path.
+                    apply_native_certs(&mut roots, rustls_native_certs::load_native_certs())?;
                 }
             }
             rustls::ClientConfig::builder()
@@ -106,6 +105,53 @@ impl BackendConnector {
             .enable_http1()
             .wrap_connector(http)
     }
+}
+
+/// Adds every usable certificate from `result` to `roots`, then requires
+/// that at least one landed.
+///
+/// An empty native trust store is exactly as dangerous as a `ca_file` that
+/// loads to zero certificates: it leaves an empty `RootCertStore` in
+/// service, which rejects every backend at the first request instead of
+/// failing loudly at startup. That is plausible on a minimal or sandboxed
+/// container -- this project's deploy target is still undecided -- so it is
+/// checked the same way the `ca_file` branch checks it, not assumed away.
+///
+/// Individual unreadable/malformed entries, reported via `result.errors` or
+/// a rejected `roots.add`, are tolerated on their own -- that mirrors
+/// upstream's own guidance that OS certificate stores can contain entries
+/// that don't parse. Only a totally empty result *after* processing is a
+/// startup failure, and when it happens the enumeration errors (if any) are
+/// folded into the message so the operator learns why, not just that it
+/// happened.
+///
+/// Split out from `new` so this path can be exercised directly in a test:
+/// `rustls_native_certs::load_native_certs()` reads the real platform
+/// certificate store, which cannot practically be forced to return nothing
+/// on a normal development machine.
+fn apply_native_certs(
+    roots: &mut rustls::RootCertStore,
+    result: rustls_native_certs::CertificateResult,
+) -> Result<(), TlsError> {
+    for cert in result.certs {
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        let reason = if result.errors.is_empty() {
+            "no certificates found".to_string()
+        } else {
+            result
+                .errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        return Err(TlsError::Pem(format!(
+            "system trust store contains no usable certificates: {reason}"
+        )));
+    }
+    Ok(())
 }
 
 /// Accepts any certificate. Reachable only through
@@ -204,5 +250,24 @@ mod tests {
         // Reported so the caller can log it at startup and set a gauge --
         // this must be visible on a dashboard, not buried in a config file.
         assert!(c.verification_disabled());
+    }
+
+    /// `BackendConnector::new(&BackendTlsConfig { ca_file: None, .. })` reads
+    /// the *real* platform certificate store via
+    /// `rustls_native_certs::load_native_certs()`, which this machine's
+    /// store is never going to return empty -- so there is no way to drive
+    /// that end-to-end path into the empty-store branch from a unit test.
+    /// What *is* directly testable is the guard itself: `apply_native_certs`
+    /// was split out from `new` specifically so a synthetic, empty
+    /// `CertificateResult` (built with `Default`, no real OS call involved)
+    /// can be fed straight to it.
+    #[test]
+    fn an_empty_native_trust_store_fails_construction() {
+        let mut roots = rustls::RootCertStore::empty();
+        let empty = rustls_native_certs::CertificateResult::default();
+        // Startup must not succeed with an empty trust store here either --
+        // same reasoning as `a_missing_ca_file_fails_loudly` above, just
+        // reachable through the sibling (no ca_file) code path.
+        assert!(super::apply_native_certs(&mut roots, empty).is_err());
     }
 }

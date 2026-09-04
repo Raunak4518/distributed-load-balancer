@@ -13,9 +13,13 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
 # System trust store for the backend-connector path when no ca_file is
-# configured. Errors from individual native certs are safe to ignore --
-# `CertificateResult.certs` is used, malformed OS entries just don't count.
-rustls-native-certs = "0.8"
+# configured. A single malformed OS entry doesn't fail construction, but an
+# empty result does -- see connector.rs's apply_native_certs, which is where
+# `CertificateResult.errors` actually gets used, not discarded.
+# default-features = false to match every other TLS dependency here: this
+# crate has no [features] table today, but a future version bump is not
+# getting to silently opt lb-tls into a second crypto provider.
+rustls-native-certs = { version = "0.8", default-features = false }
 # hyper-rustls defaults to aws-lc-rs, which needs cmake and a C toolchain
 # unavailable here -- same reason rustls itself is pinned to ring above.
 # Every TLS crate in the graph must agree on one provider.
