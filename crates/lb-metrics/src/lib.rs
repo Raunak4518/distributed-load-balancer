@@ -34,6 +34,10 @@ pub struct Metrics {
     request_timeouts: IntCounterVec,
     ratelimit_tracked_keys: IntGaugeVec,
     pub cluster_auth_failures: IntCounterVec,
+
+    // TLS (Phase 6)
+    tls_handshakes: IntCounterVec,
+    tls_handshake_duration: HistogramVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -136,6 +140,26 @@ impl Metrics {
             ),
             &["peer"],
         )?;
+        // `outcome` separates "we are being probed" (failed) from "clients
+        // cannot finish" (timeout) from "our configuration is wrong" (no
+        // successes at all) -- three incidents with three different fixes.
+        // The set is fixed in code; the SNI hostname a client asked for is
+        // deliberately absent, being entirely client-controlled.
+        let tls_handshakes = IntCounterVec::new(
+            Opts::new("lb_tls_handshakes_total", "TLS handshakes, by outcome"),
+            &["listener", "outcome"],
+        )?;
+        // Handshake latency never shows up in request latency, because a
+        // failed handshake never becomes a request. Shares the request
+        // buckets so operators only have one bucket vocabulary to learn.
+        let tls_handshake_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "lb_tls_handshake_duration_seconds",
+                "TLS handshake duration",
+            )
+            .buckets(latency_buckets()),
+            &["listener"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -152,6 +176,8 @@ impl Metrics {
         registry.register(Box::new(request_timeouts.clone()))?;
         registry.register(Box::new(ratelimit_tracked_keys.clone()))?;
         registry.register(Box::new(cluster_auth_failures.clone()))?;
+        registry.register(Box::new(tls_handshakes.clone()))?;
+        registry.register(Box::new(tls_handshake_duration.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -170,6 +196,8 @@ impl Metrics {
             request_timeouts,
             ratelimit_tracked_keys,
             cluster_auth_failures,
+            tls_handshakes,
+            tls_handshake_duration,
         })
     }
 
@@ -205,6 +233,10 @@ impl Metrics {
             timeouts_header: self.request_timeouts.with_label_values(&[name, "header"]),
             timeouts_body: self.request_timeouts.with_label_values(&[name, "body"]),
             tracked_keys: self.ratelimit_tracked_keys.with_label_values(&[name]),
+            tls_handshakes_success: self.tls_handshakes.with_label_values(&[name, "success"]),
+            tls_handshakes_failed: self.tls_handshakes.with_label_values(&[name, "failed"]),
+            tls_handshakes_timeout: self.tls_handshakes.with_label_values(&[name, "timeout"]),
+            tls_handshake_duration: self.tls_handshake_duration.with_label_values(&[name]),
         }
     }
 
@@ -351,6 +383,44 @@ mod tests {
         assert!(text.contains("lb_cluster_auth_failures_total"));
     }
 
+    /// Separating the three outcomes is the whole point of the metric: a
+    /// spike in `failed` means we are being probed, a spike in `timeout`
+    /// means clients cannot finish, and a flatline in `success` while the
+    /// port is busy means the configuration is wrong. Three incidents, three
+    /// different fixes.
+    #[test]
+    fn tls_handshake_outcomes_are_counted_separately() {
+        let metrics = Metrics::new().unwrap();
+        let l = metrics.listener("web", "http");
+        l.tls_handshakes_success.inc();
+        l.tls_handshakes_failed.inc();
+        l.tls_handshakes_failed.inc();
+        l.tls_handshakes_timeout.inc();
+        l.tls_handshake_duration.observe(0.012);
+
+        let text = metrics.gather_text();
+        assert!(
+            text.contains(r#"lb_tls_handshakes_total{listener="web",outcome="success"} 1"#),
+            "expected success=1 in:
+{text}"
+        );
+        assert!(
+            text.contains(r#"lb_tls_handshakes_total{listener="web",outcome="failed"} 2"#),
+            "expected failed=2 in:
+{text}"
+        );
+        assert!(
+            text.contains(r#"lb_tls_handshakes_total{listener="web",outcome="timeout"} 1"#),
+            "expected timeout=1 in:
+{text}"
+        );
+        assert!(
+            text.contains(r#"lb_tls_handshake_duration_seconds_count{listener="web"} 1"#),
+            "expected one handshake duration observation in:
+{text}"
+        );
+    }
+
     /// Encodes spec section 2.3 as an executable rule: every label name in the
     /// exposition must come from a known, config-derived set. A client IP or
     /// path label would explode Prometheus's series count.
@@ -375,6 +445,11 @@ mod tests {
         hardening.timeouts_header.inc();
         hardening.timeouts_body.inc();
         hardening.tracked_keys.set(42);
+        let tls = metrics.listener("web", "http");
+        tls.tls_handshakes_success.inc();
+        tls.tls_handshakes_failed.inc();
+        tls.tls_handshakes_timeout.inc();
+        tls.tls_handshake_duration.observe(0.01);
         let text = metrics.gather_text();
 
         const ALLOWED: [&str; 10] = [

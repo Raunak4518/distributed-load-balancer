@@ -12,6 +12,7 @@ lb-proxy = { path = "../lb-proxy" }
 lb-tcp = { path = "../lb-tcp" }
 lb-metrics = { path = "../lb-metrics" }
 lb-cluster = { path = "../lb-cluster" }
+lb-tls = { path = "../lb-tls" }
 dashmap = "6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
@@ -32,3 +33,8 @@ reqwest = "0.12"
 reqwest = "0.12"
 bytes = "1"
 http-body-util = "0.1"
+# Test certificates are generated at run time; none are committed. Left on
+# native-tls (reqwest's default) deliberately: switching the test client to
+# rustls-tls risks pulling aws-lc-rs into the dev graph, and schannel is
+# entirely independent of the server's rustls+ring stack.
+rcgen = "0.13"

@@ -860,6 +860,8 @@ dependencies = [
  "lb-proxy",
  "lb-ratelimit",
  "lb-tcp",
+ "lb-tls",
+ "rcgen",
  "reqwest",
  "tokio",
  "tracing",

@@ -18,6 +18,11 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 pub async fn run(config: Config) -> std::io::Result<()> {
+    // Must happen before any rustls type is constructed — `build_app` builds
+    // the TLS acceptors. `ring`, matching what every TLS crate in the graph
+    // selected; a provider mismatch surfaces at runtime, not compile time.
+    lb_tls::install_crypto_provider();
+
     // Resolved before anything binds: a cluster configured without a usable
     // secret must fail startup, not run unauthenticated.
     let cluster_secret = match config.cluster.as_ref() {
@@ -60,7 +65,10 @@ pub async fn run(config: Config) -> std::io::Result<()> {
             addr = %actual,
             "listener bound"
         );
-        bound.push((listener, runtime));
+        // Shared from here on: every connection task holds a handle to the
+        // runtime it was accepted on, and outlives the accept-loop iteration
+        // that spawned it.
+        bound.push((listener, Arc::new(runtime)));
     }
 
     // Bound here alongside the traffic listeners so a port clash fails
@@ -146,7 +154,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
 /// drain independently when the shutdown signal arrives.
 async fn serve_listener(
     listener: TcpListener,
-    runtime: ListenerRuntime,
+    runtime: Arc<ListenerRuntime>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
 ) {
@@ -208,14 +216,69 @@ async fn serve_listener(
 
 /// Spawns the connection handler, moving both limit guards into the task so
 /// every exit path — success, error, panic, drain — releases them.
+///
+/// On a TLS listener the handshake also happens inside the task, never in the
+/// accept loop: it is several network round trips, and running it before
+/// `spawn` would let one slow client stall every other accept here. Both
+/// guards are held across it, so a handshake flood consumes the connection
+/// budget — which is correct precisely because the handshake timeout
+/// guarantees that budget drains.
 fn spawn_connection(
-    runtime: &ListenerRuntime,
+    runtime: &Arc<ListenerRuntime>,
     connections: &mut JoinSet<()>,
     stream: TcpStream,
     peer: SocketAddr,
     permit: tokio::sync::OwnedSemaphorePermit,
     ip_guard: crate::limits::IpGuard,
 ) {
+    let runtime = Arc::clone(runtime);
+    connections.spawn(async move {
+        // Held for the life of the connection, handshake included.
+        let _permit = permit;
+        let _ip_guard = ip_guard;
+
+        let Some(acceptor) = runtime.tls() else {
+            drive(&runtime, stream, peer).await;
+            return;
+        };
+
+        let metrics = runtime.metrics();
+        let started = std::time::Instant::now();
+        match acceptor.accept(stream).await {
+            Ok(tls) => {
+                metrics.tls_handshakes_success.inc();
+                // Recorded separately from request latency, which never
+                // includes it: a failed handshake never becomes a request.
+                metrics
+                    .tls_handshake_duration
+                    .observe(started.elapsed().as_secs_f64());
+                drive(&runtime, tls, peer).await;
+            }
+            Err(lb_tls::HandshakeError::TimedOut) => {
+                metrics.tls_handshakes_timeout.inc();
+            }
+            Err(lb_tls::HandshakeError::Failed(err)) => {
+                // No TLS session exists yet, so there is nothing to send an
+                // alert over and nothing that would be valid HTTP. Dropping
+                // the stream is the entire response. The error is rustls'
+                // own description of the protocol failure; the hostname the
+                // client asked for is deliberately not recorded anywhere.
+                metrics.tls_handshakes_failed.inc();
+                tracing::debug!(error = %err, "tls handshake failed");
+            }
+        }
+    });
+}
+
+/// Runs the protocol driver over whatever stream it is given.
+///
+/// Generic so the same code serves a plain `TcpStream` and a `TlsStream`; the
+/// data planes never learn which they got, which is why terminating TLS
+/// needed no change to `lb-proxy` at all.
+async fn drive<S>(runtime: &ListenerRuntime, stream: S, peer: SocketAddr)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     match runtime {
         ListenerRuntime::Http {
             ctx,
@@ -223,37 +286,24 @@ fn spawn_connection(
             ..
         } => {
             let ctx = Arc::clone(ctx);
-            let io = TokioIo::new(stream);
             let peer_ip = peer.ip();
-            let header_read_timeout = *header_read_timeout;
-            connections.spawn(async move {
-                // Held for the life of the connection.
-                let _permit = permit;
-                let _ip_guard = ip_guard;
-
-                let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
-                if let Err(err) = http1::Builder::new()
-                    // hyper 1.x has no built-in timer: any timeout feature
-                    // panics unless one is supplied. Must accompany
-                    // `header_read_timeout`, not be assumed.
-                    .timer(hyper_util::rt::TokioTimer::new())
-                    // Caps the time a client may take to send the request
-                    // head — the direct slowloris defence.
-                    .header_read_timeout(header_read_timeout)
-                    .serve_connection(io, svc)
-                    .await
-                {
-                    tracing::debug!(error = %err, "client connection error");
-                }
-            });
+            let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
+            if let Err(err) = http1::Builder::new()
+                // hyper 1.x has no built-in timer: any timeout feature
+                // panics unless one is supplied. Must accompany
+                // `header_read_timeout`, not be assumed.
+                .timer(hyper_util::rt::TokioTimer::new())
+                // Caps the time a client may take to send the request
+                // head — the direct slowloris defence.
+                .header_read_timeout(*header_read_timeout)
+                .serve_connection(TokioIo::new(stream), svc)
+                .await
+            {
+                tracing::debug!(error = %err, "client connection error");
+            }
         }
         ListenerRuntime::Tcp { ctx, .. } => {
-            let ctx = Arc::clone(ctx);
-            connections.spawn(async move {
-                let _permit = permit;
-                let _ip_guard = ip_guard;
-                lb_tcp::handle_connection(stream, peer, ctx).await;
-            });
+            lb_tcp::handle_connection(stream, peer, Arc::clone(ctx)).await;
         }
     }
 }

@@ -29,6 +29,10 @@ pub enum ListenerRuntime {
         limits: ConnectionLimits,
         metrics: Arc<lb_metrics::ListenerMetrics>,
         header_read_timeout: Duration,
+        /// `None` means this listener speaks plaintext. Built once at startup
+        /// so a bad certificate fails before the port is bound, rather than
+        /// on the first client to arrive.
+        tls: Option<Arc<lb_tls::TlsAcceptor>>,
     },
     Tcp {
         name: String,
@@ -36,6 +40,7 @@ pub enum ListenerRuntime {
         ctx: Arc<TcpAppContext>,
         limits: ConnectionLimits,
         metrics: Arc<lb_metrics::ListenerMetrics>,
+        tls: Option<Arc<lb_tls::TlsAcceptor>>,
     },
 }
 
@@ -55,6 +60,12 @@ impl ListenerRuntime {
     pub fn metrics(&self) -> &Arc<lb_metrics::ListenerMetrics> {
         match self {
             ListenerRuntime::Http { metrics, .. } | ListenerRuntime::Tcp { metrics, .. } => metrics,
+        }
+    }
+
+    pub fn tls(&self) -> Option<&Arc<lb_tls::TlsAcceptor>> {
+        match self {
+            ListenerRuntime::Http { tls, .. } | ListenerRuntime::Tcp { tls, .. } => tls.as_ref(),
         }
     }
 
@@ -197,6 +208,27 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
                 _ => None,
             };
 
+        // Built here, not on first connection: an unreadable certificate or
+        // an unusable key must fail startup outright rather than leave a
+        // bound port that can never complete a handshake.
+        let tls = match &lc.tls {
+            Some(tls_cfg) => {
+                // The listener's protocol decides what we are willing to
+                // speak inside the tunnel. Advertising `http/1.1` is the
+                // seam where Phase 8 adds `h2`; at L4 we do not know the
+                // application protocol's name, so we offer none.
+                let alpn: &[&[u8]] = match lc.protocol {
+                    Protocol::Http => &[b"http/1.1"],
+                    Protocol::Tcp => &[],
+                };
+                Some(Arc::new(
+                    lb_tls::TlsAcceptor::new(tls_cfg, alpn)
+                        .unwrap_or_else(|e| panic!("listener '{}': {e}", lc.name)),
+                ))
+            }
+            None => None,
+        };
+
         listeners.push(match lc.protocol {
             Protocol::Http => ListenerRuntime::Http {
                 name: lc.name.clone(),
@@ -222,6 +254,7 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
                 limits: connection_limits,
                 metrics: Arc::clone(&listener_metrics),
                 header_read_timeout: lc.header_read_timeout(),
+                tls,
             },
             Protocol::Tcp => ListenerRuntime::Tcp {
                 name: lc.name.clone(),
@@ -239,6 +272,7 @@ pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
                 }),
                 limits: connection_limits,
                 metrics: Arc::clone(&listener_metrics),
+                tls,
             },
         });
     }

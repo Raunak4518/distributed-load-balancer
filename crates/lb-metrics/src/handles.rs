@@ -59,6 +59,14 @@ pub struct ListenerMetrics {
     pub timeouts_body: IntCounter,
     /// Early warning that the rate-limit overflow bucket is about to engage.
     pub tracked_keys: IntGauge,
+
+    // TLS (Phase 6). Pre-resolved per outcome for the same reason as every
+    // handle above: the outcome set is fixed in code, so there is no reason
+    // to hash a label string once per handshake.
+    pub tls_handshakes_success: IntCounter,
+    pub tls_handshakes_failed: IntCounter,
+    pub tls_handshakes_timeout: IntCounter,
+    pub tls_handshake_duration: Histogram,
 }
 
 impl ListenerMetrics {

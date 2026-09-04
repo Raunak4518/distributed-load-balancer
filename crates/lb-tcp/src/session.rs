@@ -76,12 +76,18 @@ pub enum ConnectionOutcome {
     Aborted,
 }
 
-pub async fn handle_connection<R, L, C>(
-    inbound: TcpStream,
+/// Proxies one client connection to a backend.
+///
+/// Generic over the inbound stream so the same code serves a plain
+/// `TcpStream` and a TLS stream: `pump` is already written against
+/// `AsyncRead`/`AsyncWrite`, so the L4 data plane never learns which it got.
+pub async fn handle_connection<S, R, L, C>(
+    inbound: S,
     peer: SocketAddr,
     ctx: Arc<TcpContext<R, L, C>>,
 ) -> ConnectionOutcome
 where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     R: RateLimiter,
     L: LoadBalancer,
     C: Clock,
@@ -151,7 +157,15 @@ where
         return ConnectionOutcome::ConnectFailed;
     };
 
-    let (client_read, client_write) = inbound.into_split();
+    // `tokio::io::split` rather than `TcpStream::into_split`, because the
+    // inbound stream is no longer necessarily a socket. A TLS stream cannot
+    // be split without a lock anyway — one rustls connection drives both
+    // directions — and the lock is held only for the duration of a single
+    // non-blocking poll, so the two directions never wait on each other for
+    // longer than one syscall.
+    let (client_read, client_write) = tokio::io::split(inbound);
+    // The backend side is still ours to open, and is always a plain socket,
+    // so it keeps the lock-free split.
     let (backend_read, backend_write) = outbound.into_split();
 
     // try_join! (not select!): each direction must finish on its own. With
