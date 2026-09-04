@@ -885,12 +885,14 @@ name = "lb-tls"
 version = "0.1.0"
 dependencies = [
  "lb-core",
+ "lb-metrics",
  "rcgen",
  "rustls",
  "rustls-pemfile",
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tracing",
  "x509-parser",
 ]
 

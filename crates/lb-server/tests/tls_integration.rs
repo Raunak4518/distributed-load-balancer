@@ -283,6 +283,128 @@ listen = "{listen}"
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// Same as `tls_http_config`, plus an `[admin]` section (to scrape metrics)
+/// and a configurable `reload_interval_secs` (to make the poll fast enough
+/// for a test).
+fn tls_http_config_with_admin(
+    listen: SocketAddr,
+    admin: SocketAddr,
+    backend: SocketAddr,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    reload_interval_secs: u64,
+) -> String {
+    format!(
+        r#"
+[admin]
+listen = "{admin}"
+
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+
+  [listeners.tls]
+  handshake_timeout_ms = 5000
+  reload_interval_secs = {reload_interval_secs}
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "{cert}"
+    key_file = "{key}"
+    hostnames = ["localhost"]
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#,
+        cert = cert.display().to_string().replace('\\', "\\\\"),
+        key = key.display().to_string().replace('\\', "\\\\"),
+    )
+}
+
+/// The end-to-end proof that the reloader is actually wired into `run`, not
+/// just correct in isolation: rewrite the certificate on disk under a
+/// running server, and confirm the swap is both recorded in metrics and does
+/// not disturb service.
+#[tokio::test]
+async fn a_certificate_rewritten_on_disk_is_reloaded_without_a_restart() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let admin = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let config = Config::parse(&tls_http_config_with_admin(
+        listen, admin, backend, &cert, &key, 1,
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+    support::wait_until_listening(admin).await;
+
+    // Sleep past filesystem timestamp granularity, then replace the
+    // certificate material with a fresh, distinct pair for the same name.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    std::fs::write(&cert, generated.cert.pem()).unwrap();
+    std::fs::write(&key, generated.key_pair.serialize_pem()).unwrap();
+
+    // Poll `/metrics` (1s reload interval) for the second "applied" reload:
+    // the first happens on the reloader's initial tick against the
+    // already-loaded material, the second picks up the rewrite above.
+    let body = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let body = reqwest::get(format!("http://{admin}/metrics"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            if body
+                .contains(r#"lb_tls_certificate_reloads_total{listener="web",outcome="applied"} 2"#)
+            {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the on-disk certificate rewrite was never reflected in metrics");
+
+    assert!(
+        body.contains(
+            r#"lb_tls_certificate_expiry_timestamp_seconds{cert="primary",listener="web"}"#
+        ),
+        "expected the expiry gauge for the reloaded certificate in:\n{body}"
+    );
+
+    // The load-bearing outcome: the listener is still serving HTTPS after
+    // the swap, on the new material.
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .expect("https request failed after a hot reload");
+    assert_eq!(resp.status(), 200);
+}
+
 // ---------------------------------------------------------------------------
 // TLS on a raw TCP (L4) listener
 // ---------------------------------------------------------------------------

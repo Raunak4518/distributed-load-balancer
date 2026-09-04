@@ -1,4 +1,4 @@
-use prometheus::{Histogram, IntCounter, IntGauge};
+use prometheus::{Histogram, IntCounter, IntGauge, IntGaugeVec};
 
 /// Status codes are recorded by *class*, not exact code.
 ///
@@ -67,6 +67,21 @@ pub struct ListenerMetrics {
     pub tls_handshakes_failed: IntCounter,
     pub tls_handshakes_timeout: IntCounter,
     pub tls_handshake_duration: Histogram,
+
+    // TLS certificate hot reload (Phase 6). The outcome set is fixed in
+    // code (applied/unchanged/rejected), so these are pre-resolved handles
+    // like every other counter above -- never `with_label_values` on a
+    // reload tick.
+    pub tls_certificate_reloads_applied: IntCounter,
+    pub tls_certificate_reloads_unchanged: IntCounter,
+    pub tls_certificate_reloads_rejected: IntCounter,
+    /// Unlike every other field here, this is the family itself rather than
+    /// a pre-resolved handle: `cert` genuinely varies per configured
+    /// certificate, and the set of certificates is not known when this
+    /// struct is built. Reload ticks are infrequent (60s by default), so
+    /// resolving a label pair here is not a hot-path cost the way it would
+    /// be per-request or per-handshake.
+    pub tls_certificate_expiry_timestamp_seconds: IntGaugeVec,
 }
 
 impl ListenerMetrics {

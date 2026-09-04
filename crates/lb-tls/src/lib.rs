@@ -1,11 +1,13 @@
 mod acceptor;
 mod certs;
 mod error;
+mod reload;
 mod resolver;
 
 pub use acceptor::{install_crypto_provider, HandshakeError, TlsAcceptor};
 pub use certs::{load_certificate, LoadedCert};
 pub use error::TlsError;
+pub use reload::{reload_once, spawn_reloader, FileStamp, ReloadReport};
 pub use resolver::{CertStore, SniResolver};
 
 // Loaded once here and re-exported via `use` from each module's inline test

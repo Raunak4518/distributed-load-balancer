@@ -211,6 +211,20 @@ pub fn build_app(
 
         spawn_health_checkers(lc, &backends, &pool, &mut background_tasks, &metrics);
 
+        // Certificates expire on a fixed schedule (90 days under ACME), so a
+        // TLS listener without a reload loop is an outage generator on a
+        // timer. Pushed onto the same list the health checkers use, so it is
+        // aborted on shutdown with everything else.
+        if let (Some(acceptor), Some(tls_cfg)) = (tls.as_ref(), lc.tls.as_ref()) {
+            background_tasks.push(lb_tls::spawn_reloader(
+                lc.name.clone(),
+                tls_cfg.certificates.clone(),
+                Arc::clone(acceptor.resolver()),
+                tls_cfg.reload_interval(),
+                Arc::clone(&listener_metrics),
+            ));
+        }
+
         // The global cap is the sustained rate over the whole window; the
         // local GCRA continues to shape bursts inside it.
         let cluster_coordinator: Option<Arc<dyn ClusterCoordinator>> =

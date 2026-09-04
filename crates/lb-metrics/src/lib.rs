@@ -38,6 +38,8 @@ pub struct Metrics {
     // TLS (Phase 6)
     tls_handshakes: IntCounterVec,
     tls_handshake_duration: HistogramVec,
+    tls_certificate_reloads: IntCounterVec,
+    tls_certificate_expiry_timestamp_seconds: IntGaugeVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -160,6 +162,28 @@ impl Metrics {
             .buckets(latency_buckets()),
             &["listener"],
         )?;
+        // outcome: applied | unchanged | rejected. A rising `rejected` means
+        // renewal is broken while the certificate on disk quietly ages
+        // toward expiry -- this is what turns that into a ticket instead of
+        // a Sunday outage.
+        let tls_certificate_reloads = IntCounterVec::new(
+            Opts::new(
+                "lb_tls_certificate_reloads_total",
+                "Certificate reload attempts, by outcome",
+            ),
+            &["listener", "outcome"],
+        )?;
+        // Unix seconds of the leaf's notAfter. Alert on "< 14 days" and an
+        // expiry becomes a ticket instead of an outage. `cert` is carried
+        // alongside `listener` because two listeners could otherwise reuse
+        // the same certificate name and clobber each other's gauge value.
+        let tls_certificate_expiry_timestamp_seconds = IntGaugeVec::new(
+            Opts::new(
+                "lb_tls_certificate_expiry_timestamp_seconds",
+                "Unix timestamp of each certificate's notAfter",
+            ),
+            &["listener", "cert"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -178,6 +202,8 @@ impl Metrics {
         registry.register(Box::new(cluster_auth_failures.clone()))?;
         registry.register(Box::new(tls_handshakes.clone()))?;
         registry.register(Box::new(tls_handshake_duration.clone()))?;
+        registry.register(Box::new(tls_certificate_reloads.clone()))?;
+        registry.register(Box::new(tls_certificate_expiry_timestamp_seconds.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -198,6 +224,8 @@ impl Metrics {
             cluster_auth_failures,
             tls_handshakes,
             tls_handshake_duration,
+            tls_certificate_reloads,
+            tls_certificate_expiry_timestamp_seconds,
         })
     }
 
@@ -237,6 +265,22 @@ impl Metrics {
             tls_handshakes_failed: self.tls_handshakes.with_label_values(&[name, "failed"]),
             tls_handshakes_timeout: self.tls_handshakes.with_label_values(&[name, "timeout"]),
             tls_handshake_duration: self.tls_handshake_duration.with_label_values(&[name]),
+            tls_certificate_reloads_applied: self
+                .tls_certificate_reloads
+                .with_label_values(&[name, "applied"]),
+            tls_certificate_reloads_unchanged: self
+                .tls_certificate_reloads
+                .with_label_values(&[name, "unchanged"]),
+            tls_certificate_reloads_rejected: self
+                .tls_certificate_reloads
+                .with_label_values(&[name, "rejected"]),
+            // A clone, not a resolved handle: `IntGaugeVec::clone()` shares
+            // the same underlying series storage, so this is cheap, and the
+            // set of certificate names is not known until the reloader
+            // reads its config.
+            tls_certificate_expiry_timestamp_seconds: self
+                .tls_certificate_expiry_timestamp_seconds
+                .clone(),
         }
     }
 
@@ -383,6 +427,52 @@ mod tests {
         assert!(text.contains("lb_cluster_auth_failures_total"));
     }
 
+    /// A rising `rejected` count means renewal is broken while the
+    /// certificate on disk quietly ages toward expiry -- this is the signal
+    /// that turns that into a ticket instead of a Sunday outage. The expiry
+    /// gauge is the other half: `cert` genuinely varies per certificate, so
+    /// it carries both `listener` and `cert` labels (two listeners could
+    /// otherwise reuse the same certificate name and clobber each other's
+    /// gauge value).
+    #[test]
+    fn tls_certificate_reload_and_expiry_metrics_are_exposed() {
+        let metrics = Metrics::new().unwrap();
+        let l = metrics.listener("web", "http");
+        l.tls_certificate_reloads_applied.inc();
+        l.tls_certificate_reloads_unchanged.inc();
+        l.tls_certificate_reloads_unchanged.inc();
+        l.tls_certificate_reloads_rejected.inc();
+        l.tls_certificate_expiry_timestamp_seconds
+            .with_label_values(&["web", "primary"])
+            .set(1_893_456_000);
+
+        let text = metrics.gather_text();
+        assert!(
+            text.contains(
+                r#"lb_tls_certificate_reloads_total{listener="web",outcome="applied"} 1"#
+            ),
+            "expected applied=1 in:\n{text}"
+        );
+        assert!(
+            text.contains(
+                r#"lb_tls_certificate_reloads_total{listener="web",outcome="unchanged"} 2"#
+            ),
+            "expected unchanged=2 in:\n{text}"
+        );
+        assert!(
+            text.contains(
+                r#"lb_tls_certificate_reloads_total{listener="web",outcome="rejected"} 1"#
+            ),
+            "expected rejected=1 in:\n{text}"
+        );
+        assert!(
+            text.contains(
+                r#"lb_tls_certificate_expiry_timestamp_seconds{cert="primary",listener="web"} 1893456000"#
+            ),
+            "expected the expiry gauge in:\n{text}"
+        );
+    }
+
     /// Separating the three outcomes is the whole point of the metric: a
     /// spike in `failed` means we are being probed, a spike in `timeout`
     /// means clients cannot finish, and a flatline in `success` while the
@@ -450,15 +540,25 @@ mod tests {
         tls.tls_handshakes_failed.inc();
         tls.tls_handshakes_timeout.inc();
         tls.tls_handshake_duration.observe(0.01);
+        tls.tls_certificate_reloads_applied.inc();
+        tls.tls_certificate_reloads_unchanged.inc();
+        tls.tls_certificate_reloads_rejected.inc();
+        tls.tls_certificate_expiry_timestamp_seconds
+            .with_label_values(&["web", "primary"])
+            .set(1_893_456_000);
         let text = metrics.gather_text();
 
-        const ALLOWED: [&str; 10] = [
+        const ALLOWED: [&str; 11] = [
             "listener", "protocol", "status", "backend", "outcome", "layer", "peer",
             // Phase 5: both drawn from fixed sets in the code, never input.
             "reason", "phase",
             // `le` is Prometheus's own histogram bucket-boundary label. It is
             // bounded by our bucket count (15), not client-derived.
             "le",
+            // Phase 6: an operator-chosen name from `[[listeners.tls.certificates]]`,
+            // never client-controlled -- unlike the SNI hostname, which is
+            // deliberately not a label anywhere.
+            "cert",
         ];
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let Some(start) = line.find('{') else {
