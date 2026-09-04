@@ -2,7 +2,7 @@ use crate::error::ConfigError;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,6 +169,11 @@ pub struct ListenerConfig {
     pub header_read_timeout_ms: Option<u64>,
     pub body_read_timeout_ms: Option<u64>,
 
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub backend_tls: Option<BackendTlsConfig>,
+
     pub backends: Vec<BackendConfig>,
     pub health_check: HealthCheckConfig,
     pub rate_limit: RateLimitConfig,
@@ -216,11 +221,85 @@ impl ListenerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    pub certificates: Vec<CertificateConfig>,
+    pub handshake_timeout_ms: Option<u64>,
+    pub min_version: Option<TlsVersion>,
+    pub reload_interval_secs: Option<u64>,
+    pub hsts_max_age_secs: Option<u64>,
+}
+
+impl TlsConfig {
+    /// Caps the TLS handshake. Nothing in Phase 5 covers this window: hyper
+    /// never sees a connection whose handshake has not completed, so
+    /// `header_read_timeout` cannot apply to it.
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms.unwrap_or(5_000))
+    }
+
+    pub fn reload_interval(&self) -> Duration {
+        Duration::from_secs(self.reload_interval_secs.unwrap_or(60))
+    }
+
+    pub fn min_version(&self) -> TlsVersion {
+        self.min_version.unwrap_or(TlsVersion::Tls12)
+    }
+
+    /// 0 means off, which is the default: HSTS is cached by browsers for its
+    /// full max-age, so enabling it must be a deliberate act.
+    pub fn hsts_max_age_secs(&self) -> u64 {
+        self.hsts_max_age_secs.unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CertificateConfig {
+    /// Appears in metrics. Operator-chosen, never client-controlled.
+    pub name: String,
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    #[serde(default)]
+    pub hostnames: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum TlsVersion {
+    Tls12,
+    Tls13,
+}
+
+impl TryFrom<String> for TlsVersion {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        match s.as_str() {
+            "1.2" => Ok(TlsVersion::Tls12),
+            "1.3" => Ok(TlsVersion::Tls13),
+            other => Err(format!(
+                "invalid tls.min_version '{other}': expected \"1.2\" or \"1.3\""
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackendTlsConfig {
+    /// Omit for the system trust store. Internal PKI is the common case on
+    /// this path, which is why the file form exists at all.
+    pub ca_file: Option<PathBuf>,
+    #[serde(default)]
+    pub danger_accept_invalid_certs: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct BackendConfig {
     pub id: String,
     pub address: SocketAddr,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -471,6 +550,33 @@ impl ListenerConfig {
                         "rate_limit.key 'header:{name}' is http-only — a tcp listener has no headers to read, use 'source_ip'"
                     )));
                 }
+            }
+        }
+
+        if self.backend_tls.is_some() {
+            for backend in &self.backends {
+                if backend.server_name.is_none() {
+                    return Err(invalid(format!(
+                        "backend '{}' needs a server_name when backend_tls is set — \
+                         certificates are issued for hostnames, but the backend is \
+                         addressed as {}. Add server_name = \"<the name on its certificate>\".",
+                        backend.id, backend.address
+                    )));
+                }
+            }
+        }
+        if let Some(tls) = &self.tls {
+            if self.protocol == Protocol::Tcp && tls.hsts_max_age_secs() > 0 {
+                return Err(invalid(
+                    "hsts_max_age_secs is meaningless on a tcp listener — there are no \
+                     responses to add a header to"
+                        .into(),
+                ));
+            }
+            if tls.certificates.is_empty() {
+                return Err(invalid(
+                    "[listeners.tls] needs at least one certificate".into(),
+                ));
             }
         }
         Ok(())
@@ -777,5 +883,195 @@ mod tests {
             "          [[listeners.backends]]\n          id = \"web1\"\n          address = \"127.0.0.1:9001\"\n\n          [[listeners.backends]]\n          id = \"web1\"\n          address = \"127.0.0.1:9002\"",
         );
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    /// Full valid config for a listener whose `backend_tls` is set. `danger`
+    /// controls `danger_accept_invalid_certs`; `server_name`, when present,
+    /// is written onto the backend.
+    fn tls_backend_toml(server_name: Option<&str>, danger: bool) -> String {
+        let server_name_line = match server_name {
+            Some(name) => format!("  server_name = \"{name}\"\n"),
+            None => String::new(),
+        };
+        format!(
+            r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.backend_tls]
+  danger_accept_invalid_certs = {danger}
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+{server_name_line}
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        )
+    }
+
+    /// Full valid config for a listener with neither `tls` nor `backend_tls`
+    /// set, and no `server_name` on its backend.
+    fn plain_backend_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    /// Full valid config for a *tcp* listener whose `tls` section turns HSTS
+    /// on — a combination that must be rejected, since a tcp listener never
+    /// produces an HTTP response to carry the header.
+    fn tcp_listener_with_hsts_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "tcp"
+listen = "0.0.0.0:443"
+
+  [listeners.tls]
+  hsts_max_age_secs = 3600
+
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "/etc/lb/a.crt"
+    key_file = "/etc/lb/a.key"
+    hostnames = ["example.com"]
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn parses_a_tls_listener_with_defaults() {
+        let toml = r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.tls]
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "/etc/lb/a.crt"
+    key_file = "/etc/lb/a.key"
+    hostnames = ["example.com"]
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#;
+        let config = Config::parse(toml).unwrap();
+        let tls = config.listeners[0].tls.as_ref().unwrap();
+        assert_eq!(tls.certificates.len(), 1);
+        assert_eq!(tls.certificates[0].name, "primary");
+        assert_eq!(tls.handshake_timeout(), Duration::from_millis(5_000));
+        assert_eq!(tls.reload_interval(), Duration::from_secs(60));
+        assert_eq!(tls.min_version(), TlsVersion::Tls12);
+        // HSTS is off unless someone deliberately turns it on: browsers cache
+        // the policy for its full max-age, so it is close to irreversible.
+        assert_eq!(tls.hsts_max_age_secs(), 0);
+    }
+
+    #[test]
+    fn a_backend_without_server_name_is_rejected_when_backend_tls_is_set() {
+        let toml = tls_backend_toml(/* server_name = */ None, /* danger = */ false);
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        // Fails at startup rather than at the first request, following the
+        // cluster-secret precedent.
+        assert!(err.contains("server_name"), "unhelpful error: {err}");
+        assert!(err.contains("b1"), "error must name the backend: {err}");
+    }
+
+    #[test]
+    fn server_name_is_not_required_without_backend_tls() {
+        let toml = plain_backend_toml();
+        assert!(Config::parse(&toml).is_ok());
+    }
+
+    #[test]
+    fn hsts_is_rejected_on_a_tcp_listener() {
+        let toml = tcp_listener_with_hsts_toml();
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        // A TCP listener has no responses to put a header on.
+        assert!(err.contains("hsts"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn tls_version_strings_use_dotted_form() {
+        assert_eq!(
+            TlsVersion::try_from("1.3".to_string()).unwrap(),
+            TlsVersion::Tls13
+        );
+        assert!(TlsVersion::try_from("1.1".to_string()).is_err());
     }
 }
