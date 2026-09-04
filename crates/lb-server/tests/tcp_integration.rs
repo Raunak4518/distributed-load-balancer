@@ -3,7 +3,6 @@ mod support;
 use lb_core::Config;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use support::{spawn_echo_backend, tcp_config_toml, tcp_roundtrip};
 use tokio::net::TcpListener;
 

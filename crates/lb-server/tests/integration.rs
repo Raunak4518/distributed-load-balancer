@@ -4,7 +4,6 @@ use hyper::StatusCode;
 use lb_core::Config;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use support::{config_toml, spawn_counting_backend};
 use tokio::net::TcpListener;
 
