@@ -12,6 +12,15 @@ lb-metrics = { path = "../lb-metrics" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls-pemfile = "2"
+# System trust store for the backend-connector path when no ca_file is
+# configured. Errors from individual native certs are safe to ignore --
+# `CertificateResult.certs` is used, malformed OS entries just don't count.
+rustls-native-certs = "0.8"
+# hyper-rustls defaults to aws-lc-rs, which needs cmake and a C toolchain
+# unavailable here -- same reason rustls itself is pinned to ring above.
+# Every TLS crate in the graph must agree on one provider.
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "tls12", "native-tokio"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 x509-parser = "0.16"
 thiserror = "1"
 tracing = "0.1"

@@ -203,6 +203,43 @@ mod tests {
         );
     }
 
+    /// Task 6's rule is that every certificate in the batch is loaded and
+    /// validated *before* anything is swapped, so a bad second certificate
+    /// cannot leave a good first certificate applied on its own -- a
+    /// *partial* swap, which is worse than a fully stale batch because it
+    /// puts half-new material into service. This is the direct test for
+    /// that: two certificates, a first reload applies both, then only the
+    /// second is corrupted, and the whole batch -- including the still-valid
+    /// first certificate -- must be rejected together.
+    #[test]
+    fn a_bad_second_certificate_rejects_the_whole_batch_not_just_itself() {
+        let dir = tmpdir();
+        let c = vec![
+            cfg(&dir, "a", &["a.example.com"]),
+            cfg(&dir, "b", &["b.example.com"]),
+        ];
+        let resolver = resolver_for(&c);
+        let mut stamps = vec![None, None];
+        reload_once(&c, &resolver, &mut stamps);
+        let good = resolver.current();
+
+        // Sleep past filesystem timestamp granularity so the change on the
+        // second certificate is detectable.
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        std::fs::write(&c[1].cert_file, b"garbage, not a certificate").unwrap();
+
+        let report = reload_once(&c, &resolver, &mut stamps);
+        assert!(report.rejected.is_some());
+        // The load-bearing assertion: not just "the bad cert was rejected",
+        // but that the store was never swapped at all -- so the still-valid
+        // first certificate was not applied either.
+        assert!(
+            std::sync::Arc::ptr_eq(&good, &resolver.current()),
+            "a partial swap occurred: the first certificate was applied \
+             even though the second was rejected"
+        );
+    }
+
     #[test]
     fn broken_material_is_rejected_and_the_old_certificate_keeps_serving() {
         let dir = tmpdir();

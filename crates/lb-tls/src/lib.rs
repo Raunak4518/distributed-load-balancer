@@ -1,11 +1,13 @@
 mod acceptor;
 mod certs;
+mod connector;
 mod error;
 mod reload;
 mod resolver;
 
 pub use acceptor::{install_crypto_provider, HandshakeError, TlsAcceptor};
 pub use certs::{load_certificate, LoadedCert};
+pub use connector::BackendConnector;
 pub use error::TlsError;
 pub use reload::{reload_once, spawn_reloader, FileStamp, ReloadReport};
 pub use resolver::{CertStore, SniResolver};
