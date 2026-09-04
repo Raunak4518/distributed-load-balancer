@@ -19,15 +19,24 @@ pub struct ClusterNode<C: Clock> {
     node_id: String,
     store: CounterStore,
     clock: C,
+    /// Pre-shared key authenticating every peer message. Mandatory: the peer
+    /// port influences rate-limiting decisions, so unauthenticated access to
+    /// it is a denial-of-service vector.
+    secret: Vec<u8>,
 }
 
 impl<C: Clock> ClusterNode<C> {
-    pub fn new(node_id: impl Into<String>, window_secs: u64, clock: C) -> Self {
+    pub fn new(node_id: impl Into<String>, window_secs: u64, clock: C, secret: Vec<u8>) -> Self {
         ClusterNode {
             node_id: node_id.into(),
             store: CounterStore::new(window_secs),
             clock,
+            secret,
         }
+    }
+
+    pub fn secret(&self) -> &[u8] {
+        &self.secret
     }
 
     pub fn node_id(&self) -> &str {
@@ -114,7 +123,7 @@ mod tests {
     use std::time::Duration;
 
     fn node(id: &str, clock: FakeClock) -> Arc<ClusterNode<FakeClock>> {
-        Arc::new(ClusterNode::new(id, 10, clock))
+        Arc::new(ClusterNode::new(id, 10, clock, b"test-secret".to_vec()))
     }
 
     #[test]

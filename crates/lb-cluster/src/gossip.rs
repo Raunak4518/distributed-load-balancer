@@ -38,7 +38,7 @@ async fn handle_peer_connection<C>(
     C: Clock,
 {
     loop {
-        match read_message(&mut stream).await {
+        match read_message(&mut stream, node.secret()).await {
             Ok(msg) => {
                 if node.merge_message(&msg) == MergeOutcome::OwnNodeIdEcho {
                     tracing::error!(
@@ -48,6 +48,12 @@ async fn handle_peer_connection<C>(
                          and their counts will collide"
                     );
                 }
+            }
+            // A failed tag is worth surfacing: it means either a
+            // misconfigured secret or someone probing the peer port.
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                tracing::warn!(peer = %peer, "rejected an unauthenticated peer message");
+                return;
             }
             // Includes clean EOF when the peer closes after pushing. A bad
             // frame closes only this connection, never the listener.
@@ -78,7 +84,7 @@ where
 
             let message = node.snapshot_message();
             if !message.entries.is_empty() {
-                let Ok(framed) = encode(&message) else {
+                let Ok(framed) = encode(&message, node.secret()) else {
                     continue;
                 };
                 for peer in &peers {
@@ -113,6 +119,8 @@ mod tests {
     use lb_core::test_util::FakeClock;
     use lb_core::ClusterCoordinator;
 
+    const SECRET: &[u8] = b"cluster-test-secret";
+
     async fn bound_listener() -> (TcpListener, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -122,8 +130,18 @@ mod tests {
     #[tokio::test]
     async fn counters_propagate_from_one_node_to_another() {
         let clock = FakeClock::new();
-        let sender = Arc::new(ClusterNode::new("sender", 10, clock.clone()));
-        let receiver = Arc::new(ClusterNode::new("receiver", 10, clock.clone()));
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
 
         let (listener, addr) = bound_listener().await;
         let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
@@ -165,7 +183,12 @@ mod tests {
     #[tokio::test]
     async fn an_unreachable_peer_does_not_break_the_sync_loop() {
         let clock = FakeClock::new();
-        let sender = Arc::new(ClusterNode::new("sender", 10, clock.clone()));
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
 
         // One dead address, one live receiver.
         let dead = {
@@ -173,7 +196,12 @@ mod tests {
             drop(l);
             a
         };
-        let receiver = Arc::new(ClusterNode::new("receiver", 10, clock.clone()));
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
         let (listener, live) = bound_listener().await;
         let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
 
@@ -203,10 +231,88 @@ mod tests {
         assert!(converged, "a dead peer blocked delivery to a live one");
     }
 
+    /// The security property this phase exists to deliver: an attacker who
+    /// can reach the peer port but does not hold the secret cannot inflate
+    /// counters, and therefore cannot deny service through the limiter.
+    #[tokio::test]
+    async fn a_peer_with_the_wrong_secret_cannot_influence_counters() {
+        let clock = FakeClock::new();
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
+
+        // An impostor signs with a different key and pushes a large count.
+        let impostor = Arc::new(ClusterNode::new(
+            "impostor",
+            10,
+            clock.clone(),
+            b"not-the-real-secret".to_vec(),
+        ));
+        let coord = ListenerCoordinator::new(Arc::clone(&impostor), "web", 1_000);
+        for _ in 0..50 {
+            assert!(coord.try_admit("victim"));
+        }
+        let framed = encode(&impostor.snapshot_message(), impostor.secret()).unwrap();
+        {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(&framed).await.unwrap();
+            s.shutdown().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            receiver
+                .store()
+                .total_in_window("web\u{1}victim", clock.unix_secs()),
+            0,
+            "an unauthenticated peer managed to inject counter values"
+        );
+
+        // And the listener still serves a properly-signed peer afterwards.
+        let genuine = Arc::new(ClusterNode::new(
+            "genuine",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let good = ListenerCoordinator::new(Arc::clone(&genuine), "web", 1_000);
+        assert!(good.try_admit("victim"));
+        let framed = encode(&genuine.snapshot_message(), SECRET).unwrap();
+        {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(&framed).await.unwrap();
+            s.shutdown().await.unwrap();
+        }
+
+        let mut converged = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if receiver
+                .store()
+                .total_in_window("web\u{1}victim", clock.unix_secs())
+                == 1
+            {
+                converged = true;
+                break;
+            }
+        }
+        assert!(converged, "listener stopped accepting authentic peers");
+    }
+
     #[tokio::test]
     async fn garbage_from_a_peer_does_not_kill_the_listener() {
         let clock = FakeClock::new();
-        let receiver = Arc::new(ClusterNode::new("receiver", 10, clock.clone()));
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
         let (listener, addr) = bound_listener().await;
         let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
 
@@ -221,10 +327,15 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // The listener still serves a well-formed peer afterwards.
-        let sender = Arc::new(ClusterNode::new("sender", 10, clock.clone()));
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
         let coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 10);
         assert!(coord.try_admit("k"));
-        let framed = encode(&sender.snapshot_message()).unwrap();
+        let framed = encode(&sender.snapshot_message(), SECRET).unwrap();
         {
             let mut good = TcpStream::connect(addr).await.unwrap();
             good.write_all(&framed).await.unwrap();

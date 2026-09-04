@@ -17,6 +17,15 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 pub async fn run(config: Config) -> std::io::Result<()> {
+    // Resolved before anything binds: a cluster configured without a usable
+    // secret must fail startup, not run unauthenticated.
+    let cluster_secret = match config.cluster.as_ref() {
+        Some(c) => Some(c.resolve_secret().map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?),
+        None => None,
+    };
+
     let WiredApp {
         listeners,
         background_tasks,
@@ -25,7 +34,7 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         metrics,
         admin_listen,
         pools,
-    } = build_app(&config);
+    } = build_app(&config, cluster_secret);
 
     // Bind every listener before serving any of them, so a port conflict or
     // permission error fails startup outright instead of half-starting.

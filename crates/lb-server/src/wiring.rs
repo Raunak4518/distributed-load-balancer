@@ -77,7 +77,12 @@ pub struct ClusterSetup {
     pub sync_interval: Duration,
 }
 
-pub fn build_app(config: &Config) -> WiredApp {
+/// Builds the runtime.
+///
+/// Takes the already-resolved cluster secret rather than reading it here:
+/// `run` resolves it before anything binds, so a missing secret fails
+/// startup instead of surfacing once traffic is flowing.
+pub fn build_app(config: &Config, cluster_secret: Option<Vec<u8>>) -> WiredApp {
     let mut listeners = Vec::with_capacity(config.listeners.len());
     let mut background_tasks = Vec::new();
     let mut pools = Vec::with_capacity(config.listeners.len());
@@ -87,13 +92,15 @@ pub fn build_app(config: &Config) -> WiredApp {
     let metrics = Arc::new(Metrics::new().expect("metric names are valid and unique"));
 
     // One cluster node per process, shared by every listener.
-    let cluster_node = config.cluster.as_ref().map(|c| {
-        Arc::new(ClusterNode::new(
+    let cluster_node = match (config.cluster.as_ref(), cluster_secret) {
+        (Some(c), Some(secret)) => Some(Arc::new(ClusterNode::new(
             c.node_id.clone(),
             c.window_secs,
             SystemClock,
-        ))
-    });
+            secret,
+        ))),
+        _ => None,
+    };
 
     for lc in &config.listeners {
         let backends: Vec<Backend> = lc
@@ -322,7 +329,7 @@ mod tests {
     async fn builds_one_runtime_per_listener_with_the_right_protocol() {
         // build_app spawns background tasks, so this needs a Tokio runtime.
         let config = Config::parse(CONFIG).unwrap();
-        let app = build_app(&config);
+        let app = build_app(&config, None);
 
         assert_eq!(app.listeners.len(), 2);
         assert!(matches!(app.listeners[0], ListenerRuntime::Http { .. }));
@@ -349,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn applies_drain_timeout_default() {
         let config = Config::parse(CONFIG).unwrap();
-        let app = build_app(&config);
+        let app = build_app(&config, None);
         assert_eq!(app.drain_timeout, Duration::from_millis(10_000));
         for task in app.background_tasks {
             task.abort();

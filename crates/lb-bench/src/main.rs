@@ -113,7 +113,12 @@ fn bench_gcra_check() {
 
 fn bench_cluster_try_admit() {
     println!("\nListenerCoordinator::try_admit()  [format!() allocation per call]");
-    let node = Arc::new(ClusterNode::new("bench-node", 10, SystemClock));
+    let node = Arc::new(ClusterNode::new(
+        "bench-node",
+        10,
+        SystemClock,
+        b"bench-secret".to_vec(),
+    ));
     let coord = ListenerCoordinator::new(node, "web", u64::MAX);
     bench("single key", ITERATIONS, || {
         black_box(coord.try_admit("192.168.1.100"));
