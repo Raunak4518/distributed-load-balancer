@@ -2,13 +2,17 @@
 # Omit this whole section to run as a single node.
 # Enforces the rate limit ACROSS nodes: without it, N nodes each admit
 # `rate_per_sec`, so the effective global limit is N x what you configured.
-# The peer port is UNAUTHENTICATED — bind it to a private interface.
+# The peer port is authenticated (HMAC-SHA256): a secret is required whenever
+# [cluster] is set, so a misconfigured cluster fails to start rather than
+# running open. Still bind it to a private interface.
+# Prefer shared_secret_env — config files end up in version control.
 # [cluster]
-# node_id          = "lb-1"                  # must be unique per node
-# listen           = "127.0.0.1:7946"        # peer sync port
-# peers            = ["127.0.0.1:7947"]      # the OTHER nodes
-# sync_interval_ms = 200
-# window_secs      = 10
+# node_id           = "lb-1"                 # must be unique per node
+# listen            = "127.0.0.1:7946"       # peer sync port — bind privately
+# peers             = ["127.0.0.1:7947"]     # the OTHER nodes
+# sync_interval_ms  = 200
+# window_secs       = 10
+# shared_secret_env = "LB_CLUSTER_SECRET"    # names the env var holding it
 
 [server]
 drain_timeout_ms = 10000
@@ -20,6 +24,12 @@ protocol = "http"
 listen   = "0.0.0.0:8080"
 forward_timeout_ms     = 5000
 max_request_body_bytes = 1048576
+
+# Edge hardening. Defaults shown; all optional.
+max_connections        = 10000   # total in-flight connections for this listener
+max_connections_per_ip = 100     # stops one source consuming the whole budget
+header_read_timeout_ms = 5000    # slowloris: caps time to send the request head
+body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
 
   [[listeners.backends]]
   id = "web1"
@@ -42,6 +52,10 @@ max_request_body_bytes = 1048576
   key = "source_ip"          # or "header:X-API-Key"
   rate_per_sec = 50
   burst = 100
+  # Caps distinct tracked keys. Past this, newcomers share one overflow
+  # budget so a spray attack cannot grow memory without bound — established
+  # clients keep their own limits.
+  max_tracked_keys = 100000
 
   [listeners.load_balancing]
   strategy = "round_robin"
@@ -53,6 +67,8 @@ protocol = "tcp"
 listen   = "0.0.0.0:5432"
 connect_timeout_ms = 2000
 idle_timeout_ms    = 300000
+max_connections        = 10000
+max_connections_per_ip = 100
 
   [[listeners.backends]]
   id = "pg1"

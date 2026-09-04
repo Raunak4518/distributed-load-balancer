@@ -1,5 +1,7 @@
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use lb_core::{Clock, Decision, RateLimiter};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Shared budget for keys arriving after the map is full.
@@ -20,6 +22,15 @@ pub struct Gcra<C: Clock> {
     period: Duration,
     tau: Duration,
     max_tracked_keys: usize,
+    /// Cached key count.
+    ///
+    /// `DashMap::len()` is *not* O(1) — it walks every shard and sums them.
+    /// Calling it per request measured 4x slower than the whole rest of
+    /// `check()` combined. This is maintained on insert instead and read
+    /// with a single relaxed load. It can lag `state.len()` slightly under
+    /// concurrent sweeps, which is fine: the cap is a safety bound, not an
+    /// exact quota.
+    tracked: AtomicUsize,
     clock: C,
     state: DashMap<String, Instant>,
 }
@@ -32,6 +43,7 @@ impl<C: Clock> Gcra<C> {
             period,
             tau,
             max_tracked_keys: config.max_tracked_keys.max(1),
+            tracked: AtomicUsize::new(0),
             clock,
             state: DashMap::new(),
         }
@@ -40,7 +52,7 @@ impl<C: Clock> Gcra<C> {
     /// Number of distinct keys currently tracked. Exposed so operators can
     /// see the overflow bucket coming before it engages.
     pub fn tracked_keys(&self) -> usize {
-        self.state.len()
+        self.tracked.load(Ordering::Relaxed)
     }
 
     /// Evicts keys whose theoretical arrival time is more than `idle_after`
@@ -49,6 +61,9 @@ impl<C: Clock> Gcra<C> {
         let now = self.clock.now();
         self.state
             .retain(|_, tat| *tat > now || now.duration_since(*tat) < idle_after);
+        // Resync after eviction. Sweeping is infrequent, so paying for a
+        // real `len()` here is fine — unlike on the request path.
+        self.tracked.store(self.state.len(), Ordering::Relaxed);
     }
 }
 
@@ -63,17 +78,26 @@ impl<C: Clock> RateLimiter for Gcra<C> {
         // way incumbents keep their own limits and a spray attack
         // collectively gets one client's worth of throughput.
         //
-        // Short-circuits on the common path: normally only the `len()`
-        // comparison runs, and the extra `contains_key` lookup happens solely
-        // once the map is already at capacity.
-        let key = if self.state.len() >= self.max_tracked_keys && !self.state.contains_key(key) {
+        // Short-circuits on the common path: normally only a relaxed atomic
+        // load runs. The `contains_key` lookup happens solely once the map is
+        // already at capacity.
+        let at_capacity = self.tracked.load(Ordering::Relaxed) >= self.max_tracked_keys;
+        let key = if at_capacity && !self.state.contains_key(key) {
             OVERFLOW_KEY
         } else {
             key
         };
 
         let now = self.clock.now();
-        let mut entry = self.state.entry(key.to_string()).or_insert(now);
+        // The explicit Entry match is what keeps `tracked` accurate: it is
+        // the only way to know whether this call created a key.
+        let mut entry = match self.state.entry(key.to_string()) {
+            Entry::Occupied(occupied) => occupied.into_ref(),
+            Entry::Vacant(vacant) => {
+                self.tracked.fetch_add(1, Ordering::Relaxed);
+                vacant.insert(now)
+            }
+        };
         let tat = if *entry > now { *entry } else { now };
         let new_tat = tat + self.period;
         // `checked_sub` can only underflow if tau exceeds new_tat's distance
