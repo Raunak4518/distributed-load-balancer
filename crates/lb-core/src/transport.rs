@@ -57,10 +57,14 @@ pub type ProbeFuture<'a> = Pin<Box<dyn Future<Output = Option<u16>> + Send + 'a>
 /// could silently drift from that decision; this cannot.
 ///
 /// Returns the response status, or `None` when the request could not be
-/// completed at all -- connect failure, TLS verification failure, timeout, or
-/// a backend that cannot be addressed under this listener's configuration at
-/// all. Deciding which statuses count as "healthy" belongs to the probe, not
-/// here, which is why this returns a code rather than a bool.
+/// completed at all -- connect failure, TLS verification failure, timeout, a
+/// backend that cannot be addressed under this listener's configuration, or a
+/// response an implementation was unwilling to finish receiving (a probe
+/// response is a status and a line of text; an implementation is entitled to
+/// cap what it will read from an untrusted backend, and to treat exceeding
+/// that cap as not having got an answer). Deciding which statuses count as
+/// "healthy" belongs to the probe, not here, which is why this returns a code
+/// rather than a bool.
 pub trait ProbeClient: Send + Sync {
     fn get(
         &self,

@@ -19,13 +19,24 @@ async fn free_addr() -> SocketAddr {
 /// Writes a self-signed pair into a fresh temp dir and returns
 /// (dir, cert_path, key_path). Generated per run rather than checked in: no
 /// private key, however worthless, belongs in version control.
+///
+/// The directory name carries a process-wide counter as well as the clock.
+/// The clock alone is not unique: Windows' system time has ~15.6 ms
+/// granularity, so two tests running concurrently routinely read the same
+/// nanosecond value, land in the same directory, and overwrite each other's
+/// `s.crt` and `s.key` — producing a certificate from one pair with the key
+/// from another, and a `KeyMismatch` at startup that has nothing to do with
+/// what the test was checking. The counter makes collision impossible within
+/// the binary, which is where every concurrent caller lives.
 fn cert_files(names: &[&str]) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "lbtlsit-{}",
+        "lbtlsit-{}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let owned: Vec<String> = names.iter().map(|s| s.to_string()).collect();
@@ -566,23 +577,38 @@ async fn a_tls_tcp_listener_proxies_bytes_to_a_plaintext_backend() {
 // Re-encrypting to backends
 // ---------------------------------------------------------------------------
 
-/// A TLS-only HTTPS backend, and a count of the non-health requests that
-/// reached it.
+/// A TLS-only HTTPS backend, with separate counts of the client requests and
+/// the health-probe requests that reached it over TLS.
 ///
 /// TLS-only on purpose: it answers nothing over plaintext, so anything in the
 /// load balancer that still spoke `http://` to it -- the health probe very
-/// much included -- would be refused, the backend would drop out of rotation
-/// within one probe interval, and every test below would fail. That is the
-/// guard that keeps "the probe uses the traffic transport" load-bearing here
-/// rather than merely intended. (Until Task 9 this fixture had to answer
-/// plaintext as well, because the probe did.)
+/// much included -- would be refused. (Until Task 9 this fixture had to
+/// answer plaintext as well, because the probe did.)
 ///
-/// `/health` is excluded from the count so probe traffic does not show up in
-/// assertions about what a client's request did.
-async fn spawn_tls_backend(
-    cert: &std::path::Path,
-    key: &std::path::Path,
-) -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+/// The two counters are separate because they answer different questions.
+/// `hits` is "did a client's request reach this backend", and excludes
+/// `/health` so probe traffic never contaminates it. `health_hits` is the
+/// positive, backend-side evidence that the *probe itself* got through over
+/// TLS -- the L7 mirror of the handshake count the L4 fixture exposes, and
+/// the only thing that distinguishes "the probe succeeded" from "the probe
+/// never ran".
+struct TlsBackend {
+    addr: SocketAddr,
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    health_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl TlsBackend {
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn health_hits(&self) -> usize {
+        self.health_hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn spawn_tls_backend(cert: &std::path::Path, key: &std::path::Path) -> TlsBackend {
     use std::sync::atomic::{AtomicUsize, Ordering};
     lb_tls::install_crypto_provider();
 
@@ -601,8 +627,10 @@ async fn spawn_tls_backend(
     let acceptor = std::sync::Arc::new(lb_tls::TlsAcceptor::new(&tls_cfg, &[b"http/1.1"]).unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let count = std::sync::Arc::new(AtomicUsize::new(0));
-    let hits = std::sync::Arc::clone(&count);
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let health_hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let served = std::sync::Arc::clone(&hits);
+    let probed = std::sync::Arc::clone(&health_hits);
 
     tokio::spawn(async move {
         loop {
@@ -610,16 +638,20 @@ async fn spawn_tls_backend(
                 return;
             };
             let acceptor = std::sync::Arc::clone(&acceptor);
-            let hits = std::sync::Arc::clone(&hits);
+            let served = std::sync::Arc::clone(&served);
+            let probed = std::sync::Arc::clone(&probed);
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(stream).await else {
                     return;
                 };
                 let svc = hyper::service::service_fn(move |req: hyper::Request<_>| {
-                    let hits = std::sync::Arc::clone(&hits);
+                    let served = std::sync::Arc::clone(&served);
+                    let probed = std::sync::Arc::clone(&probed);
                     async move {
-                        if req.uri().path() != "/health" {
-                            hits.fetch_add(1, Ordering::SeqCst);
+                        if req.uri().path() == "/health" {
+                            probed.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            served.fetch_add(1, Ordering::SeqCst);
                         }
                         Ok::<_, std::convert::Infallible>(hyper::Response::new(
                             http_body_util::Full::new(bytes::Bytes::new()),
@@ -632,7 +664,11 @@ async fn spawn_tls_backend(
             });
         }
     });
-    (addr, count)
+    TlsBackend {
+        addr,
+        hits,
+        health_hits,
+    }
 }
 
 /// `tls_http_config` plus a `[listeners.backend_tls]` section, a
@@ -733,13 +769,13 @@ fn trusting_client() -> reqwest::Client {
 #[tokio::test]
 async fn an_untrusted_backend_certificate_is_refused() {
     let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
-    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let backend = spawn_tls_backend(&bcert, &bkey).await;
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
 
     let config = Config::parse(&backend_tls_config(
         listen,
-        backend,
+        backend.addr,
         &cert,
         &key,
         /* ca_file */ None,
@@ -771,7 +807,7 @@ async fn an_untrusted_backend_certificate_is_refused() {
         "an untrusted backend answered {status}"
     );
     assert_eq!(
-        hits.load(std::sync::atomic::Ordering::SeqCst),
+        backend.hits(),
         0,
         "the request reached a backend whose certificate we could not verify"
     );
@@ -803,13 +839,13 @@ async fn a_listener_without_backend_tls_still_forwards_plaintext() {
 #[tokio::test]
 async fn a_backend_trusted_via_ca_file_is_proxied_to() {
     let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
-    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let backend = spawn_tls_backend(&bcert, &bkey).await;
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
 
     let config = Config::parse(&backend_tls_config(
         listen,
-        backend,
+        backend.addr,
         &cert,
         &key,
         Some(&bcert),
@@ -830,7 +866,7 @@ async fn a_backend_trusted_via_ca_file_is_proxied_to() {
     assert_eq!(resp.status(), 200);
     // Counted only for TLS connections, so a regression to plaintext
     // forwarding fails here rather than quietly answering 200.
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(backend.hits(), 1);
 }
 
 /// The regression test for the L7 DNS-pinning bug. `backend.invalid` is
@@ -846,13 +882,13 @@ async fn a_backend_trusted_via_ca_file_is_proxied_to() {
 #[tokio::test]
 async fn a_backend_whose_server_name_does_not_resolve_via_dns_is_still_proxied_to() {
     let (_bdir, bcert, bkey) = cert_files(&["backend.invalid"]);
-    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let backend = spawn_tls_backend(&bcert, &bkey).await;
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
 
     let config = Config::parse(&backend_tls_config(
         listen,
-        backend,
+        backend.addr,
         &cert,
         &key,
         Some(&bcert),
@@ -885,7 +921,7 @@ async fn a_backend_whose_server_name_does_not_resolve_via_dns_is_still_proxied_t
     assert_eq!(resp.status(), 200);
     // Counted only for TLS connections, so a regression to plaintext
     // forwarding fails here rather than quietly answering 200.
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(backend.hits(), 1);
 }
 
 /// `danger_accept_invalid_certs` must genuinely bypass verification — the
@@ -895,14 +931,14 @@ async fn a_backend_whose_server_name_does_not_resolve_via_dns_is_still_proxied_t
 #[tokio::test]
 async fn the_danger_flag_forwards_to_an_unverifiable_backend_and_is_visible() {
     let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
-    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let backend = spawn_tls_backend(&bcert, &bkey).await;
     let listen = free_addr().await;
     let admin = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
 
     let config = Config::parse(&backend_tls_config(
         listen,
-        backend,
+        backend.addr,
         &cert,
         &key,
         None,
@@ -921,7 +957,7 @@ async fn the_danger_flag_forwards_to_an_unverifiable_backend_and_is_visible() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(backend.hits(), 1);
 
     let body = reqwest::get(format!("http://{admin}/metrics"))
         .await
@@ -1171,14 +1207,29 @@ async fn ready_status(admin: SocketAddr) -> u16 {
 /// cannot verify must fail forwarding *and* probe unhealthy.
 ///
 /// If these two ever disagree, the load balancer keeps a backend in rotation
-/// that it cannot actually talk to. Before Task 9 the probe spoke plaintext
-/// `http://` over its own `reqwest` client, so it got a cheerful 200 from a
-/// backend every real (TLS) request was refused against: `/ready` said 200
-/// while every request failed.
+/// that it cannot actually talk to: every request fails while `/ready` says
+/// 200 and the dashboard shows green. Before Task 9 that was exactly the
+/// behaviour, because the probe went over its own `reqwest` client with its
+/// own trust configuration and never had an opinion about this backend's
+/// certificate at all.
+///
+/// **What this test proves on its own, precisely.** It fails for any probe
+/// that reaches a verdict of "healthy" on a backend the data plane refuses --
+/// a probe on a second client with different (or no) trust roots, a probe
+/// with the danger flag wired to it, a probe that never runs. It does *not*
+/// by itself discriminate the specific plaintext-`http://` regression named
+/// above any more, because this fixture is now TLS-only (that is deliberate,
+/// and is itself a guard): a plaintext probe would be refused by the
+/// backend's acceptor rather than getting a cheerful 200, and would land on
+/// the same 503. The other half of that proof is
+/// `a_backend_we_can_verify_probes_healthy` below, which asserts the probe
+/// reached this same TLS-only backend at `/health` -- so between the two,
+/// "the probe speaks the traffic transport, and agrees with it about trust"
+/// is pinned from both sides.
 #[tokio::test]
 async fn a_backend_we_cannot_verify_also_probes_unhealthy() {
     let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
-    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let backend = spawn_tls_backend(&bcert, &bkey).await;
     let listen = free_addr().await;
     let admin = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
@@ -1187,7 +1238,7 @@ async fn a_backend_we_cannot_verify_also_probes_unhealthy() {
     // trust store this listener has.
     let config = Config::parse(&backend_tls_config(
         listen,
-        backend,
+        backend.addr,
         &cert,
         &key,
         /* ca_file */ None,
@@ -1227,27 +1278,43 @@ async fn a_backend_we_cannot_verify_also_probes_unhealthy() {
         "an unverifiable backend answered {status}"
     );
     assert_eq!(
-        hits.load(std::sync::atomic::Ordering::SeqCst),
+        backend.hits(),
         0,
         "the request reached a backend whose certificate we could not verify"
     );
+    // Backend-side evidence for the probe half, not just the pool's verdict:
+    // in 2.5s the checker ran several times and not one of those probes ever
+    // completed a request against this backend. A probe that had verified it
+    // (or skipped verification) would show up here.
+    assert_eq!(
+        backend.health_hits(),
+        0,
+        "a probe completed a request against a backend we cannot verify"
+    );
 }
 
-/// The control for the test above: the *same* backend, with its certificate
-/// as the trust root, must probe healthy and serve traffic. Without this,
-/// the test above would pass just as well if probing were broken outright
-/// and every backend were reported unhealthy.
+/// The control for the test above, and the other half of its proof: the
+/// *same* backend, with its certificate as the trust root, must probe healthy
+/// and serve traffic.
+///
+/// Two things rest on this. Without it, the test above would pass just as
+/// well if probing were broken outright and every backend were reported
+/// unhealthy. And its `health_hits` assertion is the positive, backend-side
+/// evidence that the probe really does speak the traffic transport -- the
+/// backend is TLS-only, so a request from the probe arriving at `/health`
+/// could not have been made over plaintext. It is the L7 mirror of
+/// `a_tcp_backend_we_can_verify_probes_healthy`'s handshake count.
 #[tokio::test]
 async fn a_backend_we_can_verify_probes_healthy() {
     let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
-    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let backend = spawn_tls_backend(&bcert, &bkey).await;
     let listen = free_addr().await;
     let admin = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
 
     let config = Config::parse(&backend_tls_config(
         listen,
-        backend,
+        backend.addr,
         &cert,
         &key,
         Some(&bcert),
@@ -1268,13 +1335,21 @@ async fn a_backend_we_can_verify_probes_healthy() {
         "a backend we can verify was probed unhealthy"
     );
 
+    // Asserted before any client request, so it can only be the probe's
+    // doing. Over TLS by construction: this backend answers nothing else.
+    assert!(
+        backend.health_hits() >= 1,
+        "the probe never reached the backend over TLS -- /ready said 200 for \
+         some other reason"
+    );
+
     let resp = trusting_client()
         .get(format!("https://localhost:{}/", listen.port()))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(backend.hits(), 1);
 }
 
 /// The L4 half of the same invariant. A completed TCP handshake says nothing

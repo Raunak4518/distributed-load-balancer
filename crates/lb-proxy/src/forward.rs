@@ -1,6 +1,6 @@
 use crate::resolver::PinnedResolver;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -31,6 +31,16 @@ pub type ProxyClient =
 /// actually need to tune; these two guard resource usage, not behavior.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much of a health-check response body we are willing to read.
+///
+/// Not a tuning knob and deliberately not configurable: a `/health`
+/// endpoint answers with a status line, and at most a short JSON summary.
+/// 64 KiB is absurdly generous for that -- it is sized to never reject a
+/// legitimate health response, not to be tight. Its job is to put *some*
+/// ceiling on what a broken or hostile backend can make the probe allocate,
+/// once per backend per interval, for as long as the process runs.
+const MAX_PROBE_BODY_BYTES: usize = 64 * 1024;
 
 /// Builds the forwarding client.
 ///
@@ -166,14 +176,32 @@ impl lb_core::ProbeClient for ProbeCapableClient {
         Box::pin(async move {
             let resp = forward(&self.0, req, timeout).await.ok()?;
             let status = resp.status().as_u16();
-            // Drained so the pooled connection can be reused instead of being
-            // closed after every probe -- otherwise a re-encrypting listener
-            // pays a full backend handshake on every health check. Bounded by
-            // the same timeout, since a backend that answers a status and
-            // then dribbles a body forever must not pin a task. The verdict
-            // is the status either way: it has already been received.
-            let _ = tokio::time::timeout(timeout, resp.into_body().collect()).await;
-            Some(status)
+            // The body is drained so the pooled connection can be reused
+            // instead of being closed after every probe -- otherwise a
+            // re-encrypting listener pays a full backend TLS handshake on
+            // every health check.
+            //
+            // Both bounds on that drain are load-bearing, and neither is
+            // redundant. The timeout stops a backend that answers a status
+            // and then dribbles bytes forever from pinning this task. The
+            // *size* cap stops one that answers and then pushes as fast as it
+            // can from making us allocate whatever fits in `timeout` -- per
+            // backend, per interval, forever. This project does not trust its
+            // backends: verifying their certificates is the entire reason
+            // this crate re-encrypts at all, and an unbounded read from one
+            // would reintroduce exactly the unbounded-resource-consumption
+            // class the request path already caps
+            // (`max_request_body_bytes`).
+            let limited = Limited::new(resp.into_body(), MAX_PROBE_BODY_BYTES);
+            match tokio::time::timeout(timeout, limited.collect()).await {
+                Ok(Ok(_)) => Some(status),
+                // Over the cap, or the body failed mid-read, or it never
+                // finished. Reported as unreachable rather than as the status
+                // we already hold: a `/health` endpoint that streams
+                // megabytes is not healthy under any useful definition, and
+                // the connection is not safe to pool either way.
+                _ => None,
+            }
         })
     }
 }
@@ -321,6 +349,28 @@ mod tests {
         lb_core::Backend::new("b1", addr, 1, name.map(str::to_string))
     }
 
+    /// A backend that answers 200 with a body of exactly `len` bytes, for
+    /// exercising the probe's body cap from both sides.
+    async fn spawn_sized_body_backend(len: usize) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(vec![b'x'; len]))))
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        addr
+    }
+
     /// The probe reports the status it got, over the same client and the same
     /// connector real traffic uses -- not over a client of its own.
     #[tokio::test]
@@ -385,6 +435,50 @@ mod tests {
             "a nameless backend was probed anyway -- in plaintext, since there \
              is no name to demand a certificate for"
         );
+    }
+
+    /// A backend is not trusted -- verifying its certificate is the whole
+    /// reason this crate re-encrypts -- so it must not be able to make the
+    /// probe allocate without bound. A `/health` that answers 200 and then
+    /// pushes far more than any health response could legitimately carry is
+    /// reported as unreachable, not as a 200.
+    #[tokio::test]
+    async fn the_probe_client_refuses_an_oversized_health_response() {
+        use lb_core::ProbeClient;
+
+        let addr = spawn_sized_body_backend(MAX_PROBE_BODY_BYTES + 1).await;
+        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let status = probe
+            .get(
+                &backend(None, addr),
+                "/health",
+                false,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(
+            status, None,
+            "an unbounded health-check body was buffered and reported as healthy"
+        );
+    }
+
+    /// The matched control: a body that fits is read and the status reported,
+    /// so the test above cannot pass by rejecting every body.
+    #[tokio::test]
+    async fn the_probe_client_accepts_a_health_response_within_the_cap() {
+        use lb_core::ProbeClient;
+
+        let addr = spawn_sized_body_backend(MAX_PROBE_BODY_BYTES).await;
+        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let status = probe
+            .get(
+                &backend(None, addr),
+                "/health",
+                false,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert_eq!(status, Some(200));
     }
 
     /// The decision itself. Both the forwarding path and the probe read the

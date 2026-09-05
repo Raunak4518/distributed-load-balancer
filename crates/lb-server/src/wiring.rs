@@ -481,8 +481,18 @@ enum ProbeTransport {
     Tcp(Option<Arc<dyn lb_core::OutboundTransport>>),
 }
 
-/// The listener's protocol picks the probe — an HTTP listener always wants an
-/// HTTP probe, so there is no config knob here to get wrong.
+/// Spawns one active checker per backend. `transport` picks the probe — an
+/// HTTP listener always wants an HTTP probe, so there is still no config knob
+/// here to get wrong.
+///
+/// Note what moved, though: this reads the *caller's* `ProbeTransport` rather
+/// than `lc.protocol`, so keeping the two in agreement is now the caller's
+/// obligation, not this function's. It is discharged in `build_app`, where
+/// the enum is constructed inside the `match lc.protocol` arm that also
+/// builds the data plane's copy — which is the point. Building it here from
+/// `lc.protocol` instead would mean building the client and the transport
+/// here too, and then they would be *this* function's, not the listener's,
+/// which is precisely the divergence the whole design exists to prevent.
 fn spawn_health_checkers(
     lc: &ListenerConfig,
     backends: &[Backend],
