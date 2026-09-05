@@ -23,7 +23,7 @@ rustls-native-certs = { version = "0.8", default-features = false }
 # hyper-rustls defaults to aws-lc-rs, which needs cmake and a C toolchain
 # unavailable here -- same reason rustls itself is pinned to ring above.
 # Every TLS crate in the graph must agree on one provider.
-hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "tls12", "native-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 x509-parser = "0.16"
 thiserror = "1"
