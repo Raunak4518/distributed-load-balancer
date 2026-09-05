@@ -31,15 +31,81 @@ max_connections_per_ip = 100     # stops one source consuming the whole budget
 header_read_timeout_ms = 5000    # slowloris: caps time to send the request head
 body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
 
+# ── TLS termination (optional) ──────────────────────────────────────────
+# Uncomment to terminate TLS on this listener. Certificates are read from
+# disk and polled for changes on reload_interval_secs, so a renewed
+# certificate takes effect without a restart — see the README's TLS section
+# for why restart-to-renew is an outage generator on a 90-day schedule.
+# [listeners.tls]
+#   # Caps the handshake itself. Nothing above this line covers that window:
+#   # hyper never sees a connection whose handshake hasn't finished, so
+#   # header_read_timeout_ms cannot apply to it — this is a genuinely new
+#   # control, not a rename of an existing one.
+#   handshake_timeout_ms = 5000
+#   # "1.2" or "1.3". Raise to "1.3" once every client you serve supports
+#   # it — shorter handshake, no legacy cipher suites to reason about.
+#   min_version = "1.2"
+#   # Poll interval for cert/key changes on disk. New material is loaded and
+#   # fully validated before it replaces what's currently serving; if it's
+#   # broken, the old certificate keeps serving — a reload that breaks TLS
+#   # is worse than a certificate that is a few hours stale.
+#   reload_interval_secs = 60
+#   # 0 = off, and that is the deliberate default. A browser that receives
+#   # this header caches the policy for the full max-age with no way for the
+#   # server to take it back early, so turning it on is close to
+#   # irreversible — do it only once you're sure every host under this name
+#   # will keep serving valid HTTPS. (As shipped in Phase 6 this setting is
+#   # parsed and validated — rejected outright on a tcp listener, which has
+#   # no response to put a header on — but no code path emits the header
+#   # yet; see the README's TLS section.)
+#   hsts_max_age_secs = 0
+#
+#     [[listeners.tls.certificates]]
+#     name      = "web-primary"   # appears in metrics — operator-chosen,
+#                                  # never client-controlled
+#     cert_file = "/etc/lb/tls/web.crt"
+#     key_file  = "/etc/lb/tls/web.key"
+#     # SNI match list: exact hostnames win over a single-level wildcard
+#     # (*.example.com matches a.example.com, not a.b.example.com or the
+#     # bare parent). A ClientHello whose SNI matches nothing here is
+#     # rejected rather than handed a default certificate — a mismatched
+#     # cert fails in the browser anyway, so a silent fallback would only
+#     # turn a clear failure into a confusing one.
+#     hostnames = ["example.com", "*.example.com"]
+
+# ── Backend re-encryption (optional) ────────────────────────────────────
+# Uncomment to speak TLS onward to the backends too, not just to the client.
+# Verification is ON by default: encryption without authentication does not
+# address the threat that motivates it — if the network isn't trusted to
+# carry plaintext, it isn't trusted not to sit in the middle of a TLS
+# session either.
+# [listeners.backend_tls]
+#   # Omit for the system trust store. Set this for an internal PKI, which
+#   # is the common case on this path.
+#   ca_file = "/etc/lb/tls/internal-ca.crt"
+#   # true turns verification off entirely — a deliberately ugly escape
+#   # hatch for a fleet that meets self-signed backend certs on day one. It
+#   # logs a warning at every startup and sets the
+#   # lb_backend_tls_verification_disabled gauge, specifically so it cannot
+#   # hide in a config file for two years.
+#   danger_accept_invalid_certs = false
+
   [[listeners.backends]]
   id = "web1"
   address = "127.0.0.1:9001"
   weight  = 1
+  # Required whenever [listeners.backend_tls] is set: the hostname on this
+  # backend's certificate, used only for SNI and hostname verification. The
+  # TCP dial is still pinned to `address` above — server_name is never
+  # DNS-resolved to pick the connection target, which is what keeps this
+  # setting from silently overriding the address you configured.
+  # server_name = "web1.internal"
 
   [[listeners.backends]]
   id = "web2"
   address = "127.0.0.1:9002"
   weight  = 1
+  # server_name = "web2.internal"
 
   [listeners.health_check]
   path = "/health"
