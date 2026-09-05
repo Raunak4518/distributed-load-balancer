@@ -134,10 +134,14 @@ green.
 **Three performance notes for picking a certificate and reasoning about
 scale — operator guidance, not enforced by any code here:**
 
-- An ECDSA P-256 certificate's server-side handshake is roughly 5–10x
-  cheaper in CPU than an RSA-2048 one. This project accepts whatever key
-  type a loaded certificate uses, so the choice is entirely yours to make at
-  issuance time — it is not a config setting here.
+- An ECDSA P-256 certificate's server-side handshake is widely reported as
+  several times cheaper in CPU than an RSA-2048 one. **We have not measured
+  that ratio for this codebase** — `lb-bench` measures P-256 only, because
+  generating an RSA key would require `rcgen`'s `aws_lc_rs` feature, and that
+  pulls in the C toolchain this project's `ring` pin exists to avoid. Treat
+  the ratio as industry guidance, not as a number this project verified. The
+  load balancer accepts whatever key type a loaded certificate uses, so the
+  choice is yours at issuance time — it is not a config setting here.
 - TLS session resumption (the session cache and TLS 1.3 tickets alike) is
   **per process**. A client that resumes a session against one cluster node
   and is then routed to another — by something in front of this load

@@ -16,6 +16,8 @@
 //! or confidence intervals) for numbers we can actually obtain. Treat the
 //! output as relative, for regression detection — not as absolute capacity.
 
+mod tls;
+
 use lb_balancer::RoundRobin;
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::{Backend, BackendPool, ClusterCoordinator, LoadBalancer, RateLimiter, SystemClock};
@@ -28,7 +30,7 @@ use std::time::{Duration, Instant};
 
 const ITERATIONS: u64 = 200_000;
 
-fn bench<F: FnMut()>(name: &str, iterations: u64, mut f: F) {
+pub fn bench<F: FnMut()>(name: &str, iterations: u64, mut f: F) {
     // Warm up so the first-touch costs (page faults, branch predictor,
     // lazily-allocated map buckets) are not attributed to the measurement.
     for _ in 0..(iterations / 10).max(1) {
@@ -156,6 +158,7 @@ fn main() {
     bench_gcra_check();
     bench_cluster_try_admit();
     bench_circuit_refresh();
+    tls::bench_tls_handshakes();
 
     println!("\n{}", "=".repeat(78));
     println!("Phase 7 should reduce ns/op on every line above.");

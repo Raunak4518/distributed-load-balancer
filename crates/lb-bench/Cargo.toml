@@ -9,6 +9,10 @@ lb-ratelimit = { path = "../lb-ratelimit" }
 lb-balancer = { path = "../lb-balancer" }
 lb-healthcheck = { path = "../lb-healthcheck" }
 lb-cluster = { path = "../lb-cluster" }
+# `ring`, matching every other TLS dependency in this workspace -- rustls
+# defaults to aws-lc-rs, which needs cmake and a C toolchain.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = "0.13"
 
 [[bin]]
 name = "lb-bench"

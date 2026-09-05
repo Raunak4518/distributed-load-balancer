@@ -684,6 +684,8 @@ dependencies = [
  "lb-core",
  "lb-healthcheck",
  "lb-ratelimit",
+ "rcgen",
+ "rustls",
 ]
 
 [[package]]
