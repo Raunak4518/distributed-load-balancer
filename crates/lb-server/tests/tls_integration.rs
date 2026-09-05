@@ -294,6 +294,163 @@ listen = "{listen}"
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// Same as `tls_http_config`, plus a configurable `hsts_max_age_secs`.
+fn tls_http_config_with_hsts(
+    listen: SocketAddr,
+    backend: SocketAddr,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    hsts_max_age_secs: u64,
+) -> String {
+    format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+
+  [listeners.tls]
+  handshake_timeout_ms = 5000
+  hsts_max_age_secs = {hsts_max_age_secs}
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "{cert}"
+    key_file = "{key}"
+    hostnames = ["localhost"]
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#,
+        cert = cert.display().to_string().replace('\\', "\\\\"),
+        key = key.display().to_string().replace('\\', "\\\\"),
+    )
+}
+
+/// The load-bearing positive case, end to end: a TLS listener with
+/// `hsts_max_age_secs` set adds `Strict-Transport-Security` to a real HTTPS
+/// response, with the configured value.
+#[tokio::test]
+async fn hsts_header_is_added_when_configured_on_a_tls_listener() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let config = Config::parse(&tls_http_config_with_hsts(
+        listen, backend, &cert, &key, 31_536_000,
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .expect("https request failed");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("strict-transport-security")
+            .expect("Strict-Transport-Security header missing"),
+        "max-age=31536000"
+    );
+}
+
+/// The default-path case, and the one that matters most: `hsts_max_age_secs`
+/// defaults to 0 (off), and a TLS listener that never sets it must emit no
+/// header at all -- not `max-age=0`, which is a materially different
+/// instruction to a browser (an active order to forget the policy), but
+/// nothing. A bug here would put an unrequested, hard-to-withdraw policy on
+/// every response by default.
+#[tokio::test]
+async fn hsts_header_is_absent_by_default_on_a_tls_listener() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    // `tls_http_config` never sets hsts_max_age_secs, so this exercises the
+    // config default of 0.
+    let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 100)).unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .expect("https request failed");
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("strict-transport-security").is_none(),
+        "HSTS header must not be sent when hsts_max_age_secs is left at its default of 0"
+    );
+}
+
+/// The other half of "only on TLS listeners": a plaintext HTTP listener --
+/// which has no `[listeners.tls]` for `hsts_max_age_secs` to even live
+/// under -- must never emit the header.
+#[tokio::test]
+async fn hsts_header_is_absent_on_a_plaintext_listener() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let config = Config::parse(&format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let resp = reqwest::get(format!("http://{listen}/")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("strict-transport-security").is_none());
+}
+
 /// Same as `tls_http_config`, plus an `[admin]` section (to scrape metrics)
 /// and a configurable `reload_interval_secs` (to make the poll fast enough
 /// for a test).

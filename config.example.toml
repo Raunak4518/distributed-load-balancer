@@ -50,14 +50,16 @@ body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
 #   # broken, the old certificate keeps serving — a reload that breaks TLS
 #   # is worse than a certificate that is a few hours stale.
 #   reload_interval_secs = 60
-#   # 0 = off, and that is the deliberate default. A browser that receives
-#   # this header caches the policy for the full max-age with no way for the
-#   # server to take it back early, so turning it on is close to
-#   # irreversible — do it only once you're sure every host under this name
-#   # will keep serving valid HTTPS. (As shipped in Phase 6 this setting is
-#   # parsed and validated — rejected outright on a tcp listener, which has
-#   # no response to put a header on — but no code path emits the header
-#   # yet; see the README's TLS section.)
+#   # Adds Strict-Transport-Security: max-age=<value> to every response on
+#   # this listener once set above 0. 0 = off, and that is the deliberate
+#   # default. A browser that receives this header caches the policy for the
+#   # full max-age with no way for the server to take it back early, so
+#   # turning it on is close to irreversible — do it only once you're sure
+#   # every host under this name will keep serving valid HTTPS. Off means no
+#   # header is sent at all, deliberately not max-age=0 — that value is an
+#   # active instruction to forget any previously cached policy, not merely
+#   # the absence of one. (Rejected outright on a tcp listener, which has no
+#   # response to put a header on.)
 #   hsts_max_age_secs = 0
 #
 #     [[listeners.tls.certificates]]

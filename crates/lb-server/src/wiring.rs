@@ -315,6 +315,18 @@ pub fn build_app(
                             config.logging.sample_rate,
                         ),
                         body_read_timeout: lc.body_read_timeout(),
+                        // Both gating conditions collapse into this one
+                        // `Option` here, at the one place that knows both
+                        // facts: whether this listener terminates TLS at all
+                        // (`lc.tls`) and whether HSTS was actually turned on
+                        // (`hsts_max_age_secs() > 0`, since 0 is the default
+                        // and must stay a no-op, not `max-age=0`). `handle`
+                        // downstream cannot see either fact for itself.
+                        hsts_max_age_secs: lc
+                            .tls
+                            .as_ref()
+                            .map(|t| t.hsts_max_age_secs())
+                            .filter(|&v| v > 0),
                     }),
                     limits: connection_limits,
                     metrics: Arc::clone(&listener_metrics),

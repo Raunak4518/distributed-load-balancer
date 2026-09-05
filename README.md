@@ -145,17 +145,18 @@ scale — operator guidance, not enforced by any code here:**
   handshake there. Session state is never shared across nodes; doing so
   safely is a harder, security-sensitive problem left for later.
 
-**One config setting is accepted but not yet wired up.** `hsts_max_age_secs`
-is parsed and validated today — it defaults to 0 (off), and is rejected
-outright on a TCP listener, which has no HTTP response to carry a header on.
-The 0 default is deliberate: a browser that receives an HSTS header caches
-the policy for the *entire* max-age with no way for the server to revoke it
-early, so turning this on is close to irreversible — a misissued or expiring
-certificate becomes completely unreachable rather than merely broken. As
-shipped in Phase 6, however, no code path yet emits a
-`Strict-Transport-Security` header from this setting — it is validated
-configuration with no observable effect. Treat it as reserved, not
-functional, until header emission lands.
+**HSTS is opt-in and off by default.** `hsts_max_age_secs` adds
+`Strict-Transport-Security: max-age=<value>` to every response from a
+TLS-terminating HTTP listener, once set above 0. It defaults to 0 (off), and
+is rejected outright on a TCP listener, which has no HTTP response to carry
+a header on. The 0 default is deliberate, not merely conservative: a browser
+that receives this header caches the policy for the *entire* max-age with no
+way for the server to revoke it early, so turning this on is close to
+irreversible — a misissued or expiring certificate becomes completely
+unreachable rather than merely broken. When it is off, no header is sent at
+all — deliberately not `max-age=0`, which is a materially different
+instruction to a browser (an active order to forget any previously-cached
+policy) rather than simply never having asserted one.
 
 New metrics: `lb_tls_handshakes_total{listener,outcome}` (`success` /
 `failed` / `timeout`), `lb_tls_handshake_duration_seconds{listener}`,

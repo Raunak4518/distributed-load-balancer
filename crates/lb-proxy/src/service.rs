@@ -47,6 +47,23 @@ pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     /// Caps how long a client may take to send the body. A size limit alone
     /// is not a bound: 1 MiB at one byte per second is eleven days.
     pub body_read_timeout: Duration,
+    /// `Some(seconds)` adds `Strict-Transport-Security: max-age=<seconds>` to
+    /// every response; `None` adds nothing.
+    ///
+    /// Both gating conditions -- "only on a listener that terminates TLS"
+    /// and "only when `hsts_max_age_secs` is above its default of 0" -- are
+    /// folded into this one `Option` at wiring time
+    /// (`lb_server::wiring::build_app`), not checked here. `handle` has no
+    /// way to learn whether the connection it is serving arrived over TLS or
+    /// plaintext: that fact was already consumed, and discarded, before this
+    /// context was ever built. Emitting the header whenever this is `Some`
+    /// is therefore correct by construction, not by a runtime check against
+    /// something this layer cannot see. Zero is deliberately never
+    /// represented as `Some(0)`: sending `max-age=0` is a materially
+    /// different instruction to a browser than sending nothing at all -- it
+    /// actively tells the browser to forget the policy, rather than simply
+    /// never having asserted one.
+    pub hsts_max_age_secs: Option<u64>,
 }
 
 /// Sampled per-request access logging.
@@ -217,6 +234,17 @@ where
 
         if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
             resp.headers_mut().insert("x-request-id", value);
+        }
+
+        // Unconditional on every response from a qualifying listener, not
+        // just successful proxied ones: HSTS is a property of the host, and
+        // a client that gets a 429 or a 503 needs the policy applied to it
+        // exactly as much as one that gets a 200.
+        if let Some(max_age) = ctx.hsts_max_age_secs {
+            if let Ok(value) = HeaderValue::from_str(&format!("max-age={max_age}")) {
+                resp.headers_mut()
+                    .insert(header::STRICT_TRANSPORT_SECURITY, value);
+            }
         }
 
         if ctx.access_log.should_log() {
@@ -520,6 +548,7 @@ mod tests {
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
             body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -542,6 +571,7 @@ mod tests {
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
             body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -573,6 +603,7 @@ mod tests {
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
             body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -605,6 +636,7 @@ mod tests {
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
             body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
@@ -645,6 +677,7 @@ mod tests {
             backend_metrics: HashMap::new(),
             access_log: AccessLog::disabled(),
             body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
         });
 
         // "dead" sorts first in pool order, so PreferFirstEligible tries it,
@@ -658,6 +691,92 @@ mod tests {
         // to "healthy" without ever touching the tripped backend.
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The load-bearing positive case for `hsts_max_age_secs`: when wiring
+    /// hands `handle` a `Some`, the header goes on the response with exactly
+    /// that value.
+    #[tokio::test]
+    async fn hsts_header_is_added_when_configured() {
+        let backend_addr = spawn_fixed_response_backend(StatusCode::OK, "hi").await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let mut breakers = HashMap::new();
+        breakers.insert(
+            backend.id.clone(),
+            CircuitBreaker::new(3, Duration::from_secs(5), FakeClock::new()),
+        );
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            circuit_breakers: breakers,
+            client: build_client(None, HashMap::new()),
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: Some(31_536_000),
+        });
+        let resp = run_through_proxy(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
+                .expect("Strict-Transport-Security header missing"),
+            "max-age=31536000"
+        );
+    }
+
+    /// The default-path case, and the one that matters most: `None` (which
+    /// is what wiring produces whenever `hsts_max_age_secs` is left at its
+    /// default of 0, or the listener has no `[listeners.tls]` at all) must
+    /// add nothing. A bug here would put an unrequested, hard-to-withdraw
+    /// policy on every response by default -- see the doc comment on
+    /// `ProxyContext::hsts_max_age_secs` for why `max-age=0` is not an
+    /// acceptable stand-in for "nothing" either.
+    #[tokio::test]
+    async fn hsts_header_is_absent_when_not_configured() {
+        let backend_addr = spawn_fixed_response_backend(StatusCode::OK, "hi").await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let mut breakers = HashMap::new();
+        breakers.insert(
+            backend.id.clone(),
+            CircuitBreaker::new(3, Duration::from_secs(5), FakeClock::new()),
+        );
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            circuit_breakers: breakers,
+            client: build_client(None, HashMap::new()),
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        let resp = run_through_proxy(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
+                .is_none(),
+            "HSTS header must not be sent when hsts_max_age_secs is not configured"
+        );
     }
 
     /// Turns a request into the outbound one the forwarding client would
