@@ -240,8 +240,6 @@ pub fn build_app(
             Duration::from_secs(60),
         ));
 
-        spawn_health_checkers(lc, &backends, &pool, &mut background_tasks, &metrics);
-
         // Certificates expire on a fixed schedule (90 days under ACME), so a
         // TLS listener without a reload loop is an outage generator on a
         // timer. Pushed onto the same list the health checkers use, so it is
@@ -271,60 +269,99 @@ pub fn build_app(
                 _ => None,
             };
 
-        listeners.push(match lc.protocol {
-            Protocol::Http => ListenerRuntime::Http {
-                name: lc.name.clone(),
-                listen: lc.listen,
-                ctx: Arc::new(ProxyContext {
-                    rate_limiter,
-                    balancer: Arc::new(RoundRobin::new()),
-                    pool,
-                    circuit_breakers,
-                    client: lb_proxy::build_client(backend_tls.as_deref(), server_name_addresses),
-                    backend_tls: backend_tls.is_some(),
-                    rate_limit_key: lc.rate_limit.key.clone(),
-                    forward_timeout: lc.forward_timeout(),
-                    max_request_body_bytes: lc.max_request_body_bytes(),
-                    cluster: cluster_coordinator,
-                    metrics: Arc::clone(&listener_metrics),
-                    backend_metrics,
-                    access_log: lb_proxy::AccessLog::new(
-                        config.logging.log_requests,
-                        config.logging.sample_rate,
-                    ),
-                    body_read_timeout: lc.body_read_timeout(),
-                }),
-                limits: connection_limits,
-                metrics: Arc::clone(&listener_metrics),
-                header_read_timeout: lc.header_read_timeout(),
-                tls,
-            },
-            Protocol::Tcp => ListenerRuntime::Tcp {
-                name: lc.name.clone(),
-                listen: lc.listen,
-                ctx: Arc::new(TcpContext {
-                    rate_limiter,
-                    balancer: Arc::new(RoundRobin::new()),
-                    pool,
-                    circuit_breakers,
-                    connect_timeout: lc.connect_timeout(),
-                    idle_timeout: lc.idle_timeout(),
-                    // The one place the L4 data plane's re-encryption is
-                    // chosen. `lb-tcp` sees a trait object and never learns
-                    // which TLS implementation is behind it.
-                    backend_tls: backend_tls.map(|c| {
-                        Arc::new(lb_tls::BackendTlsTransport::new(&c))
-                            as Arc<dyn lb_core::OutboundTransport>
+        let runtime = match lc.protocol {
+            Protocol::Http => {
+                // Built exactly once per HTTP listener, and handed to both
+                // consumers below. **This sharing is the whole mechanism**
+                // behind "a probe validates what traffic validates": the
+                // probe does not use a client like the data plane's, it uses
+                // this one -- same connection pool, same trust roots, same
+                // verification policy, same pinned resolver. A `Client` is an
+                // `Arc`-backed handle, so a clone is the same client, not a
+                // copy of one. Two `build_client` calls here would put two
+                // TLS stacks in one listener and let them disagree.
+                let client = lb_proxy::build_client(backend_tls.as_deref(), server_name_addresses);
+                let probe_client: Arc<dyn lb_core::ProbeClient> =
+                    Arc::new(lb_proxy::ProbeCapableClient(client.clone()));
+                spawn_health_checkers(
+                    lc,
+                    &backends,
+                    &pool,
+                    &mut background_tasks,
+                    &metrics,
+                    ProbeTransport::Http {
+                        client: probe_client,
+                        backend_tls: backend_tls.is_some(),
+                    },
+                );
+                ListenerRuntime::Http {
+                    name: lc.name.clone(),
+                    listen: lc.listen,
+                    ctx: Arc::new(ProxyContext {
+                        rate_limiter,
+                        balancer: Arc::new(RoundRobin::new()),
+                        pool,
+                        circuit_breakers,
+                        client,
+                        backend_tls: backend_tls.is_some(),
+                        rate_limit_key: lc.rate_limit.key.clone(),
+                        forward_timeout: lc.forward_timeout(),
+                        max_request_body_bytes: lc.max_request_body_bytes(),
+                        cluster: cluster_coordinator,
+                        metrics: Arc::clone(&listener_metrics),
+                        backend_metrics,
+                        access_log: lb_proxy::AccessLog::new(
+                            config.logging.log_requests,
+                            config.logging.sample_rate,
+                        ),
+                        body_read_timeout: lc.body_read_timeout(),
                     }),
-                    cluster: cluster_coordinator,
+                    limits: connection_limits,
                     metrics: Arc::clone(&listener_metrics),
-                    backend_metrics,
-                }),
-                limits: connection_limits,
-                metrics: Arc::clone(&listener_metrics),
-                tls,
-            },
-        });
+                    header_read_timeout: lc.header_read_timeout(),
+                    tls,
+                }
+            }
+            Protocol::Tcp => {
+                // The one place the L4 data plane's re-encryption is chosen.
+                // `lb-tcp` sees a trait object and never learns which TLS
+                // implementation is behind it -- and, for the same reason as
+                // the HTTP client above, the probe is handed this same `Arc`
+                // rather than a second transport built from the same config.
+                let outbound: Option<Arc<dyn lb_core::OutboundTransport>> = backend_tls.map(|c| {
+                    Arc::new(lb_tls::BackendTlsTransport::new(&c))
+                        as Arc<dyn lb_core::OutboundTransport>
+                });
+                spawn_health_checkers(
+                    lc,
+                    &backends,
+                    &pool,
+                    &mut background_tasks,
+                    &metrics,
+                    ProbeTransport::Tcp(outbound.clone()),
+                );
+                ListenerRuntime::Tcp {
+                    name: lc.name.clone(),
+                    listen: lc.listen,
+                    ctx: Arc::new(TcpContext {
+                        rate_limiter,
+                        balancer: Arc::new(RoundRobin::new()),
+                        pool,
+                        circuit_breakers,
+                        connect_timeout: lc.connect_timeout(),
+                        idle_timeout: lc.idle_timeout(),
+                        backend_tls: outbound,
+                        cluster: cluster_coordinator,
+                        metrics: Arc::clone(&listener_metrics),
+                        backend_metrics,
+                    }),
+                    limits: connection_limits,
+                    metrics: Arc::clone(&listener_metrics),
+                    tls,
+                }
+            }
+        };
+        listeners.push(runtime);
     }
 
     let cluster = match (cluster_node, config.cluster.as_ref()) {
@@ -424,6 +461,26 @@ fn build_backend_connector(
     Ok(Some(Arc::new(connector)))
 }
 
+/// The outbound machinery a listener's probes must use: the *same* values its
+/// data plane forwards through, not equivalents built from the same config.
+///
+/// An enum rather than two optional parameters because the two are mutually
+/// exclusive by protocol, and because it is built at the one site that also
+/// builds the data plane's copy -- which makes the sharing visible in the
+/// wiring instead of being a convention someone has to remember.
+enum ProbeTransport {
+    Http {
+        client: Arc<dyn lb_core::ProbeClient>,
+        /// Whether this listener re-encrypts, exactly as `ProxyContext`
+        /// carries it. The client owns the scheme/authority decision; this
+        /// only tells it which kind of listener it is probing for.
+        backend_tls: bool,
+    },
+    /// `None` inside means a plaintext outbound leg -- the same shape
+    /// `TcpContext.backend_tls` holds.
+    Tcp(Option<Arc<dyn lb_core::OutboundTransport>>),
+}
+
 /// The listener's protocol picks the probe — an HTTP listener always wants an
 /// HTTP probe, so there is no config knob here to get wrong.
 fn spawn_health_checkers(
@@ -432,6 +489,7 @@ fn spawn_health_checkers(
     pool: &Arc<BackendPool>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     metrics: &Metrics,
+    transport: ProbeTransport,
 ) {
     let interval = Duration::from_millis(lc.health_check.interval_ms);
     let timeout = Duration::from_millis(lc.health_check.timeout_ms);
@@ -441,8 +499,11 @@ fn spawn_health_checkers(
             interval,
             healthy_gauge: Some(metrics.backend(&lc.name, &b.id.0).healthy),
         };
-        match lc.protocol {
-            Protocol::Http => {
+        match &transport {
+            ProbeTransport::Http {
+                client,
+                backend_tls,
+            } => {
                 let path =
                     lc.health_check.path.clone().expect(
                         "config validation guarantees http listeners have a health_check.path",
@@ -451,15 +512,18 @@ fn spawn_health_checkers(
                     b.clone(),
                     pool.clone(),
                     config,
-                    HttpProbe::new(path, timeout),
+                    // `Arc::clone`, not a second client: every backend of this
+                    // listener probes through the one the listener forwards
+                    // with.
+                    HttpProbe::new(Arc::clone(client), path, timeout, *backend_tls),
                 ));
             }
-            Protocol::Tcp => {
+            ProbeTransport::Tcp(outbound) => {
                 tasks.push(spawn_active_checker(
                     b.clone(),
                     pool.clone(),
                     config,
-                    TcpConnectProbe::new(timeout),
+                    TcpConnectProbe::new(timeout, outbound.clone()),
                 ));
             }
         }

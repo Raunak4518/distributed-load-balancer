@@ -566,19 +566,19 @@ async fn a_tls_tcp_listener_proxies_bytes_to_a_plaintext_backend() {
 // Re-encrypting to backends
 // ---------------------------------------------------------------------------
 
-/// A backend that speaks TLS to real traffic and plaintext to the health
-/// probe, counting every non-health request *that arrived over TLS*.
+/// A TLS-only HTTPS backend, and a count of the non-health requests that
+/// reached it.
 ///
-/// Counting only the TLS ones is deliberate: it is what makes the
-/// trusted-backend test below fail if forwarding ever regresses to
-/// plaintext, which would otherwise still answer 200 and look like a pass.
+/// TLS-only on purpose: it answers nothing over plaintext, so anything in the
+/// load balancer that still spoke `http://` to it -- the health probe very
+/// much included -- would be refused, the backend would drop out of rotation
+/// within one probe interval, and every test below would fail. That is the
+/// guard that keeps "the probe uses the traffic transport" load-bearing here
+/// rather than merely intended. (Until Task 9 this fixture had to answer
+/// plaintext as well, because the probe did.)
 ///
-/// The dual behaviour is a workaround with a shelf life: until Task 9 the
-/// active HTTP probe still speaks plaintext, so a TLS-only backend would be
-/// marked unhealthy within milliseconds of startup and every test below
-/// would get a 503 for a reason that has nothing to do with what it is
-/// testing. Sniffing the first byte (0x16 is a TLS handshake record) keeps
-/// the backend eligible so these tests measure the forwarding path.
+/// `/health` is excluded from the count so probe traffic does not show up in
+/// assertions about what a client's request did.
 async fn spawn_tls_backend(
     cert: &std::path::Path,
     key: &std::path::Path,
@@ -612,12 +612,13 @@ async fn spawn_tls_backend(
             let acceptor = std::sync::Arc::clone(&acceptor);
             let hits = std::sync::Arc::clone(&hits);
             tokio::spawn(async move {
-                let mut first = [0u8; 1];
-                let is_tls = matches!(stream.peek(&mut first).await, Ok(1) if first[0] == 0x16);
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
                 let svc = hyper::service::service_fn(move |req: hyper::Request<_>| {
                     let hits = std::sync::Arc::clone(&hits);
                     async move {
-                        if is_tls && req.uri().path() != "/health" {
+                        if req.uri().path() != "/health" {
                             hits.fetch_add(1, Ordering::SeqCst);
                         }
                         Ok::<_, std::convert::Infallible>(hyper::Response::new(
@@ -625,18 +626,9 @@ async fn spawn_tls_backend(
                         ))
                     }
                 });
-                if is_tls {
-                    let Ok(tls) = acceptor.accept(stream).await else {
-                        return;
-                    };
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
-                        .await;
-                } else {
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
-                        .await;
-                }
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                    .await;
             });
         }
     });
@@ -759,16 +751,24 @@ async fn an_untrusted_backend_certificate_is_refused() {
     tokio::spawn(lb_server::run(config));
     support::wait_until_listening(listen).await;
 
-    let resp = trusting_client()
+    let status = trusting_client()
         .get(format!("https://localhost:{}/", listen.port()))
         .send()
         .await
-        .unwrap();
+        .unwrap()
+        .status()
+        .as_u16();
 
-    assert_eq!(
-        resp.status(),
-        502,
-        "an untrusted backend was proxied to anyway"
+    // Two ways to be refused, and which one arrives is a race with the health
+    // checker: 502 if the forward itself failed verification, 503 if the probe
+    // -- which since Task 9 uses this same client and so fails the same way --
+    // had already taken the backend out of rotation. Both are the backend
+    // being refused; a 200 is the only thing that would mean the load balancer
+    // talked to a backend it could not verify. The `hits` assertion below is
+    // what makes that airtight either way.
+    assert!(
+        status == 502 || status == 503,
+        "an untrusted backend answered {status}"
     );
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
@@ -972,9 +972,15 @@ fn reencrypting_tcp_config(
     listen: SocketAddr,
     backend: SocketAddr,
     ca_file: &std::path::Path,
+    admin: Option<SocketAddr>,
 ) -> String {
+    let admin_section = match admin {
+        Some(a) => format!("[admin]\nlisten = \"{a}\"\n"),
+        None => String::new(),
+    };
     format!(
         r#"
+{admin_section}
 [[listeners]]
 name = "tcp-front"
 protocol = "tcp"
@@ -1079,7 +1085,7 @@ async fn a_tcp_listener_re_encrypts_to_a_tls_backend() {
     let (backend, handshakes) = spawn_tls_echo_backend(&bcert, &bkey).await;
     let listen = free_addr().await;
 
-    let config = Config::parse(&reencrypting_tcp_config(listen, backend, &bcert)).unwrap();
+    let config = Config::parse(&reencrypting_tcp_config(listen, backend, &bcert, None)).unwrap();
     tokio::spawn(lb_server::run(config));
     support::wait_until_listening(listen).await;
 
@@ -1109,7 +1115,7 @@ async fn a_tcp_listener_refuses_an_untrusted_backend() {
     // non-empty trust store that simply does not vouch for this backend.
     let (_odir, other, _okey) = cert_files(&["someone.else"]);
 
-    let config = Config::parse(&reencrypting_tcp_config(listen, backend, &other)).unwrap();
+    let config = Config::parse(&reencrypting_tcp_config(listen, backend, &other, None)).unwrap();
     tokio::spawn(lb_server::run(config));
     support::wait_until_listening(listen).await;
 
@@ -1128,4 +1134,244 @@ async fn a_tcp_listener_refuses_an_untrusted_backend() {
         bytes.is_empty(),
         "bytes were proxied to an unverifiable backend: {bytes:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Probe/traffic transport agreement (spec section 5)
+//
+// The invariant these four tests exist for: **a probe validates what traffic
+// validates.** If the health checker and the data plane disagree about
+// whether a backend is reachable, the load balancer keeps routing to a
+// backend it cannot talk to while the dashboard shows green -- every request
+// fails, and nothing says why.
+//
+// Before Task 9 the probes had their own transport: at L7 `HttpProbe`
+// hardcoded `http://` and used its own `reqwest` client (its own TLS stack,
+// its own trust roots, its own verification policy); at L4
+// `TcpConnectProbe` completed the TCP handshake and dropped the stream, which
+// says nothing at all about whether the backend's TLS works. Both would call
+// an unverifiable backend healthy. Each failing test below is paired with a
+// control on a *trusted* backend, so neither can pass by simply reporting
+// everything unhealthy.
+// ---------------------------------------------------------------------------
+
+/// Long enough for several 500ms probe intervals to have run and published
+/// their result into the pool the readiness check reads.
+const PROBE_SETTLE: Duration = Duration::from_millis(2_500);
+
+async fn ready_status(admin: SocketAddr) -> u16 {
+    reqwest::get(format!("http://{admin}/ready"))
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// **The most important test in this phase.** A backend whose certificate we
+/// cannot verify must fail forwarding *and* probe unhealthy.
+///
+/// If these two ever disagree, the load balancer keeps a backend in rotation
+/// that it cannot actually talk to. Before Task 9 the probe spoke plaintext
+/// `http://` over its own `reqwest` client, so it got a cheerful 200 from a
+/// backend every real (TLS) request was refused against: `/ready` said 200
+/// while every request failed.
+#[tokio::test]
+async fn a_backend_we_cannot_verify_also_probes_unhealthy() {
+    let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
+    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let admin = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+
+    // No ca_file, danger off: the backend's self-signed certificate is in no
+    // trust store this listener has.
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        /* ca_file */ None,
+        /* danger */ false,
+        Some(admin),
+        "localhost",
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+    support::wait_until_listening(admin).await;
+
+    tokio::time::sleep(PROBE_SETTLE).await;
+
+    assert_eq!(
+        ready_status(admin).await,
+        503,
+        "the probe called an unverifiable backend healthy -- probe and traffic \
+         are using different trust configuration"
+    );
+
+    // The other half of the same invariant: traffic is refused too. 502 (the
+    // forward itself failed verification) and 503 (the probe already took the
+    // backend out of rotation, so there was nothing to forward to) both mean
+    // refused; which one arrives depends only on whether a probe has landed
+    // yet, and after PROBE_SETTLE it is 503. What must never happen is a 200,
+    // or the request reaching the backend.
+    let status = trusting_client()
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    assert!(
+        status == 502 || status == 503,
+        "an unverifiable backend answered {status}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the request reached a backend whose certificate we could not verify"
+    );
+}
+
+/// The control for the test above: the *same* backend, with its certificate
+/// as the trust root, must probe healthy and serve traffic. Without this,
+/// the test above would pass just as well if probing were broken outright
+/// and every backend were reported unhealthy.
+#[tokio::test]
+async fn a_backend_we_can_verify_probes_healthy() {
+    let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
+    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let admin = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        Some(&bcert),
+        false,
+        Some(admin),
+        "localhost",
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+    support::wait_until_listening(admin).await;
+
+    tokio::time::sleep(PROBE_SETTLE).await;
+
+    assert_eq!(
+        ready_status(admin).await,
+        200,
+        "a backend we can verify was probed unhealthy"
+    );
+
+    let resp = trusting_client()
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// The L4 half of the same invariant. A completed TCP handshake says nothing
+/// about whether the backend's TLS works -- an expired or untrusted
+/// certificate accepts the connection just the same -- so before Task 9 this
+/// backend probed healthy while every byte sent to it was refused.
+#[tokio::test]
+async fn a_tcp_backend_we_cannot_verify_also_probes_unhealthy() {
+    let (_bdir, bcert, bkey) = cert_files(&["backend.internal"]);
+    let (backend, _handshakes) = spawn_tls_echo_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let admin = free_addr().await;
+    // A real, non-empty trust store that simply does not vouch for this
+    // backend.
+    let (_odir, other, _okey) = cert_files(&["someone.else"]);
+
+    let config = Config::parse(&reencrypting_tcp_config(
+        listen,
+        backend,
+        &other,
+        Some(admin),
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    // Deliberately *not* waiting on the traffic listener: connecting to it is
+    // a client connection, and at L4 that would drive the data plane's own
+    // outbound attempt and trip the circuit breaker -- which would take the
+    // backend out of rotation for a reason that has nothing to do with the
+    // health probe this test is about. The admin listener binds after every
+    // traffic listener, so waiting on it alone is enough to know the server
+    // is up.
+    support::wait_until_listening(admin).await;
+
+    tokio::time::sleep(PROBE_SETTLE).await;
+
+    assert_eq!(
+        ready_status(admin).await,
+        503,
+        "the TCP probe called an unverifiable backend healthy -- a completed \
+         TCP handshake is not the transport real traffic uses"
+    );
+
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(10),
+        support::tcp_roundtrip(listen, b"ping"),
+    )
+    .await
+    .expect("the connection was held open instead of being closed")
+    .unwrap_or_default();
+    assert!(
+        echoed.is_empty(),
+        "bytes were proxied to an unverifiable backend: {echoed:?}"
+    );
+}
+
+/// The L4 control: the same backend, trusted, probes healthy and echoes.
+#[tokio::test]
+async fn a_tcp_backend_we_can_verify_probes_healthy() {
+    let (_bdir, bcert, bkey) = cert_files(&["backend.internal"]);
+    let (backend, handshakes) = spawn_tls_echo_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let admin = free_addr().await;
+
+    let config = Config::parse(&reencrypting_tcp_config(
+        listen,
+        backend,
+        &bcert,
+        Some(admin),
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    // Not waiting on the traffic listener, for the same reason as the test
+    // above: a client connection would complete a handshake of its own, and
+    // the handshake count below has to be the *probe*'s work alone.
+    support::wait_until_listening(admin).await;
+
+    tokio::time::sleep(PROBE_SETTLE).await;
+
+    assert_eq!(
+        ready_status(admin).await,
+        200,
+        "a TCP backend we can verify was probed unhealthy"
+    );
+    // The probe itself must have completed real handshakes against the
+    // backend -- if it were still only opening a socket, none of these would
+    // have been counted before any client connected.
+    assert!(
+        handshakes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the probe never completed a TLS handshake with the backend"
+    );
+
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(10),
+        support::tcp_roundtrip(listen, b"ping over re-encrypted tcp"),
+    )
+    .await
+    .expect("no echo came back within 10s")
+    .expect("the round trip failed");
+    assert_eq!(echoed, b"ping over re-encrypted tcp");
 }

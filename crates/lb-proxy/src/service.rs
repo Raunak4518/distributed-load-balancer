@@ -1,4 +1,4 @@
-use crate::forward::{forward, ForwardError, ProxyClient};
+use crate::forward::{backend_scheme_and_authority, forward, ForwardError, ProxyClient};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
@@ -158,20 +158,11 @@ fn build_outbound_request(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let (scheme, authority) = match (backend_tls, backend.server_name.as_deref()) {
-        // The authority is the name on the certificate, not the address we
-        // dial. That is what makes SNI and hostname verification check the
-        // certificate's own name rather than an IP literal no certificate is
-        // ever issued for.
-        (true, Some(name)) => ("https", format!("{name}:{}", backend.address.port())),
-        // Config validation requires a `server_name` on every backend of a
-        // listener that sets `backend_tls`, so this is unreachable through
-        // the config. It is spelled out rather than folded into the plaintext
-        // arm because falling back to `http` would silently defeat the
-        // encryption that was asked for.
-        (true, None) => return None,
-        (false, _) => ("http", backend.address.to_string()),
-    };
+    // Shared with the health probe's own request building, deliberately: see
+    // `backend_scheme_and_authority`. If the two ever decided this
+    // separately, a probe could report a backend healthy over one transport
+    // while traffic failed against it over another.
+    let (scheme, authority) = backend_scheme_and_authority(backend, backend_tls)?;
     let uri = hyper::Uri::builder()
         .scheme(scheme)
         .authority(authority)

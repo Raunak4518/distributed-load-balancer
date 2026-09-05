@@ -7,9 +7,14 @@ edition.workspace = true
 lb-core = { path = "../lb-core" }
 lb-metrics = { path = "../lb-metrics" }
 tokio = { version = "1", features = ["rt", "time", "macros", "net"] }
-reqwest = "0.12"
+
+# No HTTP client and no TLS crate, deliberately. The probes are built on the
+# `lb_core::ProbeClient` and `lb_core::OutboundTransport` seams and are handed
+# the *same* client and transport the data plane forwards through. A client of
+# our own here would mean a second TLS stack with its own trust roots, and a
+# backend whose certificate could not be verified would probe healthy while
+# every real request to it failed.
 
 [dev-dependencies]
 lb-core = { path = "../lb-core", features = ["test-util"] }
-wiremock = "0.6"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros", "net"] }

@@ -25,4 +25,4 @@ pub use error::ConfigError;
 pub use health::HealthProbe;
 pub use pool::BackendPool;
 pub use ratelimit::{Decision, RateLimiter};
-pub use transport::{OutboundTransport, ProxyStream, WrapFuture};
+pub use transport::{OutboundTransport, ProbeClient, ProbeFuture, ProxyStream, WrapFuture};

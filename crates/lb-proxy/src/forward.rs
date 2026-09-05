@@ -1,6 +1,6 @@
 use crate::resolver::PinnedResolver;
 use bytes::Bytes;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -87,6 +87,95 @@ pub fn build_client(
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .build(connector)
+}
+
+/// The scheme and authority a request to `backend` must be addressed with.
+///
+/// **The single decision site.** `service::build_outbound_request` (real
+/// traffic) and `ProbeCapableClient::get` (health probes) both call this, so
+/// a probe cannot end up addressing a backend differently from the traffic it
+/// is supposed to be predicting the fate of. Writing the decision out twice
+/// and keeping the two in sync by hand is exactly how a probe ends up
+/// reporting a backend healthy that every real request fails against.
+///
+/// `None` means this backend cannot be addressed at all: the listener
+/// re-encrypts but the backend has no `server_name`. Config validation makes
+/// that unreachable, and it is spelled out rather than folded into the
+/// plaintext arm because falling back to `http` would silently defeat the
+/// encryption that was asked for.
+pub(crate) fn backend_scheme_and_authority(
+    backend: &lb_core::Backend,
+    backend_tls: bool,
+) -> Option<(&'static str, String)> {
+    match (backend_tls, backend.server_name.as_deref()) {
+        // The authority is the name on the certificate, not the address we
+        // dial. That is what makes SNI and hostname verification check the
+        // certificate's own name rather than an IP literal no certificate is
+        // ever issued for. The dial itself is pinned back to `address` by
+        // `PinnedResolver`.
+        (true, Some(name)) => Some(("https", format!("{name}:{}", backend.address.port()))),
+        (true, None) => None,
+        (false, _) => Some(("http", backend.address.to_string())),
+    }
+}
+
+/// A [`ProxyClient`] that can also serve as an [`lb_core::ProbeClient`].
+///
+/// The wrapper exists only because Rust's orphan rule forbids implementing a
+/// foreign trait (`ProbeClient`, from `lb-core`) for a foreign type
+/// (`ProxyClient`, a `hyper_util` type alias) directly. It changes nothing
+/// about the client itself: `Client` is a cheap handle whose connection pool
+/// and connector live behind an `Arc`, so a clone of one *is* the same
+/// client -- same pool, same trust roots, same verification policy, same
+/// pinned resolver -- not a similar one.
+///
+/// That is the whole point. A probe built on a separately-constructed client
+/// would carry its own TLS stack and its own trust configuration, and could
+/// report a backend healthy that every real request fails against.
+pub struct ProbeCapableClient(pub ProxyClient);
+
+impl lb_core::ProbeClient for ProbeCapableClient {
+    fn get(
+        &self,
+        backend: &lb_core::Backend,
+        path: &str,
+        backend_tls: bool,
+        timeout: Duration,
+    ) -> lb_core::ProbeFuture<'_> {
+        // Everything borrowed from the caller is consumed here, before the
+        // future is built, so the returned future borrows only `self`.
+        let Some((scheme, authority)) = backend_scheme_and_authority(backend, backend_tls) else {
+            return Box::pin(std::future::ready(None));
+        };
+        // Fallible rather than `expect`: `health_check.path` is free text
+        // from a config file and, unlike the forwarding path, has not been
+        // through a URI parser already. An unusable path makes the backend
+        // unprobeable, which is a health verdict, not a reason to kill the
+        // checker task.
+        let Ok(uri) = hyper::Uri::builder()
+            .scheme(scheme)
+            .authority(authority)
+            .path_and_query(path)
+            .build()
+        else {
+            return Box::pin(std::future::ready(None));
+        };
+        let Ok(req) = Request::builder().uri(uri).body(Full::new(Bytes::new())) else {
+            return Box::pin(std::future::ready(None));
+        };
+        Box::pin(async move {
+            let resp = forward(&self.0, req, timeout).await.ok()?;
+            let status = resp.status().as_u16();
+            // Drained so the pooled connection can be reused instead of being
+            // closed after every probe -- otherwise a re-encrypting listener
+            // pays a full backend handshake on every health check. Bounded by
+            // the same timeout, since a backend that answers a status and
+            // then dribbles a body forever must not pin a task. The verdict
+            // is the status either way: it has already been received.
+            let _ = tokio::time::timeout(timeout, resp.into_body().collect()).await;
+            Some(status)
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -226,5 +315,99 @@ mod tests {
         .expect("resolution hung instead of using the pinned table")
         .expect("the pinned address should have been dialed directly");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn backend(name: Option<&str>, addr: SocketAddr) -> lb_core::Backend {
+        lb_core::Backend::new("b1", addr, 1, name.map(str::to_string))
+    }
+
+    /// The probe reports the status it got, over the same client and the same
+    /// connector real traffic uses -- not over a client of its own.
+    #[tokio::test]
+    async fn the_probe_client_reports_the_backend_status() {
+        use lb_core::ProbeClient;
+
+        let addr = spawn_fixed_response_backend(StatusCode::NO_CONTENT).await;
+        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let status = probe
+            .get(
+                &backend(None, addr),
+                "/health",
+                false,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(status, Some(204));
+    }
+
+    /// A backend that cannot be reached at all is `None`, not a status. This
+    /// is the arm a refused backend certificate arrives through, and the
+    /// probe's whole verdict rests on it not being mistaken for "no answer,
+    /// assume fine".
+    #[tokio::test]
+    async fn the_probe_client_reports_none_when_the_backend_cannot_be_reached() {
+        use lb_core::ProbeClient;
+
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let status = probe
+            .get(
+                &backend(None, dead),
+                "/health",
+                false,
+                Duration::from_millis(500),
+            )
+            .await;
+        assert_eq!(status, None);
+    }
+
+    /// A re-encrypting listener with a nameless backend has nothing to verify
+    /// against, so the probe reports it unreachable rather than quietly
+    /// probing it in plaintext -- exactly what `build_outbound_request` does
+    /// with the same backend, because both go through
+    /// `backend_scheme_and_authority`.
+    #[tokio::test]
+    async fn the_probe_client_refuses_a_nameless_backend_on_a_re_encrypting_listener() {
+        use lb_core::ProbeClient;
+
+        let addr = spawn_fixed_response_backend(StatusCode::OK).await;
+        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let status = probe
+            .get(
+                &backend(None, addr),
+                "/health",
+                true,
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(
+            status, None,
+            "a nameless backend was probed anyway -- in plaintext, since there \
+             is no name to demand a certificate for"
+        );
+    }
+
+    /// The decision itself. Both the forwarding path and the probe read the
+    /// scheme and authority from here, so this is the one place either could
+    /// be wrong -- and if someone re-inlines the match in `service.rs`, the
+    /// URI test over there and this one can start to disagree, which is the
+    /// drift the shared helper exists to make impossible.
+    #[test]
+    fn a_re_encrypting_backend_is_addressed_by_its_certificate_name() {
+        let b = backend(Some("web1.internal"), "10.0.0.5:8443".parse().unwrap());
+        assert_eq!(
+            backend_scheme_and_authority(&b, true),
+            Some(("https", "web1.internal:8443".to_string()))
+        );
+        // The same backend on a plaintext listener: the address, not the
+        // name, and no silent upgrade of the scheme.
+        assert_eq!(
+            backend_scheme_and_authority(&b, false),
+            Some(("http", "10.0.0.5:8443".to_string()))
+        );
+        assert_eq!(
+            backend_scheme_and_authority(&backend(None, "10.0.0.5:8443".parse().unwrap()), true),
+            None
+        );
     }
 }
