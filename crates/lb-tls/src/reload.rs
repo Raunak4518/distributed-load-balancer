@@ -132,13 +132,23 @@ mod tests {
     use super::*;
     use crate::test_support as support;
 
+    // The clock alone is not unique: Windows' system time has ~15.6 ms
+    // granularity, so concurrent tests routinely read the same nanosecond
+    // value, land in the same directory, and overwrite each other's cert/key
+    // files. That is not just litter here: some of these tests hold their
+    // files across a 1+ second sleep while asserting on reload behavior, so
+    // a collision fails an assertion that has nothing to do with what the
+    // test checks. The counter makes collision impossible within this
+    // binary, which is where every concurrent caller lives.
     fn tmpdir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
-            "lbreload-{}",
+            "lbreload-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();
         d

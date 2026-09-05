@@ -108,8 +108,18 @@ mod tests {
     use super::*;
     use crate::test_support as support;
 
+    // The clock alone is not unique: Windows' system time has ~15.6 ms
+    // granularity, so concurrent tests routinely read the same nanosecond
+    // value, land in the same directory, and overwrite each other's cert/key
+    // files. The counter makes collision impossible within this binary,
+    // which is where every concurrent caller lives.
     fn store(specs: &[(&str, &[&str])]) -> CertStore {
-        let dir = std::env::temp_dir().join(format!("lbsni-{}", nanos()));
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "lbsni-{}-{}",
+            nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let certs = specs
             .iter()

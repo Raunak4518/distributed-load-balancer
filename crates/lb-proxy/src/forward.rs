@@ -1,6 +1,6 @@
 use crate::resolver::PinnedResolver;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::{Request, Response};
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -195,6 +195,20 @@ impl lb_core::ProbeClient for ProbeCapableClient {
             let limited = Limited::new(resp.into_body(), MAX_PROBE_BODY_BYTES);
             match tokio::time::timeout(timeout, limited.collect()).await {
                 Ok(Ok(_)) => Some(status),
+                // Named separately from the catch-all below only so an
+                // operator sees *why* a backend that answered 200 still
+                // reports unhealthy -- without this, hitting the cap looks
+                // identical to a timeout or a dropped connection, and size
+                // is the one cause among the three that config
+                // (`MAX_PROBE_BODY_BYTES` is not a tuning knob, but the
+                // backend's response is) can actually explain.
+                Ok(Err(e)) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                    tracing::debug!(
+                        cap_bytes = MAX_PROBE_BODY_BYTES,
+                        "health probe response body exceeded the size cap; reporting unreachable"
+                    );
+                    None
+                }
                 // Over the cap, or the body failed mid-read, or it never
                 // finished. Reported as unreachable rather than as the status
                 // we already hold: a `/health` endpoint that streams

@@ -67,13 +67,20 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    // The clock alone is not unique: Windows' system time has ~15.6 ms
+    // granularity, so concurrent tests routinely read the same nanosecond
+    // value, land in the same directory, and overwrite each other's cert/key
+    // files. The counter makes collision impossible within this binary,
+    // which is where every concurrent caller lives.
     fn tmpdir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
-            "lbtransport-{}",
+            "lbtransport-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();
         d

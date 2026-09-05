@@ -133,14 +133,58 @@ body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
 name     = "postgres"
 protocol = "tcp"
 listen   = "0.0.0.0:5432"
+# Bounds the TCP connect AND, when backend_tls below is set, the TLS
+# handshake to the backend too — the two run sequentially, so on a
+# backend_tls listener this ceiling is really 2x per attempt, not 1x. The
+# connect-retry loop tries up to two backends before giving up, so the
+# worst case before ConnectFailed is 4x this value, not 1x. 2000 here means
+# an 8s worst case under backend_tls, not a 2s one — size it with that in
+# mind rather than as a single-hop budget.
 connect_timeout_ms = 2000
 idle_timeout_ms    = 300000
 max_connections        = 10000
 max_connections_per_ip = 100
 
+# ── TLS termination (optional) ──────────────────────────────────────────
+# Same [listeners.tls] shape as the HTTP listener above — see its comments
+# for what each field does. Shown here because this is the configuration
+# operators most need the cost note below for, and the HTTP example alone
+# leaves it unclear that TCP listeners take the same block.
+# [listeners.tls]
+#   handshake_timeout_ms = 5000
+#   min_version = "1.2"
+#   reload_interval_secs = 60
+#   # hsts_max_age_secs is HTTP-only and rejected outright here — a TCP
+#   # listener has no response to put a header on.
+#
+#     [[listeners.tls.certificates]]
+#     name      = "postgres-primary"
+#     cert_file = "/etc/lb/tls/postgres.crt"
+#     key_file  = "/etc/lb/tls/postgres.key"
+#     hostnames = ["postgres.internal"]
+
+# ── Backend re-encryption (optional) ────────────────────────────────────
+# Same [listeners.backend_tls] shape as the HTTP listener above.
+#
+# Read this before turning both blocks on together: a TCP session is 1:1
+# with a client connection and L4 does not pool (unlike L7, which amortises
+# handshake cost across a kept-alive backend connection) — so a listener
+# that both terminates (block above) and re-encrypts (this block) pays TWO
+# full TLS handshakes per proxied connection, one on each side, for every
+# single connection, with no reuse on either leg. That is the most
+# expensive configuration this system supports; see the README's TLS
+# section ("performance notes") before sizing capacity around it.
+# [listeners.backend_tls]
+#   ca_file = "/etc/lb/tls/internal-ca.crt"
+#   danger_accept_invalid_certs = false
+
   [[listeners.backends]]
   id = "pg1"
   address = "10.0.0.5:5432"
+  # Required whenever [listeners.backend_tls] above is set — see the HTTP
+  # listener's backend for what this does and why it's separate from
+  # `address`.
+  # server_name = "postgres.internal"
 
   [listeners.health_check]
   # no `path` — a TCP backend is probed by connecting, not by GET

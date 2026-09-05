@@ -109,7 +109,14 @@ impl BackendConnector {
     pub fn wrap_https<H>(&self, http: H) -> hyper_rustls::HttpsConnector<H> {
         hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config((*self.config).clone())
-            .https_or_http()
+            // `https_only()`, not `https_or_http()`: this connector only
+            // ever wraps a `backend_tls` listener's client, so plaintext
+            // egress should be structurally impossible here, not merely
+            // caller-prevented. (`lb-proxy::forward::build_client`'s
+            // `None` branch is the plaintext connector and stays
+            // `https_or_http()` -- it is a different builder, for the case
+            // where no backend TLS is configured at all.)
+            .https_only()
             .enable_http1()
             .wrap_connector(http)
     }
@@ -213,13 +220,20 @@ mod tests {
     use super::BackendConnector;
     use crate::test_support as support;
 
+    // The clock alone is not unique: Windows' system time has ~15.6 ms
+    // granularity, so concurrent tests routinely read the same nanosecond
+    // value, land in the same directory, and overwrite each other's cert/key
+    // files. The counter makes collision impossible within this binary,
+    // which is where every concurrent caller lives.
     fn tmpdir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let d = std::env::temp_dir().join(format!(
-            "lbconn-{}",
+            "lbconn-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();
         d

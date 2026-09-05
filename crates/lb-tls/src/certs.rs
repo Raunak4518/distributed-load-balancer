@@ -103,6 +103,55 @@ mod tests {
         assert!(loaded.not_after_unix > 0);
     }
 
+    /// Spec section 8, test 11 calls the expiry gauge "the most valuable
+    /// metric here" and it is the sole reason `x509-parser` is a dependency.
+    /// `loads_a_valid_pair` above only checks `not_after_unix > 0`, which is
+    /// true for any certificate that parses at all — it would not catch
+    /// `leaf_not_after` reading `notBefore` instead of `notAfter`, returning
+    /// a hardcoded constant, or returning milliseconds instead of Unix
+    /// seconds. This pins the value against what is actually known about
+    /// the generated certificate instead of merely its presence.
+    #[test]
+    fn not_after_unix_matches_the_certificates_actual_notafter() {
+        let dir = std::env::temp_dir().join(format!("lbtls-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let loaded = load_certificate(&cfg(&dir, "expiry", &["example.com"])).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // rcgen 0.13's default validity window runs from 1975-01-01 to
+        // 4096-01-01 (see rcgen::CertificateParams::default), so a freshly
+        // generated leaf's notAfter is roughly two thousand years out from
+        // "now". Two bounds relative to "now", not an exact literal (which
+        // would pin us to one rcgen release's choice of default), are
+        // enough to catch every wrong-value failure mode described above:
+        //   - "comfortably in the future" (now + 10 years) rules out
+        //     notBefore (1975, in the past of any "now" this suite runs at)
+        //     and a zero/small placeholder constant.
+        //   - "not absurdly far" (under year 9999) rules out seconds
+        //     swapped for milliseconds, which would land the value roughly
+        //     two million years out, not two thousand.
+        let ten_years_secs = 10 * 365 * 24 * 3600;
+        let year_9999_unix = 253_402_300_799_i64;
+        assert!(
+            loaded.not_after_unix > now + ten_years_secs,
+            "not_after_unix {} is not comfortably in the future of now ({}); \
+             leaf_not_after may be reading notBefore, a placeholder, or the \
+             wrong field entirely",
+            loaded.not_after_unix,
+            now
+        );
+        assert!(
+            loaded.not_after_unix < year_9999_unix,
+            "not_after_unix {} is implausibly far in the future; likely a \
+             seconds-vs-milliseconds (or other unit) bug in leaf_not_after",
+            loaded.not_after_unix
+        );
+    }
+
     #[test]
     fn a_key_that_does_not_match_the_certificate_is_rejected() {
         let dir = std::env::temp_dir().join(format!("lbtls-{}", uuid_like()));
@@ -145,10 +194,21 @@ mod tests {
     }
 
     /// Unique-enough directory suffix without pulling in a uuid dependency.
-    fn uuid_like() -> u128 {
-        std::time::SystemTime::now()
+    ///
+    /// The clock alone is not unique: Windows' system time has ~15.6 ms
+    /// granularity, so concurrent tests routinely read the same nanosecond
+    /// value, land in the same directory, and overwrite each other's
+    /// cert/key files. The counter makes collision impossible within this
+    /// binary, which is where every concurrent caller lives.
+    fn uuid_like() -> String {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos();
+        format!(
+            "{nanos}-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
     }
 }

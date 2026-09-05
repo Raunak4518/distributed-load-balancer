@@ -131,7 +131,7 @@ be verified now fails its health probe and drops out of rotation, instead of
 probing healthy while every real request to it fails and the dashboard shows
 green.
 
-**Two performance notes for picking a certificate and reasoning about
+**Three performance notes for picking a certificate and reasoning about
 scale — operator guidance, not enforced by any code here:**
 
 - An ECDSA P-256 certificate's server-side handshake is roughly 5–10x
@@ -144,6 +144,15 @@ scale — operator guidance, not enforced by any code here:**
   balancer, or simply because there is no session affinity — pays a full
   handshake there. Session state is never shared across nodes; doing so
   safely is a harder, security-sensitive problem left for later.
+- **The two notes above are about the client-facing handshake, and do not
+  apply at L4.** An L4 (TCP) listener that both terminates and re-encrypts
+  pays **two full handshakes per proxied connection** — one to the client,
+  one to the backend — because L4 does not pool (see **L4 vs L7** above: a
+  TCP session is 1:1 with a client connection, so there is no keep-alive to
+  amortise the backend handshake across). This is the most expensive
+  configuration this system supports, and it is the one figure that matters
+  most for capacity planning something like a Postgres listener at N
+  connections/sec.
 
 **HSTS is opt-in and off by default.** `hsts_max_age_secs` adds
 `Strict-Transport-Security: max-age=<value>` to every response from a
