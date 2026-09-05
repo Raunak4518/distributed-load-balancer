@@ -17,6 +17,12 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 # graph: they must all agree on one provider or `install_default()`
 # conflicts at runtime.
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "tls12", "native-tokio"] }
+# For an explicit, infallible empty-trust-store `ClientConfig` on the
+# plaintext (`backend_tls: None`) path in `build_client` -- an empty
+# `RootCertStore` never touches the filesystem or the OS certificate store,
+# unlike `with_native_roots()`, which this replaces. Same `ring`,
+# default-features = false selection as every other TLS dependency here.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"

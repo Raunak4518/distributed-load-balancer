@@ -788,6 +788,7 @@ dependencies = [
 name = "lb-core"
 version = "0.1.0"
 dependencies = [
+ "http",
  "serde",
  "thiserror",
  "tokio",
@@ -833,6 +834,7 @@ dependencies = [
  "lb-healthcheck",
  "lb-metrics",
  "lb-tls",
+ "rustls",
  "tokio",
  "tower-service",
  "tracing",

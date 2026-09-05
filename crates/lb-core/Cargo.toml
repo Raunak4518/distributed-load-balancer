@@ -10,6 +10,12 @@ test-util = []
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 thiserror = "1"
+# For validating a configured `server_name` as a real `http::uri::Authority`
+# at startup (config.rs) -- the exact type `lb-proxy`'s forwarding path
+# builds its outbound URI authority from, so "what config accepts" and "what
+# the request path will accept" cannot drift apart. Already resolved
+# transitively (hyper depends on it), so this adds an edge, not a new crate.
+http = "1"
 # `AsyncRead`/`AsyncWrite` only, for the `ProxyStream` trait bound in
 # transport.rs. Those two traits need no feature at all: no runtime, no
 # `net`, no `io-util`. This crate defines boundaries and does no I/O,

@@ -1,7 +1,7 @@
 use crate::error::ConfigError;
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -554,14 +554,80 @@ impl ListenerConfig {
         }
 
         if self.backend_tls.is_some() {
+            // server_name -> first backend id that used it. Duplicate
+            // detection is scoped to HTTP below: at L7,
+            // `lb_proxy::resolver::PinnedResolver` (the table that pins the
+            // forwarding dial to `address`) is keyed by server_name, so two
+            // backends sharing one name collapse onto whichever address is
+            // registered last -- round-robin becomes a no-op, and outcomes
+            // get recorded against the wrong backend's circuit breaker. At
+            // L4 there is no such shared table: each connection dials its
+            // own backend's own `address` directly, so several TCP replicas
+            // presenting the same certificate name is an ordinary,
+            // functioning topology, not a bug -- rejecting it there would
+            // only be pointlessly restrictive.
+            let mut first_use: HashMap<&str, &str> = HashMap::new();
+
             for backend in &self.backends {
-                if backend.server_name.is_none() {
+                let Some(name) = backend.server_name.as_deref() else {
                     return Err(invalid(format!(
                         "backend '{}' needs a server_name when backend_tls is set — \
                          certificates are issued for hostnames, but the backend is \
                          addressed as {}. Add server_name = \"<the name on its certificate>\".",
                         backend.id, backend.address
                     )));
+                };
+
+                // server_name identifies the hostname on the backend's
+                // certificate. Accepting an IP literal here would reopen the
+                // exact bug this field exists to prevent: a stock
+                // `hyper_util::HttpConnector` parses an IP-literal URI host
+                // *before* ever consulting a resolver, so an IP-literal
+                // server_name would dial that IP directly -- straight past
+                // `PinnedResolver` and the pinned `address` it exists to
+                // enforce. IP-SAN certificates are a real but separate
+                // feature this project isn't building right now.
+                if name.parse::<IpAddr>().is_ok() {
+                    return Err(invalid(format!(
+                        "backend '{}' has server_name = \"{name}\", which is an IP \
+                         address — server_name must be the hostname on the backend's \
+                         certificate, not an address (IP-SAN certificates are not \
+                         supported)",
+                        backend.id
+                    )));
+                }
+
+                // The L7 forwarding path (`lb_proxy::service::build_outbound_request`)
+                // builds its outbound request's URI authority as
+                // `{server_name}:{port}` and hands it to `hyper::Uri::builder`,
+                // which *panics* rather than erroring on a malformed
+                // authority. Before this phase that authority was always a
+                // `SocketAddr`'s `Display`, valid by construction;
+                // server_name is free text from an operator's config now, so
+                // it is checked here against the exact parser the request
+                // path uses -- `http::uri::Authority`, the same type
+                // `hyper::Uri` is built from -- so a typo fails startup
+                // instead of panicking on every request to this listener.
+                let authority = format!("{name}:{}", backend.address.port());
+                if http::uri::Authority::try_from(authority.as_str()).is_err() {
+                    return Err(invalid(format!(
+                        "backend '{}' has server_name = \"{name}\", which cannot form a \
+                         valid request authority (check for stray spaces or punctuation)",
+                        backend.id
+                    )));
+                }
+
+                if self.protocol == Protocol::Http {
+                    if let Some(first_id) = first_use.insert(name, backend.id.as_str()) {
+                        return Err(invalid(format!(
+                            "backends '{first_id}' and '{}' both use server_name = \"{name}\" \
+                             — at L7 each server_name resolves to exactly one address, so \
+                             sharing one collapses both backends onto whichever address is \
+                             registered last, silently defeating load balancing. Give each \
+                             backend a distinct server_name.",
+                            backend.id
+                        )));
+                    }
                 }
             }
         }
@@ -1055,6 +1121,123 @@ listen = "0.0.0.0:443"
     #[test]
     fn server_name_is_not_required_without_backend_tls() {
         let toml = plain_backend_toml();
+        assert!(Config::parse(&toml).is_ok());
+    }
+
+    /// Before this check, a stray space in `server_name` (a plausible typo)
+    /// would parse as config fine, start the listener fine, and then panic
+    /// on every single request -- `hyper::Uri::builder` panics rather than
+    /// erroring on a malformed authority, and before this phase the
+    /// authority was always a `SocketAddr`'s `Display`, valid by
+    /// construction. This is the regression test for that: it must fail at
+    /// `Config::parse`, not at request time.
+    #[test]
+    fn a_server_name_that_cannot_form_a_valid_request_authority_is_rejected() {
+        let toml = tls_backend_toml(Some("web1 internal"), false);
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("b1"), "error must name the backend: {err}");
+        assert!(
+            err.contains("web1 internal"),
+            "error must show the offending value: {err}"
+        );
+    }
+
+    /// `server_name` identifies the hostname on the backend's certificate.
+    /// Accepting an IP literal here would reopen the exact bug the
+    /// DNS-pinning fix closed: a stock `HttpConnector` parses an IP-literal
+    /// URI host *before* ever consulting a resolver, so an IP-literal
+    /// `server_name` would dial straight past the pinned table and the
+    /// `address` it exists to enforce.
+    #[test]
+    fn an_ip_literal_server_name_is_rejected() {
+        let toml = tls_backend_toml(Some("10.0.0.5"), false);
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("b1"), "error must name the backend: {err}");
+        assert!(
+            err.contains("10.0.0.5"),
+            "error must show the offending value: {err}"
+        );
+    }
+
+    /// Two backends of one listener, both given `server_name`. `protocol`
+    /// selects which of the duplicate-`server_name` tests below this
+    /// supports: rejected on an HTTP listener (the resolver table that pins
+    /// the L7 dial is keyed by `server_name`, so a duplicate silently
+    /// collapses two backends onto one address), accepted on a TCP listener
+    /// (no such shared table exists there -- several replicas presenting one
+    /// certificate name is an ordinary topology).
+    fn duplicate_server_name_toml(protocol: &str) -> String {
+        let tcp_only_listener_settings = if protocol == "tcp" {
+            "connect_timeout_ms = 2000\nidle_timeout_ms = 5000\n"
+        } else {
+            ""
+        };
+        let health_check = if protocol == "tcp" {
+            "  [listeners.health_check]\n  interval_ms = 1000\n  timeout_ms = 200\n  failure_threshold = 2\n  cooldown_ms = 500\n"
+        } else {
+            "  [listeners.health_check]\n  path = \"/health\"\n  interval_ms = 1000\n  timeout_ms = 200\n  failure_threshold = 2\n  cooldown_ms = 500\n"
+        };
+        format!(
+            r#"
+[[listeners]]
+name = "web"
+protocol = "{protocol}"
+listen = "0.0.0.0:443"
+{tcp_only_listener_settings}
+  [listeners.backend_tls]
+  danger_accept_invalid_certs = false
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+  server_name = "api.internal"
+
+  [[listeners.backends]]
+  id = "b2"
+  address = "127.0.0.1:9002"
+  server_name = "api.internal"
+
+{health_check}
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        )
+    }
+
+    /// The regression test for fix #2: without duplicate detection, `b1` and
+    /// `b2` above would both parse fine, and `lb_proxy::resolver::PinnedResolver`'s
+    /// `server_name -> address` table would silently collapse them onto
+    /// whichever address is registered last -- load balancing becomes a
+    /// no-op, and outcomes get attributed to the wrong backend's circuit
+    /// breaker.
+    #[test]
+    fn duplicate_server_names_on_an_http_listener_are_rejected() {
+        let toml = duplicate_server_name_toml("http");
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("b1"), "error must name one backend: {err}");
+        assert!(
+            err.contains("b2"),
+            "error must name the other backend: {err}"
+        );
+        assert!(
+            err.contains("api.internal"),
+            "error must show the shared server_name: {err}"
+        );
+    }
+
+    /// The mirror image, proving the HTTP-only scoping above is a deliberate
+    /// choice and not an oversight: L4 has no shared resolver table (each
+    /// connection dials its own backend's own `address`), so several TCP
+    /// backends sharing one certificate name is an ordinary, working
+    /// topology and must not be rejected.
+    #[test]
+    fn duplicate_server_names_on_a_tcp_listener_are_allowed() {
+        let toml = duplicate_server_name_toml("tcp");
         assert!(Config::parse(&toml).is_ok());
     }
 

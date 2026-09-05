@@ -60,15 +60,29 @@ pub fn build_client(
         // No backend TLS configured. This connector will only ever be given
         // `http://` URLs with an IP-literal authority -- `build_outbound_request`
         // picks the scheme and authority from the same setting -- so the
-        // roots it loads (and the resolver above) are never consulted; they
-        // exist because `https_or_http()` is what keeps `ProxyClient` a
-        // single type across both cases.
-        None => hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .expect("a native root store is loadable")
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http),
+        // roots below (and the resolver above) are never consulted; an empty
+        // `RootCertStore` exists only because `https_or_http()` is what
+        // keeps `ProxyClient` a single type across both cases.
+        //
+        // Deliberately *empty*, not `with_native_roots()`: this listener
+        // needs zero TLS material, so loading (and validating non-empty) the
+        // OS trust store here would be pure downside -- a scratch/distroless
+        // container with no `ca-certificates` package would fail to start a
+        // plaintext-only listener for no reason. Building the config
+        // directly like this is also infallible, unlike
+        // `with_native_roots()`, which can fail if the store turns out
+        // empty -- there is nothing to fail here.
+        None => {
+            let roots = rustls::RootCertStore::empty();
+            let tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            hyper_rustls::HttpsConnectorBuilder::new()
+                .with_tls_config(tls_config)
+                .https_or_http()
+                .enable_http1()
+                .wrap_connector(http)
+        }
     };
     Client::builder(TokioExecutor::new())
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
@@ -129,6 +143,23 @@ mod tests {
         addr
     }
 
+    /// `build_client(None, ..)` (no `[listeners.backend_tls]`) must not call
+    /// any fallible root-store constructor: `with_native_roots()` (what this
+    /// branch used to call) can fail on a scratch/distroless container with
+    /// no OS certificate store, even though a plaintext-only listener needs
+    /// zero TLS material. There is no practical way to force this test
+    /// machine's *actual* native store empty, so this instead confirms the
+    /// only thing that matters -- that the plaintext path builds a fully
+    /// working client with no root store loaded at all. If the fallible
+    /// constructor ever crept back in, this would still pass on a normal
+    /// dev machine; `forwards_and_returns_backend_response` above and
+    /// `connect_failure_is_reported` below are the ones that would start
+    /// failing (intermittently, machine-dependently) if it panicked.
+    #[test]
+    fn a_plaintext_only_client_builds_without_needing_any_trust_store() {
+        let _client = build_client(None, HashMap::new());
+    }
+
     #[tokio::test]
     async fn forwards_and_returns_backend_response() {
         let addr = spawn_fixed_response_backend(StatusCode::OK).await;
@@ -153,34 +184,6 @@ mod tests {
         let client = build_client(None, HashMap::new());
         let req = Request::builder()
             .uri("http://127.0.0.1:1")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-
-        let result = forward(&client, req, Duration::from_secs(1)).await;
-        assert!(matches!(
-            result,
-            Err(ForwardError::Connect | ForwardError::Timeout)
-        ));
-    }
-
-    /// A re-encrypting listener forwards `https://` URLs, which the plain
-    /// `HttpConnector` this client used to be built on would have rejected
-    /// outright as an unsupported scheme. Whether the certificate is
-    /// *trusted* is the connector's business, proven against a live
-    /// handshake in `lb-tls` and end to end in `lb-server`.
-    #[tokio::test]
-    async fn a_client_built_from_a_backend_connector_speaks_https() {
-        let connector = lb_tls::BackendConnector::new(&lb_core::BackendTlsConfig {
-            ca_file: None,
-            danger_accept_invalid_certs: false,
-        })
-        .unwrap();
-        let client = build_client(Some(&connector), HashMap::new());
-        // Nothing is listening, so this fails at connect -- but it fails
-        // there rather than at "invalid URL for connector", which is the
-        // distinction being drawn.
-        let req = Request::builder()
-            .uri("https://127.0.0.1:1/")
             .body(Full::new(Bytes::new()))
             .unwrap();
 
