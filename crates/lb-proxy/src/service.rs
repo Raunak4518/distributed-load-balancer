@@ -485,7 +485,7 @@ mod tests {
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
 
-        let client = build_client(None);
+        let client = build_client(None, HashMap::new());
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
@@ -519,7 +519,7 @@ mod tests {
             balancer: Arc::new(NoBackend), // would return None if reached; proves we short-circuit
             pool: empty_pool(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None),
+            client: build_client(None, HashMap::new()),
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -541,7 +541,7 @@ mod tests {
             balancer: Arc::new(NoBackend),
             pool: empty_pool(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None),
+            client: build_client(None, HashMap::new()),
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -572,7 +572,7 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             circuit_breakers: breakers,
-            client: build_client(None),
+            client: build_client(None, HashMap::new()),
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -604,7 +604,7 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             circuit_breakers: breakers,
-            client: build_client(None),
+            client: build_client(None, HashMap::new()),
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -644,7 +644,7 @@ mod tests {
             balancer: Arc::new(PreferFirstEligible),
             pool: pool.clone(),
             circuit_breakers: breakers,
-            client: build_client(None),
+            client: build_client(None, HashMap::new()),
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),

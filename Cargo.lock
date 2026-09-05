@@ -834,6 +834,7 @@ dependencies = [
  "lb-metrics",
  "lb-tls",
  "tokio",
+ "tower-service",
  "tracing",
  "uuid",
 ]

@@ -92,13 +92,21 @@ impl BackendConnector {
         tokio_rustls::TlsConnector::from(Arc::clone(&self.config))
     }
 
-    /// For `lb-proxy`: an HTTPS-capable connector for the hyper client.
-    pub fn https_connector(
-        &self,
-    ) -> hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector> {
-        let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
-        http.set_connect_timeout(Some(std::time::Duration::from_secs(2)));
-        http.enforce_http(false);
+    /// For `lb-proxy`: wraps an already-built connector with this backend's
+    /// TLS config, trust roots and verification policy.
+    ///
+    /// Takes the inner connector rather than building one internally (as an
+    /// earlier version of this method did) because the caller must control
+    /// how the *TCP dial* resolves its target. `lb-proxy` builds an
+    /// `HttpConnector` pinned to a fixed `server_name -> address` table
+    /// (`lb_proxy::resolver::PinnedResolver`) rather than the default
+    /// (real-DNS) resolver -- otherwise the connector would resolve the
+    /// forwarding URI's authority, which is `server_name` (chosen so SNI and
+    /// hostname verification check the certificate's name), via real DNS
+    /// instead of dialing the operator-configured `address`. This method's
+    /// only remaining job is what it says: wrap whatever connector it is
+    /// given with this backend's TLS config.
+    pub fn wrap_https<H>(&self, http: H) -> hyper_rustls::HttpsConnector<H> {
         hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config((*self.config).clone())
             .https_or_http()

@@ -182,6 +182,22 @@ pub fn build_app(
         let pool = Arc::new(BackendPool::new(backends.clone()));
         pools.push(Arc::clone(&pool));
 
+        // Pins the L7 forwarding client's TCP dial to each backend's
+        // configured `address`, even though the forwarding authority is that
+        // backend's `server_name` (chosen so SNI and hostname verification
+        // check the certificate's own name). Without this table, a
+        // `backend_tls` listener's connector would resolve `server_name` via
+        // real DNS to find something to dial -- silently reintroducing
+        // DNS-based backend resolution and letting traffic follow whatever
+        // that name resolves to instead of the pinned backend. Built for
+        // every listener, not only `backend_tls` ones: a plaintext listener's
+        // requests carry an IP-literal authority, so the table is simply
+        // never consulted there. See `lb_proxy::resolver::PinnedResolver`.
+        let server_name_addresses: HashMap<String, SocketAddr> = backends
+            .iter()
+            .filter_map(|b| b.server_name.clone().map(|name| (name, b.address)))
+            .collect();
+
         let protocol_name = match lc.protocol {
             Protocol::Http => "http",
             Protocol::Tcp => "tcp",
@@ -264,7 +280,7 @@ pub fn build_app(
                     balancer: Arc::new(RoundRobin::new()),
                     pool,
                     circuit_breakers,
-                    client: lb_proxy::build_client(backend_tls.as_deref()),
+                    client: lb_proxy::build_client(backend_tls.as_deref(), server_name_addresses),
                     backend_tls: backend_tls.is_some(),
                     rate_limit_key: lc.rate_limit.key.clone(),
                     forward_timeout: lc.forward_timeout(),

@@ -21,6 +21,11 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "time"] }
+# For `PinnedResolver` (resolver.rs): a custom `HttpConnector` resolver is a
+# `tower_service::Service<Name>` impl -- see hyper-util's `connect::dns`
+# module docs. Already resolved transitively via hyper-util itself, so this
+# adds no new crate to Cargo.lock, just an edge to it.
+tower-service = "0.3"
 
 [dev-dependencies]
 lb-core = { path = "../lb-core", features = ["test-util"] }

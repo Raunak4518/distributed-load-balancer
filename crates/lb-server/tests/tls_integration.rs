@@ -646,10 +646,14 @@ async fn spawn_tls_backend(
 /// `tls_http_config` plus a `[listeners.backend_tls]` section, a
 /// `server_name` on the backend, and an optional `[admin]` listener.
 ///
-/// The backend's `server_name` is `localhost` rather than something like
-/// `backend.internal` because at L7 the forwarding authority *is* the
-/// server name, so it has to resolve. `backend.internal` would fail in DNS
-/// long before any certificate was looked at.
+/// `server_name` is a parameter (rather than hardcoded to `localhost`) so
+/// `a_backend_whose_server_name_does_not_resolve_via_dns_is_still_proxied_to`
+/// below can exercise a name -- `backend.invalid` -- that is guaranteed to
+/// never resolve via real DNS. Before the L7 DNS-pinning fix, the forwarding
+/// authority (`server_name`) was handed straight to a stock `HttpConnector`,
+/// which resolves it via real DNS to find something to dial; the fix pins
+/// that dial to the backend's configured `address` instead.
+#[allow(clippy::too_many_arguments)]
 fn backend_tls_config(
     listen: SocketAddr,
     backend: SocketAddr,
@@ -658,6 +662,7 @@ fn backend_tls_config(
     ca_file: Option<&std::path::Path>,
     danger: bool,
     admin: Option<SocketAddr>,
+    server_name: &str,
 ) -> String {
     let ca_line = match ca_file {
         Some(p) => format!(
@@ -692,7 +697,7 @@ listen = "{listen}"
   [[listeners.backends]]
   id = "b1"
   address = "{backend}"
-  server_name = "localhost"
+  server_name = "{server_name}"
 
   [listeners.health_check]
   path = "/health"
@@ -741,7 +746,14 @@ async fn an_untrusted_backend_certificate_is_refused() {
     let (_dir, cert, key) = cert_files(&["localhost"]);
 
     let config = Config::parse(&backend_tls_config(
-        listen, backend, &cert, &key, /* ca_file */ None, /* danger */ false, None,
+        listen,
+        backend,
+        &cert,
+        &key,
+        /* ca_file */ None,
+        /* danger */ false,
+        None,
+        "localhost",
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
@@ -803,6 +815,7 @@ async fn a_backend_trusted_via_ca_file_is_proxied_to() {
         Some(&bcert),
         false,
         None,
+        "localhost",
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
@@ -813,6 +826,61 @@ async fn a_backend_trusted_via_ca_file_is_proxied_to() {
         .send()
         .await
         .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    // Counted only for TLS connections, so a regression to plaintext
+    // forwarding fails here rather than quietly answering 200.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// The regression test for the L7 DNS-pinning bug. `backend.invalid` is
+/// reserved by RFC 2606 and is guaranteed to never resolve via real DNS,
+/// anywhere. Before the fix, the forwarding `HttpConnector` resolved this
+/// exact authority (the forwarding URI's authority is `server_name`, so SNI
+/// and hostname verification check the certificate's name) via its default,
+/// real-DNS resolver, so this request would hang or fail on that lookup
+/// without ever reaching `backend.address`. After the fix, the connector
+/// dials `address` via a fixed per-listener table and never performs a real
+/// DNS lookup at all, so the request succeeds despite the name being
+/// unresolvable.
+#[tokio::test]
+async fn a_backend_whose_server_name_does_not_resolve_via_dns_is_still_proxied_to() {
+    let (_bdir, bcert, bkey) = cert_files(&["backend.invalid"]);
+    let (backend, hits) = spawn_tls_backend(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        Some(&bcert),
+        false,
+        None,
+        "backend.invalid",
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    // Bounded explicitly: a real-DNS lookup on a `.invalid` name may hang
+    // rather than fail fast, depending on the resolver in front of this
+    // machine. Without the fix this future would very plausibly never
+    // resolve inside 5s; with the fix, no DNS lookup happens at all, so it
+    // returns almost immediately.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        trusting_client()
+            .get(format!("https://localhost:{}/", listen.port()))
+            .send(),
+    )
+    .await
+    .expect(
+        "the request hung -- forwarding tried to resolve `backend.invalid` \
+         via real DNS instead of dialing the pinned backend address",
+    )
+    .unwrap();
 
     assert_eq!(resp.status(), 200);
     // Counted only for TLS connections, so a regression to plaintext
@@ -840,6 +908,7 @@ async fn the_danger_flag_forwards_to_an_unverifiable_backend_and_is_visible() {
         None,
         true,
         Some(admin),
+        "localhost",
     ))
     .unwrap();
     tokio::spawn(lb_server::run(config));
@@ -884,6 +953,7 @@ async fn an_unreadable_ca_file_fails_startup_with_an_error() {
         Some(&missing),
         false,
         None,
+        "localhost",
     ))
     .unwrap();
 
