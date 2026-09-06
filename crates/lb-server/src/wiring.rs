@@ -1,7 +1,7 @@
 use lb_balancer::RoundRobin;
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::ClusterCoordinator;
-use lb_core::{Backend, BackendPool, Config, ListenerConfig, Protocol, SystemClock};
+use lb_core::{Backend, BackendPool, Config, Http2Config, ListenerConfig, Protocol, SystemClock};
 use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
 };
@@ -33,6 +33,13 @@ pub enum ListenerRuntime {
         /// so a bad certificate fails before the port is bound, rather than
         /// on the first client to arrive.
         tls: Option<Arc<lb_tls::TlsAcceptor>>,
+        /// `Some` exactly when this listener's acceptor advertises `h2`, and
+        /// carrying defaults when the operator wrote no `[listeners.http2]`
+        /// section. That equivalence is the point: `h2` is negotiated by the
+        /// ALPN list built from `http2_enabled()`, so populating this from
+        /// the same predicate makes "negotiated h2 without settings to serve
+        /// it under" unrepresentable rather than merely unlikely.
+        http2: Option<Arc<Http2Config>>,
     },
     Tcp {
         name: String,
@@ -66,6 +73,16 @@ impl ListenerRuntime {
     pub fn tls(&self) -> Option<&Arc<lb_tls::TlsAcceptor>> {
         match self {
             ListenerRuntime::Http { tls, .. } | ListenerRuntime::Tcp { tls, .. } => tls.as_ref(),
+        }
+    }
+
+    /// The HTTP/2 settings to serve an `h2` connection under, or `None` if
+    /// this listener never advertises `h2`. A TCP listener is always `None`:
+    /// HTTP/2 is an application protocol and the L4 data plane parses none.
+    pub fn http2(&self) -> Option<&Arc<Http2Config>> {
+        match self {
+            ListenerRuntime::Http { http2, .. } => http2.as_ref(),
+            ListenerRuntime::Tcp { .. } => None,
         }
     }
 
@@ -328,6 +345,16 @@ pub fn build_app(
                     metrics: Arc::clone(&listener_metrics),
                     header_read_timeout: lc.header_read_timeout(),
                     tls,
+                    // Built from the same `http2_enabled()` that chose the
+                    // ALPN list above, so the two cannot drift apart. The
+                    // `unwrap_or_default` is load-bearing rather than
+                    // defensive: `http2_enabled()` is true for a TLS
+                    // listener with no `[listeners.http2]` section at all --
+                    // the common case -- and that listener still advertises
+                    // `h2` and so still needs settings to serve it under.
+                    http2: lc
+                        .http2_enabled()
+                        .then(|| Arc::new(lc.http2.clone().unwrap_or_default())),
                 }
             }
             Protocol::Tcp => {
@@ -406,12 +433,13 @@ fn build_tls_acceptor(
         return Ok(None);
     };
     // The listener's protocol decides what we are willing to speak inside
-    // the tunnel. Advertising `http/1.1` is the seam where Phase 8 adds
-    // `h2`; at L4 we do not know the application protocol's name, so we
-    // offer none.
-    let alpn: &[&[u8]] = match lc.protocol {
-        Protocol::Http => &[b"http/1.1"],
-        Protocol::Tcp => &[],
+    // the tunnel. Order is preference: a client offering both gets HTTP/2.
+    // TCP listeners advertise nothing -- at L4 we do not know the
+    // application protocol's name.
+    let alpn: &[&[u8]] = match (lc.protocol, lc.http2_enabled()) {
+        (Protocol::Http, true) => &[b"h2", b"http/1.1"],
+        (Protocol::Http, false) => &[b"http/1.1"],
+        (Protocol::Tcp, _) => &[],
     };
     let acceptor = lb_tls::TlsAcceptor::new(tls_cfg, alpn).map_err(|err| {
         std::io::Error::new(
@@ -628,6 +656,28 @@ mod tests {
             }
             _ => panic!("expected an http listener"),
         }
+
+        for task in app.background_tasks {
+            task.abort();
+        }
+    }
+
+    /// The half of the h2 invariant that needs no certificate: a listener
+    /// that cannot negotiate ALPN must carry no HTTP/2 settings, so `drive`'s
+    /// `is_h2` branch is unreachable for it by construction. The other half --
+    /// a TLS listener with no `[listeners.http2]` section still getting
+    /// settings -- is covered end to end in `tests/http2_integration.rs`,
+    /// where the `expect` in `drive` would fire if it did not hold.
+    #[tokio::test]
+    async fn a_listener_that_cannot_negotiate_alpn_carries_no_http2_settings() {
+        let config = Config::parse(CONFIG).unwrap();
+        let app = build_app(&config, None).unwrap();
+
+        // Plaintext HTTP: no TLS handshake, so no ALPN, so no h2.
+        assert!(app.listeners[0].http2().is_none());
+        // TCP: HTTP/2 is an application protocol the L4 data plane never
+        // parses, whatever the config says.
+        assert!(app.listeners[1].http2().is_none());
 
         for task in app.background_tasks {
             task.abort();

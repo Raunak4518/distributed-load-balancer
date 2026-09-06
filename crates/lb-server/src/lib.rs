@@ -6,7 +6,7 @@ pub use wiring::{
     build_app, AppClusterNode, ClusterSetup, HttpContext, ListenerRuntime, TcpAppContext, WiredApp,
 };
 
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use lb_core::Config;
@@ -238,7 +238,11 @@ fn spawn_connection(
         let _ip_guard = ip_guard;
 
         let Some(acceptor) = runtime.tls() else {
-            drive(&runtime, stream, peer).await;
+            // No TLS means no ALPN, and this node is the edge: prior-knowledge
+            // h2c on an unencrypted port is surface nobody asked for. Passing
+            // `false` unconditionally is what keeps "a plaintext listener is
+            // HTTP/1.1" true in code rather than only in config.
+            drive(&runtime, stream, peer, false).await;
             return;
         };
 
@@ -252,7 +256,12 @@ fn spawn_connection(
                 metrics
                     .tls_handshake_duration
                     .observe(started.elapsed().as_secs_f64());
-                drive(&runtime, tls, peer).await;
+                // Read here, while the concrete `TlsStream` still exists --
+                // `drive` is generic and erases it. This is why the dispatch
+                // needs no preface sniffing: the handshake that just
+                // completed already told us which protocol both ends chose.
+                let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
+                drive(&runtime, tls, peer, is_h2).await;
             }
             Err(lb_tls::HandshakeError::TimedOut) => {
                 metrics.tls_handshakes_timeout.inc();
@@ -275,7 +284,11 @@ fn spawn_connection(
 /// Generic so the same code serves a plain `TcpStream` and a `TlsStream`; the
 /// data planes never learn which they got, which is why terminating TLS
 /// needed no change to `lb-proxy` at all.
-async fn drive<S>(runtime: &ListenerRuntime, stream: S, peer: SocketAddr)
+///
+/// `is_h2` is the protocol the handshake negotiated. It is decided by the
+/// caller because only the caller still holds a stream concrete enough to ask,
+/// and it is always `false` for a plaintext connection, which has no ALPN.
+async fn drive<S>(runtime: &ListenerRuntime, stream: S, peer: SocketAddr, is_h2: bool)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -283,18 +296,59 @@ where
         ListenerRuntime::Http {
             ctx,
             header_read_timeout,
+            http2,
             ..
         } => {
             let ctx = Arc::clone(ctx);
             let peer_ip = peer.ip();
             let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
-            if let Err(err) = http1::Builder::new()
+            if is_h2 {
+                // Holds by construction, not by hope: `h2` is advertised only
+                // when `http2_enabled()` is true, and this field is populated
+                // from that same predicate in the same `build_app` arm. A
+                // connection therefore cannot negotiate `h2` on a listener
+                // with no settings to serve it under -- including the common
+                // case of a TLS listener with no `[listeners.http2]` section,
+                // which gets `Http2Config::default()`.
+                let h2 = http2
+                    .as_ref()
+                    .expect("h2 is only advertised when http2 config is present");
+                // Every limit below exists because one HTTP/2 connection
+                // carries many concurrent requests, so Phase 5's per-IP
+                // *connection* cap no longer bounds per-IP *work*. Omitting
+                // them would quietly undo that hardening.
+                if let Err(err) = http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    // Same rule as the HTTP/1.1 path below: hyper 1.x has no
+                    // built-in timer, and the keep-alive settings panic
+                    // without one.
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    // The h2 analogue of max_connections_per_ip.
+                    .max_concurrent_streams(h2.max_concurrent_streams())
+                    // Rapid Reset (CVE-2023-44487). Cancelled streams evade
+                    // max_concurrent_streams by not being concurrent.
+                    .max_pending_accept_reset_streams(h2.max_pending_accept_reset_streams())
+                    .max_local_error_reset_streams(h2.max_local_error_reset_streams())
+                    // Bounds HPACK and CONTINUATION expansion, where few
+                    // frames can become a lot of server-side state.
+                    .max_header_list_size(h2.max_header_list_size())
+                    .max_frame_size(h2.max_frame_size())
+                    // No header-read timeout here: an idle h2 connection is
+                    // normal, a dead one is not, and PING tells them apart.
+                    .keep_alive_interval(h2.keep_alive_interval())
+                    .keep_alive_timeout(h2.keep_alive_timeout())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await
+                {
+                    tracing::debug!(error = %err, "http/2 client connection error");
+                }
+            } else if let Err(err) = http1::Builder::new()
                 // hyper 1.x has no built-in timer: any timeout feature
                 // panics unless one is supplied. Must accompany
                 // `header_read_timeout`, not be assumed.
                 .timer(hyper_util::rt::TokioTimer::new())
                 // Caps the time a client may take to send the request
-                // head — the direct slowloris defence.
+                // head — the direct slowloris defence. There is no h2
+                // equivalent above, deliberately; see the keep-alive note.
                 .header_read_timeout(*header_read_timeout)
                 .serve_connection(TokioIo::new(stream), svc)
                 .await
