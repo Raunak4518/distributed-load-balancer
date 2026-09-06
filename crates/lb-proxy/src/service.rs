@@ -160,6 +160,49 @@ async fn read_bounded(body: Incoming, max_bytes: usize) -> Result<Bytes, ()> {
     }
 }
 
+/// Removes hop-by-hop headers, which describe a single connection rather than
+/// the message.
+///
+/// HTTP/2 forbids them outright and a client may reject a response carrying
+/// one. Before this phase the question never arose — an HTTP/1.1 backend's
+/// response went to an HTTP/1.1 client and both ends tolerated it — but an
+/// HTTP/1.1 backend's response can now land on an HTTP/2 stream.
+///
+/// Applied unconditionally rather than only for HTTP/2 clients: these headers
+/// were never correct to forward, HTTP/1.1 was simply tolerant of the
+/// mistake, and one code path is one behaviour to test.
+fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
+    const ALWAYS: [&str; 8] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+    ];
+
+    // `Connection` may *name* further headers that are hop-by-hop for this
+    // hop only. Collect them before removing `Connection` itself.
+    let named: Vec<String> = headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    for name in ALWAYS {
+        headers.remove(name);
+    }
+    headers.remove("upgrade");
+    for name in named {
+        headers.remove(name.as_str());
+    }
+}
+
 /// Rewrites the client's request as the one we send onward.
 ///
 /// `None` means this backend cannot be forwarded to at all -- see the
@@ -187,7 +230,12 @@ fn build_outbound_request(
         .build()
         .expect("backend authority + original path form a valid URI");
     let mut builder = Request::builder().method(parts.method.clone()).uri(uri);
-    for (name, value) in parts.headers.iter() {
+    // Direction: client -> backend. Strip before forwarding so a hop-by-hop
+    // header the client sent us (describing its hop to us) is never carried
+    // onto our hop to the backend.
+    let mut headers = parts.headers.clone();
+    strip_hop_by_hop(&mut headers);
+    for (name, value) in headers.iter() {
         builder = builder.header(name, value);
     }
     Some(
@@ -381,7 +429,11 @@ where
                 // Propagate immediately (not just next request) so a backend
                 // that just recovered is usable again within this same burst.
                 ctx.pool.set_circuit_open(&backend_id, false);
-                let (resp_parts, resp_body) = resp.into_parts();
+                let (mut resp_parts, resp_body) = resp.into_parts();
+                // Direction: backend -> client. Strip before returning so a
+                // hop-by-hop header the backend sent us (describing its hop
+                // to us) is never carried onto our hop to the client.
+                strip_hop_by_hop(&mut resp_parts.headers);
                 return Ok(Response::from_parts(resp_parts, resp_body.boxed()));
             }
             Err(err) => {
@@ -837,5 +889,42 @@ mod tests {
     fn a_re_encrypting_listener_builds_no_request_for_a_nameless_backend() {
         let backend = Backend::new("b1", "10.0.0.5:8443".parse().unwrap(), 1, None);
         assert_eq!(outbound_uri_for(&backend, true), None);
+    }
+
+    #[test]
+    fn hop_by_hop_headers_are_removed() {
+        use hyper::header::{HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "connection",
+            HeaderValue::from_static("keep-alive, x-custom"),
+        );
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("x-custom", HeaderValue::from_static("named-by-connection"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        strip_hop_by_hop(&mut headers);
+
+        for gone in [
+            "connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+            "proxy-connection",
+            // Named inside `Connection`, so hop-by-hop by reference. Missing this
+            // is the subtle half of the rule.
+            "x-custom",
+        ] {
+            assert!(!headers.contains_key(gone), "{gone} survived stripping");
+        }
+        // End-to-end headers must be untouched.
+        assert_eq!(
+            headers.get("content-type").map(|v| v.as_bytes()),
+            Some(&b"application/json"[..])
+        );
     }
 }
