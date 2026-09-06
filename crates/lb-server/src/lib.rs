@@ -1,3 +1,4 @@
+mod first_byte;
 mod limits;
 mod shutdown;
 mod wiring;
@@ -332,11 +333,26 @@ where
                     // frames can become a lot of server-side state.
                     .max_header_list_size(h2.max_header_list_size())
                     .max_frame_size(h2.max_frame_size())
-                    // No header-read timeout here: an idle h2 connection is
-                    // normal, a dead one is not, and PING tells them apart.
+                    // PING polices an *established* connection: once the
+                    // preface has arrived, an idle h2 connection is normal
+                    // and a dead one is not, and PING tells them apart.
+                    // It does not cover the window before that -- hyper
+                    // arms it only after the handshake resolves -- which is
+                    // what `FirstByteDeadline` below is for.
                     .keep_alive_interval(h2.keep_alive_interval())
                     .keep_alive_timeout(h2.keep_alive_timeout())
-                    .serve_connection(TokioIo::new(stream), svc)
+                    // The h2 counterpart of `header_read_timeout`, and the
+                    // same question: how long may a client take to start
+                    // sending? Without it a client that negotiates `h2` and
+                    // then goes silent holds its connection permit and its
+                    // per-IP slot indefinitely, at no cost to itself.
+                    .serve_connection(
+                        TokioIo::new(first_byte::FirstByteDeadline::new(
+                            stream,
+                            *header_read_timeout,
+                        )),
+                        svc,
+                    )
                     .await
                 {
                     tracing::debug!(error = %err, "http/2 client connection error");
