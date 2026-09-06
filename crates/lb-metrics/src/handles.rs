@@ -35,16 +35,41 @@ impl StatusClass {
     }
 }
 
+/// The four status-class counters for one HTTP version.
+///
+/// Split out so `ListenerMetrics` can hold one resolved set per HTTP
+/// version (see `ListenerMetrics::requests_for`) without doubling up on the
+/// four-field boilerplate above.
+pub struct RequestCounters {
+    pub c2xx: IntCounter,
+    pub c3xx: IntCounter,
+    pub c4xx: IntCounter,
+    pub c5xx: IntCounter,
+}
+
+impl RequestCounters {
+    fn record(&self, class: StatusClass) {
+        match class {
+            StatusClass::Success => self.c2xx.inc(),
+            StatusClass::Redirect => self.c3xx.inc(),
+            StatusClass::ClientError => self.c4xx.inc(),
+            StatusClass::ServerError => self.c5xx.inc(),
+        }
+    }
+}
+
 /// Metric handles for one listener, resolved once at wiring time.
 ///
 /// Every field is a concrete handle wrapping an atomic. Recording a request
 /// costs a couple of atomic increments and one histogram observation — no
 /// map lookup, no string hashing, no lock.
 pub struct ListenerMetrics {
-    pub requests_2xx: IntCounter,
-    pub requests_3xx: IntCounter,
-    pub requests_4xx: IntCounter,
-    pub requests_5xx: IntCounter,
+    /// Pre-resolved per HTTP version, so selecting between them on the
+    /// request path is a branch (`requests_for`) rather than a label lookup.
+    /// A TCP listener holds these like every other listener but never
+    /// increments them — it counts connections, not requests.
+    pub requests_h1: RequestCounters,
+    pub requests_h2: RequestCounters,
     pub request_duration: Histogram,
     pub active_connections: IntGauge,
     pub connections_total: IntCounter,
@@ -82,16 +107,36 @@ pub struct ListenerMetrics {
     /// resolving a label pair here is not a hot-path cost the way it would
     /// be per-request or per-handshake.
     pub tls_certificate_expiry_timestamp_seconds: IntGaugeVec,
+
+    // HTTP/2 (Phase 8). `reason` separates ordinary load (a client already
+    // at its concurrent-stream limit opening another) from an attack
+    // pattern (rapid-reset floods) -- the two look nothing alike
+    // operationally and must not share a series. There is deliberately no
+    // active-streams gauge: hyper exposes no per-stream open/close hook on
+    // the server builder, so one would mean wrapping the service to count
+    // entries and exits, which is real drift risk for low value next to the
+    // limit actually being enforced and rejections being counted.
+    pub http2_streams_rejected_concurrency: IntCounter,
+    pub http2_streams_rejected_reset_flood: IntCounter,
 }
 
 impl ListenerMetrics {
-    pub fn record_status(&self, class: StatusClass) {
-        match class {
-            StatusClass::Success => self.requests_2xx.inc(),
-            StatusClass::Redirect => self.requests_3xx.inc(),
-            StatusClass::ClientError => self.requests_4xx.inc(),
-            StatusClass::ServerError => self.requests_5xx.inc(),
+    /// Selects the counters for the version this request arrived on.
+    ///
+    /// A lookup into two already-resolved sets, not a label lookup — the
+    /// `with_label_values` calls all happened once at startup.
+    pub fn requests_for(&self, is_h2: bool) -> &RequestCounters {
+        if is_h2 {
+            &self.requests_h2
+        } else {
+            &self.requests_h1
         }
+    }
+
+    /// Records one completed request's status class under the counters for
+    /// the HTTP version it arrived on.
+    pub fn record_status(&self, is_h2: bool, class: StatusClass) {
+        self.requests_for(is_h2).record(class);
     }
 }
 

@@ -332,7 +332,7 @@ mod tests {
             cluster: None,
             metrics: {
                 let registry = lb_metrics::Metrics::new().expect("metrics registry");
-                Arc::new(registry.listener("test", "tcp"))
+                Arc::new(registry.listener("test"))
             },
             backend_metrics: HashMap::new(),
         })

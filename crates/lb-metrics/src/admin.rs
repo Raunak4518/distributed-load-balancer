@@ -98,8 +98,8 @@ mod tests {
     async fn start(ready: bool) -> (String, Arc<AtomicBool>) {
         let metrics = Arc::new(Metrics::new().unwrap());
         metrics
-            .listener("web", "http")
-            .record_status(StatusClass::Success);
+            .listener("web")
+            .record_status(false, StatusClass::Success);
 
         let flag = Arc::new(AtomicBool::new(ready));
         let flag_clone = Arc::clone(&flag);

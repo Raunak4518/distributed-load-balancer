@@ -227,8 +227,10 @@ where
     // would be a bug waiting to happen.
     if let Ok(resp) = &mut result {
         let status = resp.status();
+        // Task 5 supplies the negotiated HTTP version; `false` (HTTP/1) is
+        // a placeholder so this compiles, not a decision.
         ctx.metrics
-            .record_status(StatusClass::from_code(status.as_u16()));
+            .record_status(false, StatusClass::from_code(status.as_u16()));
         let elapsed = started.elapsed();
         ctx.metrics.request_duration.observe(elapsed.as_secs_f64());
 
@@ -524,7 +526,7 @@ mod tests {
     /// to exist so the hot path stays branch-free.
     fn test_metrics() -> Arc<ListenerMetrics> {
         let registry = lb_metrics::Metrics::new().expect("metrics registry");
-        Arc::new(registry.listener("test", "http"))
+        Arc::new(registry.listener("test"))
     }
 
     #[tokio::test]

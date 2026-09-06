@@ -198,11 +198,7 @@ pub fn build_app(
             .filter_map(|b| b.server_name.clone().map(|name| (name, b.address)))
             .collect();
 
-        let protocol_name = match lc.protocol {
-            Protocol::Http => "http",
-            Protocol::Tcp => "tcp",
-        };
-        let listener_metrics = Arc::new(metrics.listener(&lc.name, protocol_name));
+        let listener_metrics = Arc::new(metrics.listener(&lc.name));
         let connection_limits = ConnectionLimits {
             global: Arc::new(tokio::sync::Semaphore::new(lc.max_connections())),
             per_ip: Arc::new(crate::limits::PerIpLimiter::new(

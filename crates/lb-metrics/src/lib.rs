@@ -2,7 +2,7 @@ mod admin;
 mod handles;
 
 pub use admin::{spawn_admin_server, ReadinessCheck};
-pub use handles::{BackendMetrics, ListenerMetrics, StatusClass};
+pub use handles::{BackendMetrics, ListenerMetrics, RequestCounters, StatusClass};
 
 /// Re-exported so consumer crates can hold metric handles without taking a
 /// direct dependency on the metrics backend.
@@ -45,6 +45,9 @@ pub struct Metrics {
     /// zero here on a plaintext-backend listener would read as "backend TLS
     /// is on and verifying", which is a lie a dashboard would repeat.
     pub backend_tls_verification_disabled: IntGaugeVec,
+
+    // HTTP/2 (Phase 8).
+    http2_streams_rejected: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -202,6 +205,17 @@ impl Metrics {
             &["listener"],
         )?;
 
+        // reason: concurrency | reset_flood. A busy client at its
+        // concurrent-stream limit and a rapid-reset attack look nothing
+        // alike operationally, so they must not share a series.
+        let http2_streams_rejected = IntCounterVec::new(
+            Opts::new(
+                "lb_http2_streams_rejected_total",
+                "HTTP/2 streams refused, by reason",
+            ),
+            &["listener", "reason"],
+        )?;
+
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
         registry.register(Box::new(active_connections.clone()))?;
@@ -222,6 +236,7 @@ impl Metrics {
         registry.register(Box::new(tls_certificate_reloads.clone()))?;
         registry.register(Box::new(tls_certificate_expiry_timestamp_seconds.clone()))?;
         registry.register(Box::new(backend_tls_verification_disabled.clone()))?;
+        registry.register(Box::new(http2_streams_rejected.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -245,25 +260,43 @@ impl Metrics {
             tls_certificate_reloads,
             tls_certificate_expiry_timestamp_seconds,
             backend_tls_verification_disabled,
+            http2_streams_rejected,
         })
+    }
+
+    /// Resolves the four status-class counters for one listener and HTTP
+    /// version. Called only from `listener()`, at startup.
+    fn request_counters(&self, listener: &str, version: &str) -> RequestCounters {
+        RequestCounters {
+            c2xx: self
+                .requests_total
+                .with_label_values(&[listener, version, "2xx"]),
+            c3xx: self
+                .requests_total
+                .with_label_values(&[listener, version, "3xx"]),
+            c4xx: self
+                .requests_total
+                .with_label_values(&[listener, version, "4xx"]),
+            c5xx: self
+                .requests_total
+                .with_label_values(&[listener, version, "5xx"]),
+        }
     }
 
     /// Resolve one listener's handles. Called once per listener at startup —
     /// never on the request path.
-    pub fn listener(&self, name: &str, protocol: &str) -> ListenerMetrics {
+    ///
+    /// Both HTTP versions are always resolved, for every listener, using the
+    /// literal version strings `"http1"`/`"http2"` — a TCP listener holds
+    /// these like any other but simply never increments them, exactly as it
+    /// never incremented the old undifferentiated counter: it counts
+    /// connections, not requests. This keeps the request path a branch
+    /// (`ListenerMetrics::requests_for`) instead of a protocol-conditional
+    /// field set.
+    pub fn listener(&self, name: &str) -> ListenerMetrics {
         ListenerMetrics {
-            requests_2xx: self
-                .requests_total
-                .with_label_values(&[name, protocol, "2xx"]),
-            requests_3xx: self
-                .requests_total
-                .with_label_values(&[name, protocol, "3xx"]),
-            requests_4xx: self
-                .requests_total
-                .with_label_values(&[name, protocol, "4xx"]),
-            requests_5xx: self
-                .requests_total
-                .with_label_values(&[name, protocol, "5xx"]),
+            requests_h1: self.request_counters(name, "http1"),
+            requests_h2: self.request_counters(name, "http2"),
             request_duration: self.request_duration.with_label_values(&[name]),
             active_connections: self.active_connections.with_label_values(&[name]),
             connections_total: self.connections_total.with_label_values(&[name]),
@@ -300,6 +333,12 @@ impl Metrics {
             tls_certificate_expiry_timestamp_seconds: self
                 .tls_certificate_expiry_timestamp_seconds
                 .clone(),
+            http2_streams_rejected_concurrency: self
+                .http2_streams_rejected
+                .with_label_values(&[name, "concurrency"]),
+            http2_streams_rejected_reset_flood: self
+                .http2_streams_rejected
+                .with_label_values(&[name, "reset_flood"]),
         }
     }
 
@@ -351,9 +390,9 @@ mod tests {
     #[test]
     fn recording_a_request_shows_up_in_exposition() {
         let metrics = Metrics::new().unwrap();
-        let listener = metrics.listener("web", "http");
-        listener.record_status(StatusClass::Success);
-        listener.record_status(StatusClass::ServerError);
+        let listener = metrics.listener("web");
+        listener.record_status(false, StatusClass::Success);
+        listener.record_status(false, StatusClass::ServerError);
 
         let text = metrics.gather_text();
         assert!(
@@ -369,7 +408,7 @@ mod tests {
     #[test]
     fn rate_limit_layers_are_counted_separately() {
         let metrics = Metrics::new().unwrap();
-        let listener = metrics.listener("web", "http");
+        let listener = metrics.listener("web");
         listener.ratelimit_rejected_local.inc();
         listener.ratelimit_rejected_cluster.inc();
         listener.ratelimit_rejected_cluster.inc();
@@ -403,8 +442,8 @@ mod tests {
     fn exposition_is_valid_prometheus_text_format() {
         let metrics = Metrics::new().unwrap();
         metrics
-            .listener("web", "http")
-            .record_status(StatusClass::Success);
+            .listener("web")
+            .record_status(false, StatusClass::Success);
         let text = metrics.gather_text();
 
         // Every metric family carries HELP and TYPE lines, and no line is
@@ -425,7 +464,7 @@ mod tests {
     #[test]
     fn edge_hardening_metrics_are_exposed() {
         let metrics = Metrics::new().unwrap();
-        let l = metrics.listener("web", "http");
+        let l = metrics.listener("web");
         l.connections_rejected_max.inc();
         l.connections_rejected_per_ip.inc();
         l.connections_rejected_per_ip.inc();
@@ -456,7 +495,7 @@ mod tests {
     #[test]
     fn tls_certificate_reload_and_expiry_metrics_are_exposed() {
         let metrics = Metrics::new().unwrap();
-        let l = metrics.listener("web", "http");
+        let l = metrics.listener("web");
         l.tls_certificate_reloads_applied.inc();
         l.tls_certificate_reloads_unchanged.inc();
         l.tls_certificate_reloads_unchanged.inc();
@@ -500,7 +539,7 @@ mod tests {
     #[test]
     fn tls_handshake_outcomes_are_counted_separately() {
         let metrics = Metrics::new().unwrap();
-        let l = metrics.listener("web", "http");
+        let l = metrics.listener("web");
         l.tls_handshakes_success.inc();
         l.tls_handshakes_failed.inc();
         l.tls_handshakes_failed.inc();
@@ -556,6 +595,59 @@ mod tests {
         );
     }
 
+    /// The `protocol` label on `lb_requests_total` used to carry the
+    /// listener's kind (always "http" for this metric, since TCP listeners
+    /// never increment it). It now carries the HTTP version instead, so
+    /// "is anyone actually using h2" is answerable from an existing counter
+    /// rather than a new one.
+    #[test]
+    fn request_counters_are_separated_by_http_version() {
+        let metrics = Metrics::new().unwrap();
+        let m = metrics.listener("web");
+
+        m.requests_for(false).c2xx.inc();
+        m.requests_for(true).c2xx.inc();
+        m.requests_for(true).c5xx.inc();
+
+        let body = metrics.gather_text();
+        assert!(
+            body.contains(r#"lb_requests_total{listener="web",protocol="http1",status="2xx"} 1"#),
+            "missing http1 2xx series:\n{body}"
+        );
+        assert!(
+            body.contains(r#"lb_requests_total{listener="web",protocol="http2",status="2xx"} 1"#),
+            "missing http2 2xx series:\n{body}"
+        );
+        assert!(
+            body.contains(r#"lb_requests_total{listener="web",protocol="http2",status="5xx"} 1"#),
+            "missing http2 5xx series:\n{body}"
+        );
+    }
+
+    /// A busy client and an attack look nothing alike operationally, so they
+    /// must not share a series.
+    #[test]
+    fn http2_stream_rejections_distinguish_load_from_attack() {
+        let metrics = Metrics::new().unwrap();
+        let m = metrics.listener("web");
+        m.http2_streams_rejected_concurrency.inc();
+        m.http2_streams_rejected_reset_flood.inc();
+
+        let body = metrics.gather_text();
+        assert!(
+            body.contains(
+                r#"lb_http2_streams_rejected_total{listener="web",reason="concurrency"} 1"#
+            ),
+            "missing concurrency rejection series:\n{body}"
+        );
+        assert!(
+            body.contains(
+                r#"lb_http2_streams_rejected_total{listener="web",reason="reset_flood"} 1"#
+            ),
+            "missing reset-flood rejection series:\n{body}"
+        );
+    }
+
     /// Encodes spec section 2.3 as an executable rule: every label name in the
     /// exposition must come from a known, config-derived set. A client IP or
     /// path label would explode Prometheus's series count.
@@ -563,8 +655,8 @@ mod tests {
     fn no_unbounded_label_names_are_exposed() {
         let metrics = Metrics::new().unwrap();
         metrics
-            .listener("web", "http")
-            .record_status(StatusClass::Success);
+            .listener("web")
+            .record_status(false, StatusClass::Success);
         metrics.backend("web", "b1").healthy.set(1);
         metrics
             .cluster_peer_sync
@@ -574,13 +666,13 @@ mod tests {
             .cluster_auth_failures
             .with_label_values(&["10.0.0.2:7946"])
             .inc();
-        let hardening = metrics.listener("web", "http");
+        let hardening = metrics.listener("web");
         hardening.connections_rejected_max.inc();
         hardening.connections_rejected_per_ip.inc();
         hardening.timeouts_header.inc();
         hardening.timeouts_body.inc();
         hardening.tracked_keys.set(42);
-        let tls = metrics.listener("web", "http");
+        let tls = metrics.listener("web");
         tls.tls_handshakes_success.inc();
         tls.tls_handshakes_failed.inc();
         tls.tls_handshakes_timeout.inc();
