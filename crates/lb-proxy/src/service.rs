@@ -262,6 +262,10 @@ where
     // collide log entries.
     let request_id = uuid::Uuid::new_v4();
     let method = req.method().clone();
+    // Read before `req` is moved into `handle_inner`. hyper sets this from
+    // the connection that carried the request, so it is the negotiated
+    // protocol rather than anything the client can assert in a header.
+    let is_h2 = req.version() == hyper::Version::HTTP_2;
     let path = req
         .uri()
         .path_and_query()
@@ -275,10 +279,8 @@ where
     // would be a bug waiting to happen.
     if let Ok(resp) = &mut result {
         let status = resp.status();
-        // Task 5 supplies the negotiated HTTP version; `false` (HTTP/1) is
-        // a placeholder so this compiles, not a decision.
         ctx.metrics
-            .record_status(false, StatusClass::from_code(status.as_u16()));
+            .record_status(is_h2, StatusClass::from_code(status.as_u16()));
         let elapsed = started.elapsed();
         ctx.metrics.request_duration.observe(elapsed.as_secs_f64());
 

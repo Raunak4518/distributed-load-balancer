@@ -67,3 +67,11 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
     "logging",
 ] }
+# Raw HTTP/2, for the two attacks in `http2_integration.rs` that no HTTP
+# client will perform: cancelling a request the instant it is made (Rapid
+# Reset, CVE-2023-44487), and opening more concurrent streams than the server
+# advertised. reqwest cannot express either -- it is a conforming client, and
+# both are definitionally non-conforming. Already in the lock as hyper's own
+# h2 implementation, so this adds no crate; no TLS features exist on it, so it
+# is no route for aws-lc-rs either.
+h2 = "0.4"
