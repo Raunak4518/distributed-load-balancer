@@ -1,4 +1,5 @@
 use crate::error::ConfigError;
+use crate::http2::Http2Config;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -173,6 +174,8 @@ pub struct ListenerConfig {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub backend_tls: Option<BackendTlsConfig>,
+    #[serde(default)]
+    pub http2: Option<Http2Config>,
 
     pub backends: Vec<BackendConfig>,
     pub health_check: HealthCheckConfig,
@@ -217,6 +220,18 @@ impl ListenerConfig {
     /// is not a bound: 1 MiB at one byte per second is eleven days.
     pub fn body_read_timeout(&self) -> Duration {
         Duration::from_millis(self.body_read_timeout_ms.unwrap_or(10_000))
+    }
+
+    /// Whether this listener serves HTTP/2.
+    ///
+    /// The TLS requirement lives here, in one place, rather than being
+    /// re-derived at each call site: HTTP/2 is negotiated over ALPN, ALPN
+    /// only exists inside a TLS handshake, and this node is the edge — so a
+    /// plaintext listener is HTTP/1.1 regardless of what the config says.
+    pub fn http2_enabled(&self) -> bool {
+        self.protocol == Protocol::Http
+            && self.tls.is_some()
+            && self.http2.as_ref().map(|h| h.enabled()).unwrap_or(true)
     }
 }
 
@@ -642,6 +657,23 @@ impl ListenerConfig {
             if tls.certificates.is_empty() {
                 return Err(invalid(
                     "[listeners.tls] needs at least one certificate".into(),
+                ));
+            }
+        }
+        if let Some(h2) = &self.http2 {
+            if self.protocol == Protocol::Tcp {
+                return Err(invalid(
+                    "http2 settings are meaningless on a tcp listener — HTTP/2 is \
+                     an application protocol and the L4 data plane does not parse one"
+                        .to_string(),
+                ));
+            }
+            if h2.max_concurrent_streams() == 0 {
+                return Err(invalid(
+                    "http2.max_concurrent_streams must be greater than 0 — zero \
+                     advertises that no streams may be opened, which accepts \
+                     connections and then serves nothing"
+                        .to_string(),
                 ));
             }
         }
@@ -1256,5 +1288,246 @@ listen = "0.0.0.0:443"
             TlsVersion::Tls13
         );
         assert!(TlsVersion::try_from("1.1".to_string()).is_err());
+    }
+
+    /// Full valid config for a TLS-terminating HTTP listener with no
+    /// `[listeners.http2]` section at all.
+    fn tls_listener_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.tls]
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "/etc/lb/a.crt"
+    key_file = "/etc/lb/a.key"
+    hostnames = ["example.com"]
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    /// Same TLS listener as `tls_listener_toml`, but with HTTP/2 explicitly
+    /// switched off.
+    fn tls_listener_with_http2_disabled_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.tls]
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "/etc/lb/a.crt"
+    key_file = "/etc/lb/a.key"
+    hostnames = ["example.com"]
+
+  [listeners.http2]
+  enabled = false
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    /// Full valid config for a plaintext (no `tls` section) HTTP listener.
+    fn plaintext_listener_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:8080"
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    /// Full valid config for a TCP listener that also carries an
+    /// `[listeners.http2]` section -- a combination that must be rejected,
+    /// since the L4 data plane has no application protocol to speak HTTP/2
+    /// over.
+    fn tcp_listener_with_http2_toml() -> String {
+        r#"
+[[listeners]]
+name = "postgres"
+protocol = "tcp"
+listen = "0.0.0.0:5432"
+
+  [listeners.http2]
+  max_concurrent_streams = 64
+
+  [[listeners.backends]]
+  id = "pg1"
+  address = "10.0.0.5:5432"
+
+  [listeners.health_check]
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    /// Full valid config for a TLS listener whose `[listeners.http2]`
+    /// section sets `max_concurrent_streams = 0`.
+    fn tls_listener_with_zero_streams_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.tls]
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "/etc/lb/a.crt"
+    key_file = "/etc/lb/a.key"
+    hostnames = ["example.com"]
+
+  [listeners.http2]
+  max_concurrent_streams = 0
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn http2_defaults_are_safe_without_configuration() {
+        let config = Config::parse(&tls_listener_toml()).unwrap();
+        let listener = &config.listeners[0];
+        // A TLS listener gets HTTP/2 and every protection without the operator
+        // writing an [listeners.http2] section at all.
+        assert!(listener.http2_enabled());
+
+        let h2 = listener.http2.clone().unwrap_or_default();
+        assert_eq!(h2.max_concurrent_streams(), 128);
+        assert_eq!(h2.max_pending_accept_reset_streams(), 32);
+        assert_eq!(h2.max_local_error_reset_streams(), 128);
+        assert_eq!(h2.max_header_list_size(), 16384);
+        assert_eq!(h2.max_frame_size(), 16384);
+        assert_eq!(h2.keep_alive_interval(), Duration::from_secs(20));
+        assert_eq!(h2.keep_alive_timeout(), Duration::from_secs(10));
+        assert!(!h2.backend_h2c());
+    }
+
+    #[test]
+    fn http2_can_be_disabled_on_a_tls_listener() {
+        let config = Config::parse(&tls_listener_with_http2_disabled_toml()).unwrap();
+        assert!(!config.listeners[0].http2_enabled());
+    }
+
+    #[test]
+    fn a_plaintext_listener_never_enables_http2() {
+        // No ALPN without TLS, and this node is the edge -- h2c on an
+        // unencrypted public port is attack surface nobody asked for.
+        let config = Config::parse(&plaintext_listener_toml()).unwrap();
+        assert!(!config.listeners[0].http2_enabled());
+    }
+
+    #[test]
+    fn http2_is_rejected_on_a_tcp_listener() {
+        let err = Config::parse(&tcp_listener_with_http2_toml())
+            .unwrap_err()
+            .to_string();
+        // HTTP/2 is an application protocol; the L4 data plane does not parse one.
+        assert!(err.contains("http2"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_zero_max_concurrent_streams_is_rejected() {
+        // Zero would advertise "you may open no streams", which is a listener
+        // that accepts connections and then serves nothing -- worse than being
+        // switched off, because it looks healthy.
+        let err = Config::parse(&tls_listener_with_zero_streams_toml())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("max_concurrent_streams"),
+            "unhelpful error: {err}"
+        );
     }
 }

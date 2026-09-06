@@ -5,6 +5,7 @@ pub mod cluster;
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod http2;
 pub mod pool;
 pub mod ratelimit;
 pub mod transport;
@@ -23,6 +24,7 @@ pub use config::{
 };
 pub use error::ConfigError;
 pub use health::HealthProbe;
+pub use http2::Http2Config;
 pub use pool::BackendPool;
 pub use ratelimit::{Decision, RateLimiter};
 pub use transport::{OutboundTransport, ProbeClient, ProbeFuture, ProxyStream, WrapFuture};
