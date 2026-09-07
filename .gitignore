@@ -1,6 +1,7 @@
 /target/
 **/*.rs.bk
 config.toml
-docs
+
 # Subagent-driven-development scratch (ledger, briefs, review packages)
 .superpowers/
+docs/superpowers
