@@ -5,3 +5,6 @@ config.toml
 # Subagent-driven-development scratch (ledger, briefs, review packages)
 .superpowers/
 docs/superpowers
+
+# graphify generated output (graph.json, graph.html, report)
+graphify-out/
