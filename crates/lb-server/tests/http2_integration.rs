@@ -514,6 +514,40 @@ async fn requests_are_counted_under_the_version_they_arrived_on() {
     );
 }
 
+/// Issues `n` requests over a single HTTP/2 connection and returns their
+/// statuses, in the order the requests were made.
+///
+/// Every request is put on the wire before any response is awaited, so these
+/// are genuinely concurrent streams on one connection rather than `n`
+/// round-trips that merely happen to reuse a socket.
+async fn statuses_over_one_h2_connection(addr: SocketAddr, n: usize) -> Vec<u16> {
+    let tls = tls_connect_h2(addr).await;
+    let (mut send, connection) = h2::client::handshake(tls).await.unwrap();
+    let driver = tokio::spawn(connection);
+
+    let url = format!("https://localhost:{}/", addr.port());
+    let mut pending = Vec::new();
+    for _ in 0..n {
+        send = send.ready().await.expect("h2 connection failed");
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(())
+            .unwrap();
+        let (response, _body) = send.send_request(req, true).expect("send_request");
+        pending.push(response);
+    }
+
+    let mut statuses = Vec::new();
+    for response in pending {
+        statuses.push(response.await.expect("no response").status().as_u16());
+    }
+
+    drop(send);
+    driver.abort();
+    statuses
+}
+
 /// Multiplexing does not buy a client a way around the rate limiter.
 ///
 /// The obvious worry about HTTP/2 is that limits keyed on a connection stop
@@ -522,40 +556,42 @@ async fn requests_are_counted_under_the_version_they_arrived_on() {
 /// — but that is a claim about where a call sits in the code, and this is the
 /// test that turns it into a fact. It would fail if a future change moved the
 /// check to connection scope.
+///
+/// The single connection is the whole test, so it is established by
+/// construction rather than assumed. An earlier version issued the five
+/// requests through a pooled `reqwest` client, which produced identical
+/// statuses whether the pool reused one connection or opened five — meaning
+/// it would have passed just as happily against a per-*connection* limiter,
+/// which is the one thing its name claims to rule out. `tls_connect_h2` opens
+/// exactly one socket, and every stream below is multiplexed onto it.
 #[tokio::test]
 async fn http2_requests_are_rate_limited_per_request_not_per_connection() {
     let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
-    // burst = 3: the fourth request on the SAME connection must be refused.
+    // burst = 3: the fourth and fifth requests on the SAME connection must be
+    // refused.
     let config =
         Config::parse(&tls_config_with_rate_limit(listen, backend, &cert, &key, 3)).unwrap();
     tokio::spawn(lb_server::run(config));
     support::wait_until_listening(listen).await;
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let url = format!("https://localhost:{}/", listen.port());
+    let statuses = statuses_over_one_h2_connection(listen, 5).await;
 
-    let mut statuses = Vec::new();
-    for _ in 0..5 {
-        let resp = client.get(&url).send().await.unwrap();
-        // Asserted per response, not once: a client that silently downgraded
-        // to HTTP/1.1 partway through would leave this test proving nothing
-        // about multiplexing at all.
-        assert_eq!(resp.version(), reqwest::Version::HTTP_2);
-        statuses.push(resp.status().as_u16());
-    }
-
-    assert!(
-        statuses.contains(&429),
-        "multiplexed requests bypassed the rate limiter: {statuses:?}"
+    // Counted rather than positional. The five streams are served
+    // concurrently, so which of them loses the race for the third token is
+    // not fixed -- but that exactly three tokens exist is.
+    let allowed = statuses.iter().filter(|s| **s == 200).count();
+    let refused = statuses.iter().filter(|s| **s == 429).count();
+    assert_eq!(
+        (allowed, refused),
+        (3, 2),
+        "five multiplexed requests against burst = 3 produced {statuses:?}"
     );
-    assert!(
-        count.load(Ordering::SeqCst) < 5,
-        "every request reached the backend despite the limit"
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        3,
+        "the refused requests still reached the backend"
     );
 }
 
@@ -930,6 +966,12 @@ async fn max_concurrent_streams_is_enforced_on_the_wire() {
         "the backend answered a request it was supposed to be holding open"
     );
 
-    release.send(true).unwrap();
+    // Deliberately not `unwrap`ed. `watch::Sender::send` fails when no
+    // receiver is live, and the receivers here are created per request inside
+    // the blocked handlers -- so the loop above, which drops two
+    // `ResponseFuture`s and resets their streams, can leave the channel with
+    // zero receivers. Unwrapping would turn an ordinary teardown into a
+    // spurious failure in the one test that most needs to be trustworthy.
+    let _ = release.send(true);
     driver.abort();
 }

@@ -42,8 +42,27 @@ impl Http2Config {
     /// immediately cancels them. Cancellation is nearly free for the client
     /// and expensive for us, and cancelled streams evade
     /// `max_concurrent_streams` precisely by not being concurrent.
+    ///
+    /// Twenty is deliberately h2's own built-in default
+    /// (`DEFAULT_REMOTE_RESET_STREAM_MAX`), and the number is pinned from
+    /// both directions:
+    ///
+    /// * Not higher. A looser default would be inert — h2 applies its own
+    ///   bound when hyper is given none, so anything above 20 is a number we
+    ///   claim to enforce while the library enforces something stricter. The
+    ///   previous default of 32 was exactly that, and it made "safe
+    ///   unconfigured" the library's promise rather than ours.
+    /// * Not lower. Cancelling a stream is legitimate: a browser navigating
+    ///   away, an abandoned image load, a user hitting stop. Tightening this
+    ///   below what h2 itself considers ordinary starts cutting real clients
+    ///   off mid-session, and a mitigation that produces its own outage is
+    ///   not a mitigation.
+    ///
+    /// Operators who want a stricter bound can set one; the point is that the
+    /// unconfigured value is the one number that is defensible without
+    /// knowing the traffic.
     pub fn max_pending_accept_reset_streams(&self) -> usize {
-        self.max_pending_accept_reset_streams.unwrap_or(32)
+        self.max_pending_accept_reset_streams.unwrap_or(20)
     }
 
     pub fn max_local_error_reset_streams(&self) -> usize {

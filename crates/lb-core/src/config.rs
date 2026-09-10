@@ -1485,7 +1485,11 @@ listen = "0.0.0.0:443"
 
         let h2 = listener.http2.clone().unwrap_or_default();
         assert_eq!(h2.max_concurrent_streams(), 128);
-        assert_eq!(h2.max_pending_accept_reset_streams(), 32);
+        // Matches h2's own built-in bound rather than sitting above it. A
+        // default looser than the library's buys nothing: the library would
+        // clamp first, and "safe unconfigured" would be the library's claim
+        // rather than ours.
+        assert_eq!(h2.max_pending_accept_reset_streams(), 20);
         assert_eq!(h2.max_local_error_reset_streams(), 128);
         assert_eq!(h2.max_header_list_size(), 16384);
         assert_eq!(h2.max_frame_size(), 16384);
