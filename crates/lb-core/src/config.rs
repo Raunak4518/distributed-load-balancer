@@ -676,6 +676,14 @@ impl ListenerConfig {
                         .to_string(),
                 ));
             }
+            if h2.backend_h2c() && self.backend_tls.is_some() {
+                return Err(invalid(
+                    "http2.backend_h2c cannot be combined with backend_tls — a TLS \
+                     backend negotiates HTTP/2 over ALPN automatically, so \
+                     backend_h2c is only for plaintext backends"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1533,5 +1541,14 @@ listen = "0.0.0.0:443"
             err.contains("max_concurrent_streams"),
             "unhelpful error: {err}"
         );
+    }
+
+    #[test]
+    fn backend_h2c_with_backend_tls_is_rejected() {
+        let mut toml = tls_backend_toml(Some("web1.internal"), false);
+        toml.push_str("\n  [listeners.http2]\n  backend_h2c = true\n");
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("backend_h2c"), "unhelpful error: {err}");
+        assert!(err.contains("backend_tls"), "unhelpful error: {err}");
     }
 }
