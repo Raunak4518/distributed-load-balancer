@@ -1,6 +1,6 @@
-# Distributed Load Balancer
+# Distributed Load Balancer — Phases 1–8
 
-A multi-protocol load balancer in Rust. Terminates TLS, rate-limits by IP or header, health-checks backends, and forwards traffic over HTTP or raw TCP. Multiple instances share rate-limit counters through a gossip-based CRDT protocol — no central data store required.
+A multi-protocol load balancer in Rust. Terminates TLS, speaks HTTP/1.1 and HTTP/2, rate-limits by IP or header, health-checks backends, and forwards traffic over HTTP or raw TCP. Multiple instances share rate-limit counters through a gossip-based CRDT protocol — no central data store required.
 
 ```
 Client → TLS termination → Rate limiter → Backend selection → Forward
@@ -102,6 +102,35 @@ Full field-by-field reference: [docs/configuration-reference.md](docs/configurat
 ### TCP
 
 Same accept/TLS flow. Source-IP rate limit only (no headers at L4). Backend connection established, then bidirectional pump with `tokio::try_join!` (not `select!` — half-close is preserved). One retry on connect failure.
+
+## HTTP/2
+
+HTTP/2 is negotiated over ALPN during the TLS handshake and is **on by default for every TLS listener** — an operator who writes no `[listeners.http2]` section still gets it, fully protected by the defaults below. Set `[listeners.http2] enabled = false` to keep a TLS listener on HTTP/1.1 only.
+
+A **plaintext listener always stays HTTP/1.1**, deliberately: ALPN only exists inside a TLS handshake, so there is nothing to negotiate over on an unencrypted port. This node is also the edge, so prior-knowledge h2c on a plaintext listener — starting the HTTP/2 preface with no negotiation at all — is surface nobody asked for and isn't offered; `[listeners.http2]` is rejected outright on a `tcp` listener and has no effect if written under a `protocol = "http"` listener with no `[listeners.tls]`.
+
+Which protocol a connection got is decided once, right after the TLS handshake, by reading the negotiated ALPN protocol off the still-concrete `TlsStream` — there is no preface-sniffing. That result feeds two independent things: the `hyper` server builder used to drive the connection (HTTP/1.1's `header_read_timeout`, or HTTP/2's stream limits and PING keep-alive), and the `protocol` label (`http1`/`http2`) recorded on `lb_requests_total` — the same counter every request already incremented, not a new metric.
+
+### Limits
+
+Every field is optional; the values below are the defaults an unconfigured `[listeners.http2]` section gets.
+
+| Setting | Default | Bounds |
+|---|---:|---|
+| `max_concurrent_streams` | 128 | Concurrent requests per connection — the HTTP/2 analogue of `max_connections_per_ip`. Under HTTP/2, one connection carries many concurrent requests, so a per-IP *connection* cap alone no longer bounds per-IP *work*; this is what keeps Phase 5's per-IP hardening meaningful once multiplexing is in play. |
+| `max_pending_accept_reset_streams` | 20 | Rapid Reset (CVE-2023-44487): a client opens streams and cancels them immediately, which evades `max_concurrent_streams` precisely by never being concurrent. 20 is deliberately h2's own built-in default (`DEFAULT_REMOTE_RESET_STREAM_MAX`) — looser is inert, since h2 enforces its own bound underneath regardless, and tighter starts cutting off ordinary client-initiated cancellations. |
+| `max_local_error_reset_streams` | 128 | Bounds resets this side is forced to send back to a client whose frames keep failing protocol validation — h2's own default here is 1024; 128 is deliberately tighter. |
+| `max_header_list_size` | 16384 | Bounds HPACK/`CONTINUATION` expansion, where a few frames can inflate into a lot of server-side header state. |
+| `max_frame_size` | 16384 | Per-frame size ceiling. |
+| `keep_alive_interval_secs` / `keep_alive_timeout_secs` | 20 / 10 | HTTP/2's liveness check, sent as PING frames on an established connection. There is deliberately no `header_read_timeout` equivalent here: an idle HTTP/2 connection is normal where an idle HTTP/1.1 one is not, and PING is what tells the two apart. |
+
+hyper's PING keep-alive only arms once the client's h2 preface has actually arrived, which leaves the window between "TLS handshake done" and "preface received" uncovered — a client that negotiates `h2` and then goes silent would otherwise hold its connection and per-IP slot forever. A `FirstByteDeadline` stream adapter (`crates/lb-server/src/first_byte.rs`) closes that gap by arming a deadline at connection start and disarming it on the first byte read, for both protocols.
+
+### Backends
+
+Backend HTTP/2 needs no configuration when the backend is reached over `[listeners.backend_tls]`: ALPN negotiates `h2` vs. `http/1.1` per connection during the backend handshake, so a mixed fleet — some backends on HTTP/2, some not — works automatically. `[listeners.http2] backend_h2c = true` is for plaintext backends only, which have no ALPN and so no other way to advertise `h2`; it makes every backend connection prior-knowledge HTTP/2 (`http2_only(true)` on the client builder), which is only sound when the backend is known out of band to actually speak it. `backend_h2c` together with `backend_tls` is rejected at config-parse time, since a TLS backend already negotiates HTTP/2 on its own.
+
+Because an HTTP/1.1 backend's response can now land on an HTTP/2 client stream (and vice versa), hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, plus anything named inside `Connection`) are stripped in both directions regardless of which protocol either side used.
 
 ## Observability
 

@@ -75,6 +75,53 @@ body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
 #     # turn a clear failure into a confusing one.
 #     hostnames = ["example.com", "*.example.com"]
 
+# ── HTTP/2 (optional) ────────────────────────────────────────────────────
+# Only takes effect on a listener whose [listeners.tls] above is set: HTTP/2
+# is negotiated over ALPN, ALPN only exists inside a TLS handshake, and this
+# node is the edge, so a plaintext listener stays HTTP/1.1 regardless of
+# what is written here. Every field below has a safe default, so a TLS
+# listener with no [listeners.http2] section at all still serves HTTP/2,
+# fully protected.
+# [listeners.http2]
+#   # HTTP/2 is on by default for a TLS listener. Set false to keep this
+#   # listener on HTTP/1.1 only.
+#   enabled = true
+#   # Concurrent requests per connection. This is the HTTP/2 analogue of
+#   # max_connections_per_ip above: one HTTP/2 connection multiplexes many
+#   # requests over a single socket, so a per-IP *connection* cap alone no
+#   # longer bounds per-IP *work* the way it did under HTTP/1.1. This is
+#   # the setting that keeps that bound meaningful again.
+#   max_concurrent_streams = 128
+#   # Bounds Rapid Reset (CVE-2023-44487): a client opens streams and
+#   # cancels them immediately, which evades max_concurrent_streams
+#   # precisely by never being concurrent. 20 is deliberately h2's own
+#   # built-in default (DEFAULT_REMOTE_RESET_STREAM_MAX) — higher is inert,
+#   # since h2 enforces its own stricter bound underneath anyway, and lower
+#   # starts cutting off ordinary cancellations (a browser navigating away,
+#   # an abandoned image load) that have nothing to do with an attack.
+#   max_pending_accept_reset_streams = 20
+#   # Bounds resets we ourselves are forced to send back to a client whose
+#   # frames keep failing protocol validation — the same DOS shape as
+#   # above, aimed the other direction. h2's own default is 1024; 128 here
+#   # is deliberately tighter.
+#   max_local_error_reset_streams = 128
+#   # Bounds HPACK and CONTINUATION expansion, where a handful of frames
+#   # can otherwise inflate into a lot of server-side header state.
+#   max_header_list_size = 16384
+#   max_frame_size = 16384
+#   # HTTP/2's liveness check, sent as PING frames on an established
+#   # connection. There is no header_read_timeout equivalent here on
+#   # purpose: an idle HTTP/2 connection is normal where an idle HTTP/1.1
+#   # one is not, and PING is what tells the two apart.
+#   keep_alive_interval_secs = 20
+#   keep_alive_timeout_secs = 10
+#   # Prior-knowledge h2c to a plaintext backend only: such a backend has
+#   # no ALPN to negotiate over and so no other way to advertise h2. A
+#   # backend reached through [listeners.backend_tls] negotiates HTTP/2 via
+#   # ALPN on its own and needs nothing here — setting this alongside
+#   # backend_tls is rejected at config-parse time.
+#   backend_h2c = false
+
 # ── Backend re-encryption (optional) ────────────────────────────────────
 # Uncomment to speak TLS onward to the backends too, not just to the client.
 # Verification is ON by default: encryption without authentication does not
