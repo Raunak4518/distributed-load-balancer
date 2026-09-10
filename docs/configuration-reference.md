@@ -63,7 +63,7 @@ HTTP/2 connection settings.
 
 - `enabled` (boolean, default: true): Advertises `h2` in ALPN negotiation.
 - `max_concurrent_streams` (integer, default: 128): Stream limit per connection.
-- `max_pending_accept_reset_streams` (integer, default: 32): HTTP/2 Rapid Reset mitigation.
+- `max_pending_accept_reset_streams` (integer, default: 20): HTTP/2 Rapid Reset mitigation. Matches h2's own built-in bound: a looser value would be inert, and a tighter one starts cutting clients that cancel streams legitimately.
 - `max_local_error_reset_streams` (integer, default: 128): Limits server-initiated resets.
 - `max_header_list_size` (integer, default: 16384): Bounds HPACK state.
 - `max_frame_size` (integer, default: 16384): Max frame payload.
