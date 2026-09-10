@@ -75,3 +75,10 @@ rustls = { version = "0.23", default-features = false, features = [
 # h2 implementation, so this adds no crate; no TLS features exist on it, so it
 # is no route for aws-lc-rs either.
 h2 = "0.4"
+# `server-auto` (-> server, http1, http2) for `hyper_util::server::conn::auto::Builder`,
+# used only by the backend test fixtures in `http2_integration.rs` that must
+# accept either protocol on one port -- production dispatch (`lb_server::drive`)
+# deliberately picks by ALPN instead of sniffing. Dev-only: resolver 2 keeps
+# these off the shipped binary's hyper-util build, which only ever needs
+# `tokio`.
+hyper-util = { version = "0.1", features = ["server-auto"] }

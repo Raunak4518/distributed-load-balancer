@@ -10,13 +10,13 @@ lb-metrics = { path = "../lb-metrics" }
 lb-tls = { path = "../lb-tls" }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 # hyper-rustls defaults to aws-lc-rs, which needs cmake and a C toolchain
 # unavailable here. Same `ring` selection as every other TLS crate in the
 # graph: they must all agree on one provider or `install_default()`
 # conflicts at runtime.
-hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "tls12"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12"] }
 # For an explicit, infallible empty-trust-store `ClientConfig` on the
 # plaintext (`backend_tls: None`) path in `build_client` -- an empty
 # `RootCertStore` never touches the filesystem or the OS certificate store,

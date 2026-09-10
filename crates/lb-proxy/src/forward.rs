@@ -57,9 +57,15 @@ const MAX_PROBE_BODY_BYTES: usize = 64 * 1024;
 /// silently reintroduces DNS-based backend resolution and lets traffic
 /// follow whatever that name happens to resolve to instead of the pinned
 /// backend. See `resolver::PinnedResolver`.
+///
+/// `backend_h2c` is prior-knowledge HTTP/2 over plaintext: it applies only to
+/// plaintext backends, which have no ALPN to negotiate over and so have no
+/// other way to advertise `h2`. A TLS backend negotiates the protocol via
+/// ALPN regardless of this flag -- see `BackendConnector::wrap_https`.
 pub fn build_client(
     backend_tls: Option<&lb_tls::BackendConnector>,
     server_names: HashMap<String, SocketAddr>,
+    backend_h2c: bool,
 ) -> ProxyClient {
     let mut http = HttpConnector::new_with_resolver(PinnedResolver::new(server_names));
     http.set_connect_timeout(Some(CONNECT_TIMEOUT));
@@ -94,9 +100,17 @@ pub fn build_client(
                 .wrap_connector(http)
         }
     };
-    Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-        .build(connector)
+    let mut builder = Client::builder(TokioExecutor::new());
+    builder.pool_idle_timeout(POOL_IDLE_TIMEOUT);
+    if backend_h2c {
+        // Prior knowledge: no Upgrade dance, no ALPN -- the client just
+        // starts every connection with the HTTP/2 preface. Only sound for a
+        // plaintext backend that is known out of band (i.e. by config) to
+        // speak h2; a TLS backend's protocol is decided by ALPN during the
+        // handshake instead, independent of this flag.
+        builder.http2_only(true);
+    }
+    builder.build(connector)
 }
 
 /// The scheme and authority a request to `backend` must be addressed with.
@@ -288,13 +302,13 @@ mod tests {
     /// failing (intermittently, machine-dependently) if it panicked.
     #[test]
     fn a_plaintext_only_client_builds_without_needing_any_trust_store() {
-        let _client = build_client(None, HashMap::new());
+        let _client = build_client(None, HashMap::new(), false);
     }
 
     #[tokio::test]
     async fn forwards_and_returns_backend_response() {
         let addr = spawn_fixed_response_backend(StatusCode::OK).await;
-        let client = build_client(None, HashMap::new());
+        let client = build_client(None, HashMap::new(), false);
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
@@ -312,7 +326,7 @@ mod tests {
         // unlike most Unix TCP stacks, a closed loopback port does not
         // reliably send an immediate RST, so this test accepts either
         // variant. lb-proxy's own retry logic treats them identically.
-        let client = build_client(None, HashMap::new());
+        let client = build_client(None, HashMap::new(), false);
         let req = Request::builder()
             .uri("http://127.0.0.1:1")
             .body(Full::new(Bytes::new()))
@@ -343,7 +357,7 @@ mod tests {
         // pinned address, since the resolver is what is under test here, not
         // the TLS wrapping (that is `a_client_built_from_a_backend_connector_speaks_https`
         // and the `lb-tls`/`lb-server` handshake tests).
-        let client = build_client(None, server_names);
+        let client = build_client(None, server_names, false);
         let req = Request::builder()
             .uri(format!("http://nowhere.invalid:{}/", addr.port()))
             .body(Full::new(Bytes::new()))
@@ -392,7 +406,7 @@ mod tests {
         use lb_core::ProbeClient;
 
         let addr = spawn_fixed_response_backend(StatusCode::NO_CONTENT).await;
-        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let probe = ProbeCapableClient(build_client(None, HashMap::new(), false));
         let status = probe
             .get(
                 &backend(None, addr),
@@ -413,7 +427,7 @@ mod tests {
         use lb_core::ProbeClient;
 
         let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let probe = ProbeCapableClient(build_client(None, HashMap::new(), false));
         let status = probe
             .get(
                 &backend(None, dead),
@@ -435,7 +449,7 @@ mod tests {
         use lb_core::ProbeClient;
 
         let addr = spawn_fixed_response_backend(StatusCode::OK).await;
-        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let probe = ProbeCapableClient(build_client(None, HashMap::new(), false));
         let status = probe
             .get(
                 &backend(None, addr),
@@ -461,7 +475,7 @@ mod tests {
         use lb_core::ProbeClient;
 
         let addr = spawn_sized_body_backend(MAX_PROBE_BODY_BYTES + 1).await;
-        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let probe = ProbeCapableClient(build_client(None, HashMap::new(), false));
         let status = probe
             .get(
                 &backend(None, addr),
@@ -483,7 +497,7 @@ mod tests {
         use lb_core::ProbeClient;
 
         let addr = spawn_sized_body_backend(MAX_PROBE_BODY_BYTES).await;
-        let probe = ProbeCapableClient(build_client(None, HashMap::new()));
+        let probe = ProbeCapableClient(build_client(None, HashMap::new(), false));
         let status = probe
             .get(
                 &backend(None, addr),

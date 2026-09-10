@@ -8,7 +8,7 @@ use lb_core::Config;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::spawn_counting_backend;
 use tokio::io::AsyncReadExt;
@@ -210,6 +210,313 @@ listen = "{listen}"
   strategy = "round_robin"
 "#
     )
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/2 to backends (Task 6)
+// ---------------------------------------------------------------------------
+
+/// `tls_http_config` plus a `[listeners.backend_tls]` section and a
+/// `server_name` on the backend -- modelled on `tls_integration.rs`'s
+/// fixture of the same name, restated here because integration-test binaries
+/// share no code with each other, only with `support`.
+#[allow(clippy::too_many_arguments)]
+fn backend_tls_config(
+    listen: SocketAddr,
+    backend: SocketAddr,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    ca_file: Option<&std::path::Path>,
+    danger: bool,
+    admin: Option<SocketAddr>,
+    server_name: &str,
+) -> String {
+    let ca_line = match ca_file {
+        Some(p) => format!(
+            "  ca_file = \"{}\"\n",
+            p.display().to_string().replace('\\', "\\\\")
+        ),
+        None => String::new(),
+    };
+    let admin_section = match admin {
+        Some(a) => format!("[admin]\nlisten = \"{a}\"\n"),
+        None => String::new(),
+    };
+    format!(
+        r#"
+{admin_section}
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+
+  [listeners.tls]
+  handshake_timeout_ms = 5000
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "{cert}"
+    key_file = "{key}"
+    hostnames = ["localhost"]
+
+  [listeners.backend_tls]
+  danger_accept_invalid_certs = {danger}
+{ca_line}
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+  server_name = "{server_name}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#,
+        cert = cert.display().to_string().replace('\\', "\\\\"),
+        key = key.display().to_string().replace('\\', "\\\\"),
+    )
+}
+
+/// A TLS backend that records every request's negotiated HTTP version,
+/// advertising `alpn` over ALPN.
+///
+/// Served with `hyper_util::server::conn::auto::Builder`, which sniffs the
+/// connection preface to pick between HTTP/1.1 and HTTP/2 -- a test fixture
+/// may do that; the load balancer's own dispatch (`lb_server::drive`)
+/// deliberately does not, and instead trusts the ALPN outcome, which is
+/// exactly the behaviour under test.
+async fn spawn_tls_backend_recording(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    alpn: &[&[u8]],
+) -> (SocketAddr, Arc<Mutex<Vec<hyper::Version>>>) {
+    lb_tls::install_crypto_provider();
+
+    let tls_cfg = lb_core::TlsConfig {
+        certificates: vec![lb_core::CertificateConfig {
+            name: "backend".into(),
+            cert_file: cert.to_path_buf(),
+            key_file: key.to_path_buf(),
+            hostnames: vec!["backend.internal".into()],
+        }],
+        handshake_timeout_ms: Some(5_000),
+        min_version: None,
+        reload_interval_secs: None,
+        hsts_max_age_secs: None,
+    };
+    let acceptor = Arc::new(lb_tls::TlsAcceptor::new(&tls_cfg, alpn).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let versions: Arc<Mutex<Vec<hyper::Version>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&versions);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let acceptor = Arc::clone(&acceptor);
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let recorded = Arc::clone(&recorded);
+                    async move {
+                        recorded.lock().unwrap().push(req.version());
+                        Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::new())))
+                    }
+                });
+                let io = hyper_util::rt::TokioIo::new(tls);
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, svc)
+                .await;
+            });
+        }
+    });
+    (addr, versions)
+}
+
+/// Advertises `["h2", "http/1.1"]` over ALPN -- the offering half of the
+/// mixed-fleet case.
+async fn spawn_tls_backend_recording_versions(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> (SocketAddr, Arc<Mutex<Vec<hyper::Version>>>) {
+    spawn_tls_backend_recording(cert, key, &[b"h2", b"http/1.1"]).await
+}
+
+/// Advertises only `["http/1.1"]` -- a backend that never offers `h2`.
+async fn spawn_tls_backend_http11_only(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> (SocketAddr, Arc<Mutex<Vec<hyper::Version>>>) {
+    spawn_tls_backend_recording(cert, key, &[b"http/1.1"]).await
+}
+
+/// A plaintext backend served with `hyper::server::conn::http2::Builder`
+/// directly -- prior knowledge, no `h2c` Upgrade dance -- recording every
+/// request's negotiated version the same way the TLS fixtures above do.
+async fn spawn_h2c_backend_recording_versions() -> (SocketAddr, Arc<Mutex<Vec<hyper::Version>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let versions: Arc<Mutex<Vec<hyper::Version>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&versions);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                    let recorded = Arc::clone(&recorded);
+                    async move {
+                        recorded.lock().unwrap().push(req.version());
+                        Ok::<_, Infallible>(hyper::Response::new(Full::new(Bytes::new())))
+                    }
+                });
+                let io = hyper_util::rt::TokioIo::new(stream);
+                let _ =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+            });
+        }
+    });
+    (addr, versions)
+}
+
+/// A TLS backend that speaks h2 is talked to over h2 -- with no
+/// configuration. ALPN negotiates the protocol per connection, so a listener
+/// with no `[listeners.http2]` section (the default `http2_enabled()` is
+/// `true` for a TLS listener) still forwards over HTTP/2 the moment the
+/// backend offers it.
+#[tokio::test]
+async fn a_tls_backend_that_offers_h2_is_used_over_http2() {
+    let (_bdir, bcert, bkey) = cert_files(&["backend.internal"]);
+    let (backend, versions) = spawn_tls_backend_recording_versions(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        Some(&bcert),
+        false,
+        None,
+        "backend.internal",
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Observed at the backend, not inferred from the absence of failure.
+    assert!(
+        versions.lock().unwrap().contains(&hyper::Version::HTTP_2),
+        "backend never saw an HTTP/2 request: {:?}",
+        versions.lock().unwrap()
+    );
+}
+
+/// The mixed-fleet case: a TLS backend that offers only http/1.1 still works,
+/// over HTTP/1.1 -- adding `h2` to the backend ALPN list must not break a
+/// backend that never advertises it.
+#[tokio::test]
+async fn a_tls_backend_without_h2_is_still_served_over_http11() {
+    let (_bdir, bcert, bkey) = cert_files(&["backend.internal"]);
+    let (backend, versions) = spawn_tls_backend_http11_only(&bcert, &bkey).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let config = Config::parse(&backend_tls_config(
+        listen,
+        backend,
+        &cert,
+        &key,
+        Some(&bcert),
+        false,
+        None,
+        "backend.internal",
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        versions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|v| *v == hyper::Version::HTTP_11),
+        "an http/1.1-only backend was sent HTTP/2"
+    );
+}
+
+/// `backend_h2c = true` reaches a plaintext backend over prior-knowledge
+/// HTTP/2 -- the only way a plaintext backend can ever be asked for it, since
+/// it has no ALPN to negotiate over.
+#[tokio::test]
+async fn backend_h2c_talks_prior_knowledge_http2_to_a_plaintext_backend() {
+    let (backend, versions) = spawn_h2c_backend_recording_versions().await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let mut toml = tls_http_config(listen, backend, &cert, &key, 5_000, 5_000);
+    toml.push_str("\n  [listeners.http2]\n  backend_h2c = true\n");
+    let config = Config::parse(&toml).unwrap();
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("https://localhost:{}/", listen.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        versions.lock().unwrap().contains(&hyper::Version::HTTP_2),
+        "plaintext backend never saw h2c despite backend_h2c = true: {:?}",
+        versions.lock().unwrap()
+    );
 }
 
 #[tokio::test]

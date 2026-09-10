@@ -26,7 +26,7 @@ impl BackendConnector {
         // forgotten. Same reasoning, same call, as `TlsAcceptor::new`.
         install_crypto_provider();
 
-        let config = if cfg.danger_accept_invalid_certs {
+        let mut config = if cfg.danger_accept_invalid_certs {
             rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerification))
@@ -73,6 +73,12 @@ impl BackendConnector {
                 .with_no_client_auth()
         };
 
+        // Order is preference. hyper-rustls reports the negotiated protocol to
+        // hyper's connection pool, so a backend that speaks HTTP/2 gets it and one
+        // that does not is served HTTP/1.1 -- per connection, which is why a mixed
+        // TLS fleet needs no configuration at all.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
         Ok(BackendConnector {
             config: Arc::new(config),
             verification_disabled: cfg.danger_accept_invalid_certs,
@@ -107,8 +113,16 @@ impl BackendConnector {
     /// only remaining job is what it says: wrap whatever connector it is
     /// given with this backend's TLS config.
     pub fn wrap_https<H>(&self, http: H) -> hyper_rustls::HttpsConnector<H> {
+        // `HttpsConnectorBuilder::with_tls_config` panics unless
+        // `alpn_protocols` arrives empty -- it derives the list itself from
+        // `enable_http1`/`enable_http2` below, so the `h2`/`http/1.1` list
+        // `self.config` carries (for `tls_connector`, which bypasses this
+        // builder entirely) has to be cleared on this clone first. The
+        // builder reconstructs the identical order, `h2` before `http/1.1`.
+        let mut tls_config = (*self.config).clone();
+        tls_config.alpn_protocols.clear();
         hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config((*self.config).clone())
+            .with_tls_config(tls_config)
             // `https_only()`, not `https_or_http()`: this connector only
             // ever wraps a `backend_tls` listener's client, so plaintext
             // egress should be structurally impossible here, not merely
@@ -118,6 +132,13 @@ impl BackendConnector {
             // where no backend TLS is configured at all.)
             .https_only()
             .enable_http1()
+            // Negotiated per connection over ALPN (the list set above): a
+            // backend that speaks `h2` gets it, one that only speaks
+            // `http/1.1` gets that instead. hyper-rustls reports the outcome
+            // to hyper's connection pool via `negotiated_h2()`, which is what
+            // lets one `Client` serve a mixed TLS fleet with no extra
+            // plumbing on `lb-proxy`'s side.
+            .enable_http2()
             .wrap_connector(http)
     }
 }

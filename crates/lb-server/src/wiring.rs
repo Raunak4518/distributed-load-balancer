@@ -293,7 +293,15 @@ pub fn build_app(
                 // `Arc`-backed handle, so a clone is the same client, not a
                 // copy of one. Two `build_client` calls here would put two
                 // TLS stacks in one listener and let them disagree.
-                let client = lb_proxy::build_client(backend_tls.as_deref(), server_name_addresses);
+                // Prior-knowledge h2c: plaintext backends only, and only
+                // when the operator has said so -- a TLS backend negotiates
+                // via ALPN regardless (see `lb_proxy::build_client`).
+                let backend_h2c = lc.http2.as_ref().map(|h| h.backend_h2c()).unwrap_or(false);
+                let client = lb_proxy::build_client(
+                    backend_tls.as_deref(),
+                    server_name_addresses,
+                    backend_h2c,
+                );
                 let probe_client: Arc<dyn lb_core::ProbeClient> =
                     Arc::new(lb_proxy::ProbeCapableClient(client.clone()));
                 spawn_health_checkers(
