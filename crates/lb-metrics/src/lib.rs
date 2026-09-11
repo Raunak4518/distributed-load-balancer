@@ -45,9 +45,6 @@ pub struct Metrics {
     /// zero here on a plaintext-backend listener would read as "backend TLS
     /// is on and verifying", which is a lie a dashboard would repeat.
     pub backend_tls_verification_disabled: IntGaugeVec,
-
-    // HTTP/2 (Phase 8).
-    http2_streams_rejected: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -205,17 +202,6 @@ impl Metrics {
             &["listener"],
         )?;
 
-        // reason: concurrency | reset_flood. A busy client at its
-        // concurrent-stream limit and a rapid-reset attack look nothing
-        // alike operationally, so they must not share a series.
-        let http2_streams_rejected = IntCounterVec::new(
-            Opts::new(
-                "lb_http2_streams_rejected_total",
-                "HTTP/2 streams refused, by reason",
-            ),
-            &["listener", "reason"],
-        )?;
-
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
         registry.register(Box::new(active_connections.clone()))?;
@@ -236,7 +222,6 @@ impl Metrics {
         registry.register(Box::new(tls_certificate_reloads.clone()))?;
         registry.register(Box::new(tls_certificate_expiry_timestamp_seconds.clone()))?;
         registry.register(Box::new(backend_tls_verification_disabled.clone()))?;
-        registry.register(Box::new(http2_streams_rejected.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -260,7 +245,6 @@ impl Metrics {
             tls_certificate_reloads,
             tls_certificate_expiry_timestamp_seconds,
             backend_tls_verification_disabled,
-            http2_streams_rejected,
         })
     }
 
@@ -333,12 +317,6 @@ impl Metrics {
             tls_certificate_expiry_timestamp_seconds: self
                 .tls_certificate_expiry_timestamp_seconds
                 .clone(),
-            http2_streams_rejected_concurrency: self
-                .http2_streams_rejected
-                .with_label_values(&[name, "concurrency"]),
-            http2_streams_rejected_reset_flood: self
-                .http2_streams_rejected
-                .with_label_values(&[name, "reset_flood"]),
         }
     }
 
@@ -621,30 +599,6 @@ mod tests {
         assert!(
             body.contains(r#"lb_requests_total{listener="web",protocol="http2",status="5xx"} 1"#),
             "missing http2 5xx series:\n{body}"
-        );
-    }
-
-    /// A busy client and an attack look nothing alike operationally, so they
-    /// must not share a series.
-    #[test]
-    fn http2_stream_rejections_distinguish_load_from_attack() {
-        let metrics = Metrics::new().unwrap();
-        let m = metrics.listener("web");
-        m.http2_streams_rejected_concurrency.inc();
-        m.http2_streams_rejected_reset_flood.inc();
-
-        let body = metrics.gather_text();
-        assert!(
-            body.contains(
-                r#"lb_http2_streams_rejected_total{listener="web",reason="concurrency"} 1"#
-            ),
-            "missing concurrency rejection series:\n{body}"
-        );
-        assert!(
-            body.contains(
-                r#"lb_http2_streams_rejected_total{listener="web",reason="reset_flood"} 1"#
-            ),
-            "missing reset-flood rejection series:\n{body}"
         );
     }
 

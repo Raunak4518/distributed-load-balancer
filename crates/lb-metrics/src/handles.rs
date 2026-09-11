@@ -107,17 +107,6 @@ pub struct ListenerMetrics {
     /// resolving a label pair here is not a hot-path cost the way it would
     /// be per-request or per-handshake.
     pub tls_certificate_expiry_timestamp_seconds: IntGaugeVec,
-
-    // HTTP/2 (Phase 8). `reason` separates ordinary load (a client already
-    // at its concurrent-stream limit opening another) from an attack
-    // pattern (rapid-reset floods) -- the two look nothing alike
-    // operationally and must not share a series. There is deliberately no
-    // active-streams gauge: hyper exposes no per-stream open/close hook on
-    // the server builder, so one would mean wrapping the service to count
-    // entries and exits, which is real drift risk for low value next to the
-    // limit actually being enforced and rejections being counted.
-    pub http2_streams_rejected_concurrency: IntCounter,
-    pub http2_streams_rejected_reset_flood: IntCounter,
 }
 
 impl ListenerMetrics {
