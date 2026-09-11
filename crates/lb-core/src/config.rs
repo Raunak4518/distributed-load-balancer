@@ -176,7 +176,10 @@ pub struct ListenerConfig {
     pub backend_tls: Option<BackendTlsConfig>,
     #[serde(default)]
     pub http2: Option<Http2Config>,
+    #[serde(default)]
+    pub dns_discovery: Option<crate::dns::DnsDiscoveryConfig>,
 
+    #[serde(default)]
     pub backends: Vec<BackendConfig>,
     pub health_check: HealthCheckConfig,
     pub rate_limit: RateLimitConfig,
@@ -497,8 +500,24 @@ impl ListenerConfig {
         let invalid =
             |msg: String| ConfigError::Invalid(format!("listener '{}': {msg}", self.name));
 
-        if self.backends.is_empty() {
-            return Err(invalid("at least one backend is required".into()));
+        match (&self.dns_discovery, self.backends.is_empty()) {
+            (Some(_), false) => {
+                return Err(invalid(
+                    "backends and dns_discovery are mutually exclusive — a listener's \
+                     backend set comes from exactly one source"
+                        .into(),
+                ))
+            }
+            (None, true) => return Err(invalid("at least one backend is required".into())),
+            _ => {}
+        }
+        if let Some(dns) = &self.dns_discovery {
+            if dns.name.trim().is_empty() {
+                return Err(invalid("dns_discovery.name must not be empty".into()));
+            }
+            if dns.port == 0 {
+                return Err(invalid("dns_discovery.port must be positive".into()));
+            }
         }
         let mut ids = HashSet::new();
         for b in &self.backends {
@@ -1060,6 +1079,137 @@ listen = "0.0.0.0:443"
   strategy = "round_robin"
 "#
         .to_string()
+    }
+
+    fn dns_discovery_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.dns_discovery]
+  name = "backend.svc.cluster.local"
+  port = 9001
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    fn dns_discovery_with_static_backends_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.dns_discovery]
+  name = "backend.svc.cluster.local"
+  port = 9001
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "127.0.0.1:9001"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    fn dns_discovery_with_empty_name_toml() -> String {
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "0.0.0.0:443"
+
+  [listeners.dns_discovery]
+  name = ""
+  port = 9001
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 1000
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 500
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn dns_discovery_alone_is_a_valid_backend_source() {
+        let config = Config::parse(&dns_discovery_toml()).unwrap();
+        let dns = config.listeners[0].dns_discovery.as_ref().unwrap();
+        assert_eq!(dns.name, "backend.svc.cluster.local");
+        assert_eq!(dns.port, 9001);
+        assert_eq!(dns.poll_interval(), Duration::from_secs(10));
+        assert!(config.listeners[0].backends.is_empty());
+    }
+
+    #[test]
+    fn dns_discovery_and_static_backends_are_mutually_exclusive() {
+        let err = Config::parse(&dns_discovery_with_static_backends_toml())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_listener_with_neither_backends_nor_dns_discovery_is_rejected() {
+        let err = Config::parse(&plain_backend_toml().replace(
+            "  [[listeners.backends]]\n  id = \"b1\"\n  address = \"127.0.0.1:9001\"\n",
+            "",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("at least one backend"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn dns_discovery_with_an_empty_name_is_rejected() {
+        let err = Config::parse(&dns_discovery_with_empty_name_toml())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dns_discovery.name"), "unhelpful error: {err}");
     }
 
     /// Full valid config for a *tcp* listener whose `tls` section turns HSTS
