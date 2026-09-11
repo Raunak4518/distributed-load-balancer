@@ -99,7 +99,12 @@ sudo systemctl enable --now lb-server
 
 **From source**, on anything `rustc`/Tokio supports: `cargo build --release -p lb-server`.
 
-Static, dependency-free binaries for `x86_64` and `aarch64` Linux (musl — run on any distro, any glibc version, containers included) are published on each [GitHub Release](https://github.com/Raunak4518/distributed-load-balancer/releases) by [`.github/workflows/release.yml`](.github/workflows/release.yml).
+**Install script** (Linux or macOS, `x86_64` or `arm64` — picks the right release asset automatically):
+```bash
+curl -fsSL https://raw.githubusercontent.com/Raunak4518/distributed-load-balancer/main/scripts/install.sh | sh
+```
+
+Prebuilt binaries are published on each [GitHub Release](https://github.com/Raunak4518/distributed-load-balancer/releases) by [`.github/workflows/release.yml`](.github/workflows/release.yml): static, dependency-free `musl` builds for `x86_64`/`aarch64` Linux (run on any distro, any glibc version, containers included), and native builds for `x86_64`/`aarch64` (Apple Silicon) macOS.
 
 ## Configuration
 

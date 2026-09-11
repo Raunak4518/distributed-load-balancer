@@ -24,10 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and verifies independently — so it only requires a new
     `dns_discovery.server_name` config field.
 - **Broader platform support**: multi-arch Docker images (`linux/amd64`,
-  `linux/arm64`), a `.github/workflows/release.yml` that also publishes
-  static, dependency-free `musl` binaries for `x86_64` and `aarch64` Linux
-  on each version tag, and a `packaging/systemd/lb-server.service` unit for
-  running from a plain binary on any Linux distribution.
+  `linux/arm64`); a `.github/workflows/release.yml` that publishes static,
+  dependency-free `musl` binaries for `x86_64`/`aarch64` Linux and native
+  binaries for `x86_64`/`aarch64` (Apple Silicon) macOS on each version tag;
+  a `packaging/systemd/lb-server.service` unit for running from a plain
+  binary on any Linux distribution; and `scripts/install.sh`, which detects
+  the host OS/arch and installs the matching release binary in one command.
 
 ## [0.1.0] - 2026-09-11
 

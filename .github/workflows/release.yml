@@ -37,6 +37,33 @@ jobs:
           name: lb-server-${{ matrix.target }}
           path: lb-server-${{ matrix.target }}.tar.gz
 
+  macos:
+    name: Build macOS binary (${{ matrix.target }})
+    runs-on: macos-14
+    strategy:
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p lb-server
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/lb-server dist/lb-server
+          tar -C dist -czf lb-server-${{ matrix.target }}.tar.gz lb-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lb-server-${{ matrix.target }}
+          path: lb-server-${{ matrix.target }}.tar.gz
+
   docker:
     name: Build and push multi-arch image
     runs-on: ubuntu-latest
@@ -77,7 +104,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [binaries, docker]
+    needs: [binaries, macos, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
