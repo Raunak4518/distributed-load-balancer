@@ -6,6 +6,7 @@ pub struct DnsDiscoveryConfig {
     pub name: String,
     pub port: u16,
     pub poll_interval_secs: Option<u64>,
+    pub server_name: Option<String>,
 }
 
 impl DnsDiscoveryConfig {

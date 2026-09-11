@@ -588,6 +588,37 @@ impl ListenerConfig {
         }
 
         if self.backend_tls.is_some() {
+            if let Some(dns) = &self.dns_discovery {
+                if self.protocol == Protocol::Http {
+                    return Err(invalid(
+                        "dns_discovery and backend_tls cannot both be set on an http \
+                         listener — the L7 dial-pinning table is keyed by server_name, \
+                         and dns_discovery can resolve to several addresses sharing one \
+                         name, which would collapse them onto a single pinned address \
+                         and silently defeat load balancing"
+                            .into(),
+                    ));
+                }
+                let Some(name) = dns.server_name.as_deref() else {
+                    return Err(invalid(
+                        "dns_discovery.server_name is required when backend_tls is set"
+                            .into(),
+                    ));
+                };
+                if name.parse::<IpAddr>().is_ok() {
+                    return Err(invalid(format!(
+                        "dns_discovery.server_name = \"{name}\" is an IP address — it \
+                         must be the hostname on the backends' certificate"
+                    )));
+                }
+                let authority = format!("{name}:{}", dns.port);
+                if http::uri::Authority::try_from(authority.as_str()).is_err() {
+                    return Err(invalid(format!(
+                        "dns_discovery.server_name = \"{name}\" cannot form a valid \
+                         authority (check for stray spaces or punctuation)"
+                    )));
+                }
+            }
             // server_name -> first backend id that used it. Duplicate
             // detection is scoped to HTTP below: at L7,
             // `lb_proxy::resolver::PinnedResolver` (the table that pins the
@@ -1170,6 +1201,85 @@ listen = "0.0.0.0:443"
   strategy = "round_robin"
 "#
         .to_string()
+    }
+
+    fn dns_discovery_with_backend_tls_toml(protocol: &str, server_name: Option<&str>) -> String {
+        let server_name_line = match server_name {
+            Some(name) => format!("  server_name = \"{name}\"\n"),
+            None => String::new(),
+        };
+        let health_check = if protocol == "http" {
+            "  path = \"/health\"\n  interval_ms = 1000\n  timeout_ms = 200\n  failure_threshold = 2\n  cooldown_ms = 500\n"
+        } else {
+            "  interval_ms = 1000\n  timeout_ms = 200\n  failure_threshold = 2\n  cooldown_ms = 500\n"
+        };
+        format!(
+            r#"
+[[listeners]]
+name = "web"
+protocol = "{protocol}"
+listen = "0.0.0.0:443"
+
+  [listeners.dns_discovery]
+  name = "backend.svc.cluster.local"
+  port = 9001
+{server_name_line}
+  [listeners.backend_tls]
+  danger_accept_invalid_certs = false
+
+  [listeners.health_check]
+{health_check}
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10
+  burst = 10
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+        )
+    }
+
+    #[test]
+    fn dns_discovery_with_backend_tls_is_rejected_for_http_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("http", Some("backend.internal"));
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains("dial-pinning table"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn dns_discovery_with_backend_tls_requires_a_server_name_for_tcp_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("tcp", None);
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(
+            err.contains("dns_discovery.server_name"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn dns_discovery_backend_tls_server_name_must_not_be_an_ip_for_tcp_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("tcp", Some("203.0.113.7"));
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("IP address"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn dns_discovery_with_backend_tls_and_a_server_name_is_accepted_for_tcp_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("tcp", Some("backend.internal"));
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.listeners[0]
+                .dns_discovery
+                .as_ref()
+                .unwrap()
+                .server_name
+                .as_deref(),
+            Some("backend.internal")
+        );
     }
 
     #[test]
