@@ -70,6 +70,37 @@ cargo test --workspace --features lb-core/test-util
 cargo run --release -p lb-bench
 ```
 
+**CLI flags:**
+```bash
+lb-server --check-config /etc/lb-server/config.toml   # validate and exit
+lb-server --version
+lb-server --help
+```
+
+### Running it
+
+Three ways to run `lb-server`, none tied to a particular platform:
+
+**Docker** (published for `linux/amd64` and `linux/arm64`):
+```bash
+docker run -v $(pwd)/config.toml:/etc/lb-server/config.toml:ro -p 8080:8080 \
+  ghcr.io/raunak4518/distributed-load-balancer:latest
+```
+Or build locally: `docker build -t lb-server .`
+
+**systemd** (any Linux distro, from a prebuilt binary or `cargo build --release`):
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin lb-server
+sudo install -m755 target/release/lb-server /usr/local/bin/lb-server
+sudo mkdir -p /etc/lb-server && sudo cp config.toml /etc/lb-server/config.toml
+sudo cp packaging/systemd/lb-server.service /etc/systemd/system/
+sudo systemctl enable --now lb-server
+```
+
+**From source**, on anything `rustc`/Tokio supports: `cargo build --release -p lb-server`.
+
+Static, dependency-free binaries for `x86_64` and `aarch64` Linux (musl — run on any distro, any glibc version, containers included) are published on each [GitHub Release](https://github.com/Raunak4518/distributed-load-balancer/releases) by [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 ## Configuration
 
 All configuration lives in a single TOML file. A bad config fails the process at startup — no partial or default-assumed settings are served.

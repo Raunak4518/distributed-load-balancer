@@ -1,0 +1,23 @@
+[Unit]
+Description=Distributed Load Balancer
+Documentation=https://github.com/Raunak4518/distributed-load-balancer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lb-server
+Group=lb-server
+ExecStartPre=/usr/local/bin/lb-server --check-config /etc/lb-server/config.toml
+ExecStart=/usr/local/bin/lb-server /etc/lb-server/config.toml
+Restart=on-failure
+RestartSec=2
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/lb-server
+
+[Install]
+WantedBy=multi-user.target
