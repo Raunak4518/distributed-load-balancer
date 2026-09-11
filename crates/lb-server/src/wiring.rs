@@ -199,6 +199,15 @@ pub fn build_app(
         let pool = Arc::new(BackendPool::new(backends.clone()));
         pools.push(Arc::clone(&pool));
 
+        if let Some(dns) = &lc.dns_discovery {
+            background_tasks.push(crate::dns::spawn_dns_poller(
+                crate::dns::TokioResolver,
+                dns.clone(),
+                Arc::clone(&pool),
+                lc.name.clone(),
+            ));
+        }
+
         // Pins the L7 forwarding client's TCP dial to each backend's
         // configured `address`, even though the forwarding authority is that
         // backend's `server_name` (chosen so SNI and hostname verification

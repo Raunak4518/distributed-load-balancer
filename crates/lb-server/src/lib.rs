@@ -1,3 +1,4 @@
+mod dns;
 mod first_byte;
 mod limits;
 mod shutdown;

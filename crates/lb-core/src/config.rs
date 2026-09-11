@@ -601,8 +601,7 @@ impl ListenerConfig {
                 }
                 let Some(name) = dns.server_name.as_deref() else {
                     return Err(invalid(
-                        "dns_discovery.server_name is required when backend_tls is set"
-                            .into(),
+                        "dns_discovery.server_name is required when backend_tls is set".into(),
                     ));
                 };
                 if name.parse::<IpAddr>().is_ok() {
@@ -1244,10 +1243,7 @@ listen = "0.0.0.0:443"
     fn dns_discovery_with_backend_tls_is_rejected_for_http_listeners() {
         let toml = dns_discovery_with_backend_tls_toml("http", Some("backend.internal"));
         let err = Config::parse(&toml).unwrap_err().to_string();
-        assert!(
-            err.contains("dial-pinning table"),
-            "unhelpful error: {err}"
-        );
+        assert!(err.contains("dial-pinning table"), "unhelpful error: {err}");
     }
 
     #[test]
