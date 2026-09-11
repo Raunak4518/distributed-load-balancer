@@ -47,10 +47,8 @@ impl Drop for ConnectionGuard {
 }
 
 impl<R: RateLimiter, L: LoadBalancer, C: Clock> TcpContext<R, L, C> {
-    fn circuit_breaker(&self, id: &BackendId) -> &CircuitBreaker<C> {
-        self.circuit_breakers
-            .get(id)
-            .expect("a circuit breaker is constructed for every configured backend")
+    fn circuit_breaker(&self, id: &BackendId) -> Option<&CircuitBreaker<C>> {
+        self.circuit_breakers.get(id)
     }
 
     /// Same pattern as the HTTP path: the breaker's Open -> HalfOpen
@@ -188,7 +186,9 @@ where
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_success.inc();
                 }
-                ctx.circuit_breaker(&backend_id).record_success();
+                if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
+                    breaker.record_success();
+                }
                 ctx.pool.set_circuit_open(&backend_id, false);
                 outbound = Some(stream);
                 break;
@@ -201,9 +201,10 @@ where
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_failure.inc();
                 }
-                let breaker = ctx.circuit_breaker(&backend_id);
-                breaker.record_failure();
-                ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
+                if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
+                    breaker.record_failure();
+                    ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
+                }
                 if attempt == 1 {
                     return ConnectionOutcome::ConnectFailed;
                 }
@@ -539,7 +540,10 @@ mod tests {
                 bytes_to_client: 5
             }
         );
-        assert!(ctx.circuit_breaker(&BackendId::new("dead")).is_open());
+        assert!(ctx
+            .circuit_breaker(&BackendId::new("dead"))
+            .unwrap()
+            .is_open());
     }
 
     /// The point of the seam: `lb-tcp` never names a TLS crate, it asks
@@ -613,7 +617,10 @@ mod tests {
         );
         // Recorded against the backend whose handshake failed, exactly as a
         // refused connect would have been.
-        assert!(ctx.circuit_breaker(&BackendId::new("first")).is_open());
+        assert!(ctx
+            .circuit_breaker(&BackendId::new("first"))
+            .unwrap()
+            .is_open());
     }
 
     /// Config validation requires a `server_name` on every backend of a

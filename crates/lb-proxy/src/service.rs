@@ -106,10 +106,8 @@ impl AccessLog {
 }
 
 impl<R: RateLimiter, L: LoadBalancer, C: Clock> ProxyContext<R, L, C> {
-    fn circuit_breaker(&self, id: &BackendId) -> &CircuitBreaker<C> {
-        self.circuit_breakers
-            .get(id)
-            .expect("a circuit breaker is constructed for every configured backend")
+    fn circuit_breaker(&self, id: &BackendId) -> Option<&CircuitBreaker<C>> {
+        self.circuit_breakers.get(id)
     }
 }
 
@@ -425,7 +423,9 @@ where
                     bm.upstream_duration
                         .observe(attempt_started.elapsed().as_secs_f64());
                 }
-                ctx.circuit_breaker(&backend_id).record_success();
+                if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
+                    breaker.record_success();
+                }
                 // Propagate immediately (not just next request) so a backend
                 // that just recovered is usable again within this same burst.
                 ctx.pool.set_circuit_open(&backend_id, false);
@@ -443,12 +443,13 @@ where
                         ForwardError::Connect => bm.requests_failure.inc(),
                     }
                 }
-                let breaker = ctx.circuit_breaker(&backend_id);
-                breaker.record_failure();
-                // Propagate immediately so the retry attempt below (if any)
-                // sees a freshly-tripped breaker instead of the stale flag
-                // from the top-of-request refresh.
-                ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
+                if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
+                    breaker.record_failure();
+                    // Propagate immediately so the retry attempt below (if any)
+                    // sees a freshly-tripped breaker instead of the stale flag
+                    // from the top-of-request refresh.
+                    ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
+                }
                 last_status = StatusCode::BAD_GATEWAY;
                 if attempt == 1 {
                     break;
@@ -664,6 +665,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_backend_with_no_circuit_breaker_entry_still_forwards() {
+        let backend_addr = spawn_fixed_response_backend(StatusCode::OK, "hi").await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        let resp = run_through_proxy(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn failed_forward_retries_once_then_returns_502() {
         // FixedPick always points at a port nobody is listening on.
         let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -738,7 +766,7 @@ mod tests {
         // fails, trips its breaker (threshold 1), and retries onto "healthy".
         let resp = run_through_proxy(ctx.clone()).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(ctx.circuit_breaker(&dead.id).is_open());
+        assert!(ctx.circuit_breaker(&dead.id).unwrap().is_open());
         assert!(!pool.is_eligible(&dead.id));
 
         // Now "dead" is excluded up front — the next request goes straight
