@@ -135,7 +135,7 @@ fn bench_circuit_refresh() {
         let breakers = breakers_for(&pool);
         bench(&format!("{n} backend(s)"), ITERATIONS, || {
             // Exactly what lb-proxy::handle does on every request.
-            for id in pool.all_backend_ids() {
+            for id in &pool.all_backend_ids() {
                 if let Some(breaker) = breakers.get(id) {
                     let state = breaker.state();
                     pool.set_circuit_open(id, state == CircuitState::Open);

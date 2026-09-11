@@ -354,7 +354,7 @@ where
     // forwarded to. Refreshing once per request (cheap: a handful of
     // backends, one mutex check each) keeps the pool's view current and lets
     // a backend become eligible for a probe request as soon as it's due.
-    for id in ctx.pool.all_backend_ids() {
+    for id in &ctx.pool.all_backend_ids() {
         if let Some(breaker) = ctx.circuit_breakers.get(id) {
             let state = breaker.state();
             ctx.pool
@@ -402,11 +402,9 @@ where
                 "no healthy backend",
             ));
         };
-        let backend = ctx
-            .pool
-            .backend(&backend_id)
-            .expect("picked id exists in the pool it was picked from")
-            .clone();
+        let Some(backend) = ctx.pool.backend(&backend_id) else {
+            continue;
+        };
         let Some(outbound) =
             build_outbound_request(&parts, bytes.clone(), &backend, ctx.backend_tls)
         else {

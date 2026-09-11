@@ -58,7 +58,7 @@ impl<R: RateLimiter, L: LoadBalancer, C: Clock> TcpContext<R, L, C> {
     /// cached flag has to be refreshed from it or a tripped backend would
     /// stay excluded forever.
     fn refresh_circuit_state(&self) {
-        for id in self.pool.all_backend_ids() {
+        for id in &self.pool.all_backend_ids() {
             if let Some(breaker) = self.circuit_breakers.get(id) {
                 self.pool.set_circuit_open(id, breaker.is_open());
             }
@@ -179,11 +179,9 @@ where
         let Some(backend_id) = ctx.balancer.pick(&ctx.pool) else {
             return ConnectionOutcome::NoBackend;
         };
-        let backend = ctx
-            .pool
-            .backend(&backend_id)
-            .expect("picked id exists in the pool it was picked from")
-            .clone();
+        let Some(backend) = ctx.pool.backend(&backend_id) else {
+            continue;
+        };
 
         match establish(&ctx, &backend).await {
             Some(stream) => {

@@ -22,3 +22,4 @@ http = "1"
 # and adding a feature here would be the first step towards it doing
 # some.
 tokio = { version = "1", default-features = false }
+arc-swap = "1"
