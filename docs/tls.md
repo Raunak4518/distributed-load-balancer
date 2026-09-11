@@ -68,4 +68,4 @@ The `[listeners.http2]` section provides limits for concurrent streams, HPACK he
 
 HTTP/1.1 uses a `header_read_timeout` to defend against slowloris attacks. HTTP/2 does not read headers immediately; hyper's PING keep-alive only arms after the client's preface and SETTINGS arrive. A client can negotiate `h2` and stay silent, holding a connection slot.
 
-`FirstByteDeadline` wraps the incoming stream. It runs a timeout that is disarmed as soon as the first byte arrives, ensuring silent connections are dropped.
+`FirstByteDeadline` wraps the incoming stream. It runs a timeout that is disarmed as soon as the first byte arrives. This does not close the gap fully: the disarm condition is "a byte arrived," not "the preface completed," so a client that sends one byte and then stalls mid-preface still disarms the deadline and is bounded only by the per-IP connection cap, not by anything h2-specific. Raising the disarm threshold to the full 24-byte preface would only move the attacker's cost from one byte to 24 and close nothing structurally; a true deadline on handshake completion is not something hyper exposes.

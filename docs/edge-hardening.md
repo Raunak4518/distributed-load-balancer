@@ -38,7 +38,7 @@ The `max_header_list_size` setting bounds the size of decoded HTTP headers. A ma
 ### First-Byte Deadline
 HTTP/2 does not have a `header_read_timeout`. The server waits for a client preface and `SETTINGS` frame before arming the PING keep-alive. A client can negotiate `h2` and stay silent forever.
 
-`FirstByteDeadline` wraps the connection in a timeout that fires if no data arrives. The deadline is disarmed by the first byte, allowing standard HTTP/2 keep-alive logic to take over.
+`FirstByteDeadline` wraps the connection in a timeout that fires if no data arrives. The deadline is disarmed by the first byte, allowing standard HTTP/2 keep-alive logic to take over -- but "a byte arrived" is not "the preface completed": a client that sends one byte and then stalls mid-preface still disarms it, and from there is bounded only by the per-IP connection cap, not by anything h2-specific. Tightening the disarm condition to the full 24-byte preface would only move the attacker's cost from one byte to 24, not close the gap; a deadline on handshake completion itself is not something hyper exposes.
 
 ## TLS Defenses
 
