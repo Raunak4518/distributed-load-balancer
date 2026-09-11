@@ -679,14 +679,14 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "lb-balancer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lb-core",
 ]
 
 [[package]]
 name = "lb-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lb-balancer",
  "lb-cluster",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "lb-cluster"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dashmap",
  "hmac",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "lb-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "http",
@@ -725,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "lb-healthcheck"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lb-core",
  "lb-metrics",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "lb-metrics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "lb-proxy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "http",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "lb-ratelimit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dashmap",
  "lb-core",
@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "lb-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "lb-tcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "lb-core",
  "lb-healthcheck",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "lb-tls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hyper-rustls",
  "hyper-util",
