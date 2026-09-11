@@ -5,6 +5,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **DNS-based service discovery**: a background poller (`lb-server`'s
+  `TokioResolver`, real `tokio::net::lookup_host` I/O behind the `Resolve`
+  trait) now resolves a `dns_discovery` listener's name on an interval and
+  feeds the results into `BackendPool::apply_resolved`, so a listener's
+  backend set can grow, shrink, or move without a restart.
+  - Safe for TCP listeners and for HTTP listeners without `backend_tls`
+    (both dial straight to the resolved address).
+  - Rejected at config validation for HTTP listeners *with* `backend_tls`:
+    the L7 dial-pinning table (`PinnedResolver`) is keyed by `server_name`,
+    and DNS naturally returns several addresses under one name, which would
+    collapse them onto a single pinned address and silently defeat load
+    balancing. TCP's backend TLS has no such table — each connection dials
+    and verifies independently — so it only requires a new
+    `dns_discovery.server_name` config field.
+- **Broader platform support**: multi-arch Docker images (`linux/amd64`,
+  `linux/arm64`), a `.github/workflows/release.yml` that also publishes
+  static, dependency-free `musl` binaries for `x86_64` and `aarch64` Linux
+  on each version tag, and a `packaging/systemd/lb-server.service` unit for
+  running from a plain binary on any Linux distribution.
+
 ## [0.1.0] - 2026-09-11
 
 Initial release. An 11-crate Rust workspace implementing an L4/L7 load
