@@ -76,21 +76,28 @@ body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
 #     hostnames = ["example.com", "*.example.com"]
 
 # ── HTTP/2 (optional) ────────────────────────────────────────────────────
-# Only takes effect on a listener whose [listeners.tls] above is set: HTTP/2
-# is negotiated over ALPN, ALPN only exists inside a TLS handshake, and this
-# node is the edge, so a plaintext listener stays HTTP/1.1 regardless of
-# what is written here. Every field below has a safe default, so a TLS
-# listener with no [listeners.http2] section at all still serves HTTP/2,
-# fully protected.
+# The client-facing settings below only take effect on a listener whose
+# [listeners.tls] above is set: HTTP/2 is negotiated over ALPN, ALPN only
+# exists inside a TLS handshake, and this node is the edge, so a plaintext
+# listener stays HTTP/1.1 regardless of what is written here. Every field
+# below has a safe default, so a TLS listener with no [listeners.http2]
+# section at all still serves HTTP/2, fully protected. backend_h2c is the
+# one exception -- see its own comment below.
 # [listeners.http2]
 #   # HTTP/2 is on by default for a TLS listener. Set false to keep this
 #   # listener on HTTP/1.1 only.
 #   enabled = true
-#   # Concurrent requests per connection. This is the HTTP/2 analogue of
-#   # max_connections_per_ip above: one HTTP/2 connection multiplexes many
-#   # requests over a single socket, so a per-IP *connection* cap alone no
-#   # longer bounds per-IP *work* the way it did under HTTP/1.1. This is
-#   # the setting that keeps that bound meaningful again.
+#   # Concurrent requests per connection. One HTTP/2 connection multiplexes
+#   # many requests over a single socket, so a per-IP *connection* cap alone
+#   # no longer bounds per-IP *work* the way it did under HTTP/1.1: at the
+#   # defaults, max_connections_per_ip (100) times this (128) puts the
+#   # per-IP concurrency ceiling at 12,800 requests, and since each in-flight
+#   # request buffers its body up to max_request_body_bytes (1 MiB by
+#   # default), that is a per-IP memory ceiling of roughly 12.8 GiB, not the
+#   # ~100 MiB HTTP/1.1 implied. This setting does not restore that bound —
+#   # the mandatory [listeners.rate_limit] does, since it runs before the
+#   # body is read; with key = "source_ip" its burst setting is the real
+#   # per-IP concurrency bound under HTTP/2.
 #   max_concurrent_streams = 128
 #   # Bounds Rapid Reset (CVE-2023-44487): a client opens streams and
 #   # cancels them immediately, which evades max_concurrent_streams
@@ -119,7 +126,12 @@ body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
 #   # no ALPN to negotiate over and so no other way to advertise h2. A
 #   # backend reached through [listeners.backend_tls] negotiates HTTP/2 via
 #   # ALPN on its own and needs nothing here — setting this alongside
-#   # backend_tls is rejected at config-parse time.
+#   # backend_tls is rejected at config-parse time. Unlike every other field
+#   # in this section, backend_h2c works independently of [listeners.tls]
+#   # and of enabled above: it is read straight off this config and applied
+#   # to the outbound backend client regardless of what the frontend
+#   # negotiates, so a plaintext-front, plaintext-h2c-backend listener
+#   # genuinely gets prior-knowledge h2c to its backends.
 #   backend_h2c = false
 
 # ── Backend re-encryption (optional) ────────────────────────────────────

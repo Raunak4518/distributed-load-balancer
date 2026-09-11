@@ -34,7 +34,7 @@ Defines an entry point. You can configure multiple listeners by repeating this b
 - `listen` (string, required): The bind address (e.g., `"0.0.0.0:443"`).
 - `max_connections` (integer, default: 8192): Global concurrent connection cap.
 - `max_connections_per_ip` (integer, default: 64): Concurrent connection cap per source IP.
-- `header_read_timeout_ms` (integer, default: 5000): HTTP/1.1 slowloris defense. Max time to read request headers.
+- `header_read_timeout_ms` (integer, default: 5000): HTTP/1.1 slowloris defense. Max time to read request headers. On an HTTP/2 listener the same value also bounds how long a connection may go without sending its first byte before the h2 preface arrives, via `FirstByteDeadline` — tuning this for HTTP/1.1 moves that budget too.
 - `forward_timeout_ms` (integer, default: 30000): Max time to wait for a backend response (HTTP only).
 - `max_request_body_bytes` (integer, default: 10485760): Request body size limit (HTTP only).
 - `body_read_timeout_ms` (integer, default: 30000): Max time a client can take to send the body (HTTP only).
