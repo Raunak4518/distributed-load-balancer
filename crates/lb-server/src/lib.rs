@@ -1,6 +1,7 @@
 mod dns;
 mod first_byte;
 mod limits;
+mod proxy_protocol;
 pub mod reload;
 mod shutdown;
 mod wiring;
@@ -286,6 +287,29 @@ fn spawn_connection(
         // Held for the life of the connection, handshake included.
         let _permit = permit;
         let _ip_guard = ip_guard;
+
+        let mut stream = stream;
+        let mut peer = peer;
+        if runtime.proxy_protocol() {
+            // Read before anything else on the connection -- a trusted
+            // front-end sends this first, ahead of a TLS ClientHello or a
+            // plaintext request. A missing/malformed header is fatal (see
+            // `proxy_protocol`'s module docs): this listener is only ever
+            // meant to receive connections from that one trusted front-end,
+            // so a header that doesn't parse is either a misconfiguration
+            // or an attempt to bypass per-client rate limiting.
+            match proxy_protocol::read_header(&mut stream).await {
+                Ok(Some(real_client)) => peer = real_client,
+                // LOCAL/UNKNOWN: no real client behind this connection
+                // (e.g. the front-end's own health check) -- the raw peer
+                // is the right fallback.
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!(peer = %peer, error = %err, "invalid proxy protocol header, dropping connection");
+                    return;
+                }
+            }
+        }
 
         let Some(acceptor) = runtime.tls() else {
             // No TLS means no ALPN, and this node is the edge: prior-knowledge

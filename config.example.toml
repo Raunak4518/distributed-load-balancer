@@ -67,6 +67,17 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
                                   # TCP listener gets the same protection from
                                   # idle_timeout_ms below instead.
 
+# proxy_protocol = true
+# Only turn this on when EVERY connection this listener accepts comes from
+# one specific, trusted front-end (another load balancer, an ELB/NLB, a
+# CDN) that always sends a PROXY protocol header (v1 or v2, auto-detected)
+# first, ahead of anything else on the connection. Without it, this
+# listener sees that front-end's own IP as the client -- every request
+# looks like it came from the same source, which breaks per-client rate
+# limiting, access logs, and tracing. A missing or malformed header is
+# treated as fatal (the connection is dropped), not a fallback to the raw
+# TCP peer: that's the whole trust boundary this option is enforcing.
+
 # ── TLS termination (optional) ──────────────────────────────────────────
 # Uncomment to terminate TLS on this listener. Certificates are read from
 # disk and polled for changes on reload_interval_secs, so a renewed
@@ -256,6 +267,10 @@ idle_timeout_ms    = 300000  # applies to both directions of the byte pump --
                               # out the same as one that stops sending
 max_connections        = 10000
 max_connections_per_ip = 100
+
+# proxy_protocol = true
+# See the HTTP listener's comment above -- same option, same trust model,
+# applies identically to a TCP listener.
 
 # ── TLS termination (optional) ──────────────────────────────────────────
 # Same [listeners.tls] shape as the HTTP listener above — see its comments

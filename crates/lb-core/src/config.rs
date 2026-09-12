@@ -224,6 +224,16 @@ pub struct ListenerConfig {
     pub header_read_timeout_ms: Option<u64>,
     pub body_read_timeout_ms: Option<u64>,
 
+    /// Applies to both protocols: a listener behind a trusted front-end
+    /// proxy/ELB reads the real client address from a PROXY protocol
+    /// header (v1 or v2, auto-detected) instead of trusting the immediate
+    /// TCP peer, which would just be that front-end's own address. A hard
+    /// trust boundary, not a best-effort hint: a connection whose header is
+    /// missing or malformed is dropped rather than falling back to the raw
+    /// peer -- see `lb_server::proxy_protocol`'s module docs for why.
+    #[serde(default)]
+    pub proxy_protocol: bool,
+
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     #[serde(default)]
@@ -972,6 +982,29 @@ mod tests {
             format!("{err}").contains("write_timeout_ms"),
             "error should name write_timeout_ms, got: {err}"
         );
+    }
+
+    #[test]
+    fn proxy_protocol_defaults_to_disabled() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(!cfg.listeners[0].proxy_protocol);
+        assert!(!cfg.listeners[1].proxy_protocol);
+    }
+
+    #[test]
+    fn parses_proxy_protocol_on_either_protocol() {
+        let text = VALID
+            .replace(
+                "        listen = \"0.0.0.0:8080\"",
+                "        listen = \"0.0.0.0:8080\"\n        proxy_protocol = true",
+            )
+            .replace(
+                "        listen = \"0.0.0.0:5432\"",
+                "        listen = \"0.0.0.0:5432\"\n        proxy_protocol = true",
+            );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        assert!(cfg.listeners[0].proxy_protocol);
+        assert!(cfg.listeners[1].proxy_protocol);
     }
 
     #[test]

@@ -17,6 +17,7 @@ Client → TLS termination → Rate limiter → Backend selection → Forward
 - **Cluster-wide rate limiting** via a G-Counter CRDT, synchronized over HMAC-authenticated gossip, with optional mutual TLS on the peer channel.
 - **Active health checking**: HTTP probes (GET, 2xx = healthy) or TCP connect probes, using the *same* transport as real traffic.
 - **Circuit breaking** per backend: Closed → Open → HalfOpen, with configurable threshold and cooldown.
+- **PROXY protocol** (v1 and v2, auto-detected) on either listener type, for sitting behind another proxy/ELB/CDN while still seeing the real client IP.
 - **Prometheus metrics** on a private admin port. Separate `/healthz` (liveness, always 200) and `/ready` (readiness, 503 when no backend is eligible).
 - **Connection hardening**: global + per-IP caps, slowloris timeout (both directions — sending and reading the response), HTTP/2 Rapid Reset mitigation, body size and read-time limits.
 - **Graceful shutdown**: SIGTERM/SIGINT drains in-flight connections within a configurable timeout.

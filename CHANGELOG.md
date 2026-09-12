@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`proxy_protocol` (either listener type)**: reads the real client address
+  from a PROXY protocol header (v1 text, v2 binary, auto-detected) sent by a
+  trusted front-end proxy/ELB/CDN ahead of everything else on the
+  connection, instead of trusting the immediate TCP peer — which, behind
+  another proxy, is just that proxy's own address. A hard trust boundary: a
+  connection whose header is missing or malformed is dropped, not served
+  under the raw peer address. Feeds directly into per-client rate limiting,
+  access logs, and tracing, with no changes needed in either data plane —
+  both already keyed on the connection's peer address.
 - **`[cluster.tls]`: optional mutual TLS on the cluster peer channel.**
   Previously the peer channel was HMAC-SHA256 *authenticated* but never
   *encrypted* — the HMAC stopped a peer from forging counts, but anyone who

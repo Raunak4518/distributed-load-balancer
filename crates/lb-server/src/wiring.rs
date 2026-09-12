@@ -55,6 +55,10 @@ pub enum ListenerRuntime {
         metrics: Arc<lb_metrics::ListenerMetrics>,
         header_read_timeout: Duration,
         write_timeout: Duration,
+        /// Whether this listener expects a PROXY protocol header ahead of
+        /// everything else on the connection -- see `proxy_protocol`'s
+        /// module docs for the trust model this implies.
+        proxy_protocol: bool,
         /// `None` means this listener speaks plaintext. Built once at startup
         /// so a bad certificate fails before the port is bound, rather than
         /// on the first client to arrive.
@@ -73,6 +77,7 @@ pub enum ListenerRuntime {
         ctx: Arc<ArcSwap<TcpAppContext>>,
         limits: ConnectionLimits,
         metrics: Arc<lb_metrics::ListenerMetrics>,
+        proxy_protocol: bool,
         tls: Option<Arc<lb_tls::TlsAcceptor>>,
     },
 }
@@ -99,6 +104,13 @@ impl ListenerRuntime {
     pub fn tls(&self) -> Option<&Arc<lb_tls::TlsAcceptor>> {
         match self {
             ListenerRuntime::Http { tls, .. } | ListenerRuntime::Tcp { tls, .. } => tls.as_ref(),
+        }
+    }
+
+    pub fn proxy_protocol(&self) -> bool {
+        match self {
+            ListenerRuntime::Http { proxy_protocol, .. }
+            | ListenerRuntime::Tcp { proxy_protocol, .. } => *proxy_protocol,
         }
     }
 
@@ -334,6 +346,7 @@ pub fn build_app(
                     metrics: Arc::clone(&listener_metrics),
                     header_read_timeout: lc.header_read_timeout(),
                     write_timeout: lc.write_timeout(),
+                    proxy_protocol: lc.proxy_protocol,
                     tls,
                     // Built from the same `http2_enabled()` the TLS acceptor's
                     // ALPN list is chosen from, so the two cannot drift apart.
@@ -357,6 +370,7 @@ pub fn build_app(
                     ctx,
                     limits: connection_limits,
                     metrics: Arc::clone(&listener_metrics),
+                    proxy_protocol: lc.proxy_protocol,
                     tls,
                 }
             }
