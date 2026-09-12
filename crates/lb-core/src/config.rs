@@ -213,6 +213,14 @@ pub struct ListenerConfig {
     pub forward_timeout_ms: Option<u64>,
     pub max_request_body_bytes: Option<usize>,
     pub write_timeout_ms: Option<u64>,
+    /// Compresses responses (gzip/brotli/deflate/zstd, negotiated against
+    /// the client's `Accept-Encoding`) that aren't already encoded and pass
+    /// `tower_http`'s default size/content-type heuristics -- a CPU/latency
+    /// trade-off an operator should opt into, not one this project imposes.
+    /// Off by default, same as nginx's own `gzip off`. TCP has no concept of
+    /// a response to compress.
+    #[serde(default)]
+    pub compression: bool,
 
     // TCP-only
     pub connect_timeout_ms: Option<u64>,
@@ -690,6 +698,12 @@ impl ListenerConfig {
                             .into(),
                     ));
                 }
+                if self.compression {
+                    return Err(invalid(
+                        "compression is an http-only setting -- a tcp listener has no response to compress"
+                            .into(),
+                    ));
+                }
                 if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
                     return Err(invalid(format!(
                         "rate_limit.key 'header:{name}' is http-only — a tcp listener has no headers to read, use 'source_ip'"
@@ -981,6 +995,35 @@ mod tests {
         assert!(
             format!("{err}").contains("write_timeout_ms"),
             "error should name write_timeout_ms, got: {err}"
+        );
+    }
+
+    #[test]
+    fn compression_defaults_to_disabled() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(!cfg.listeners[0].compression);
+    }
+
+    #[test]
+    fn parses_compression_enabled() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        compression = true",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        assert!(cfg.listeners[0].compression);
+    }
+
+    #[test]
+    fn rejects_compression_on_tcp_listener() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:5432\"",
+            "        listen = \"0.0.0.0:5432\"\n        compression = true",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("compression"),
+            "error should name compression, got: {err}"
         );
     }
 

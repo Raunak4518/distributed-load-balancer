@@ -78,6 +78,12 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
 # treated as fatal (the connection is dropped), not a fallback to the raw
 # TCP peer: that's the whole trust boundary this option is enforcing.
 
+# compression = false
+# Compresses responses (gzip/brotli/deflate/zstd, negotiated against the
+# client's Accept-Encoding) that aren't already encoded and pass a
+# minimum-size/content-type check -- a CPU/latency trade-off, so off by
+# default, same as nginx's own `gzip off`. HTTP-only.
+
 # ── TLS termination (optional) ──────────────────────────────────────────
 # Uncomment to terminate TLS on this listener. Certificates are read from
 # disk and polled for changes on reload_interval_secs, so a renewed

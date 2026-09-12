@@ -1,4 +1,5 @@
 mod admin_backends;
+mod compression;
 mod dns;
 mod first_byte;
 mod limits;
@@ -14,7 +15,6 @@ pub use wiring::{
 };
 
 use hyper::server::conn::{http1, http2};
-use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use lb_core::Config;
 use std::net::SocketAddr;
@@ -373,6 +373,7 @@ where
             ctx,
             header_read_timeout,
             write_timeout,
+            compression,
             http2,
             ..
         } => {
@@ -384,7 +385,22 @@ where
             // reach this line sees whatever is current then.
             let ctx = ctx.load_full();
             let peer_ip = peer.ip();
-            let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
+            // A tower stack rather than a plain hyper `service_fn`, so
+            // `tower-http`'s `CompressionLayer` can sit in front of
+            // `lb_proxy::handle` -- `TowerToHyperService` bridges the result
+            // back to what `serve_connection` below expects. One uniform
+            // type regardless of `compression`'s value: see `compression`'s
+            // module docs for why that's a predicate, not a branch here.
+            let base =
+                tower::service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
+            let svc = hyper_util::service::TowerToHyperService::new(
+                tower::ServiceBuilder::new()
+                    .layer(
+                        tower_http::compression::CompressionLayer::new()
+                            .compress_when(compression::MaybeCompress::new(*compression)),
+                    )
+                    .service(base),
+            );
             // Read and write sides are policed independently and compose
             // transparently: each is a pure passthrough on the direction it
             // doesn't own, so wrapping order between them doesn't matter.

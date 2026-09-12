@@ -59,6 +59,9 @@ pub enum ListenerRuntime {
         /// everything else on the connection -- see `proxy_protocol`'s
         /// module docs for the trust model this implies.
         proxy_protocol: bool,
+        /// Whether responses get gzip/brotli/deflate/zstd compression --
+        /// see `compression`'s module docs.
+        compression: bool,
         /// `None` means this listener speaks plaintext. Built once at startup
         /// so a bad certificate fails before the port is bound, rather than
         /// on the first client to arrive.
@@ -111,6 +114,16 @@ impl ListenerRuntime {
         match self {
             ListenerRuntime::Http { proxy_protocol, .. }
             | ListenerRuntime::Tcp { proxy_protocol, .. } => *proxy_protocol,
+        }
+    }
+
+    /// Always `false` for a TCP listener: HTTP/2's `http2()` accessor above
+    /// follows the same shape, for the same reason -- there is no response
+    /// to compress at L4.
+    pub fn compression(&self) -> bool {
+        match self {
+            ListenerRuntime::Http { compression, .. } => *compression,
+            ListenerRuntime::Tcp { .. } => false,
         }
     }
 
@@ -347,6 +360,7 @@ pub fn build_app(
                     header_read_timeout: lc.header_read_timeout(),
                     write_timeout: lc.write_timeout(),
                     proxy_protocol: lc.proxy_protocol,
+                    compression: lc.compression,
                     tls,
                     // Built from the same `http2_enabled()` the TLS acceptor's
                     // ALPN list is chosen from, so the two cannot drift apart.

@@ -53,8 +53,10 @@ dashmap = "6"
 tracing = "0.1"
 arc-swap = "1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-# Only `hyper_util::rt::*` is used here, all of it under "tokio".
-hyper-util = { version = "0.1", features = ["tokio"] }
+# "tokio" for `hyper_util::rt::*`; "service" for
+# `hyper_util::service::TowerToHyperService`, the bridge `drive()` uses to
+# hand a tower-middleware stack (response compression) to hyper's server.
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 # For the admin backend-management extension (`admin_backends.rs`): its
 # response type matches `lb_metrics::admin`'s own `Response<Full<Bytes>>`,
 # and its `GET /backends` listing is JSON. Already in the lock via other
@@ -62,8 +64,21 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # module for the other two) -- this just makes lb-server's own use of them
 # a direct dependency instead of an implicit transitive one.
 bytes = "1"
+http = "1"
+http-body = "1"
 http-body-util = "0.1"
 serde_json = "1"
+# Response compression (`compression.rs`): `tower`'s `service_fn`/
+# `ServiceBuilder` wrap `lb_proxy::handle` so `tower-http`'s `CompressionLayer`
+# can sit in front of it; `TowerToHyperService` above bridges the resulting
+# tower `Service` back to what `serve_connection` expects. `default-features
+# = false` on tower-http: its default feature set is empty anyway, this is
+# just explicit about only pulling the compression algorithms, not e.g. its
+# unrelated `fs`/`trace`/`auth` middleware.
+tower = "0.5"
+tower-http = { version = "0.6", default-features = false, features = [
+    "compression-full",
+] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

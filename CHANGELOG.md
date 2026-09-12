@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`compression` (HTTP listeners)**: gzip/brotli/deflate/zstd response
+  compression, negotiated against the client's `Accept-Encoding` via
+  `tower-http`'s `CompressionLayer`. Off by default, matching nginx's own
+  `gzip off` — a CPU/latency trade-off an operator should opt into. The
+  per-listener toggle is threaded through as a predicate rather than a
+  runtime choice between two tower stacks, so there is exactly one stack
+  shape regardless of the config value.
 - **Admin backend-management API**: `GET /backends` (every listener's
   backends, with health/circuit/drain state and in-flight connection
   counts, as JSON) and `POST /backends/{listener}/{id}/drain` /

@@ -18,6 +18,7 @@ Client → TLS termination → Rate limiter → Backend selection → Forward
 - **Active health checking**: HTTP probes (GET, 2xx = healthy) or TCP connect probes, using the *same* transport as real traffic.
 - **Circuit breaking** per backend: Closed → Open → HalfOpen, with configurable threshold and cooldown.
 - **PROXY protocol** (v1 and v2, auto-detected) on either listener type, for sitting behind another proxy/ELB/CDN while still seeing the real client IP.
+- **Response compression** (gzip/brotli/deflate/zstd), negotiated against the client's `Accept-Encoding`, off by default.
 - **Prometheus metrics** on a private admin port. Separate `/healthz` (liveness, always 200) and `/ready` (readiness, 503 when no backend is eligible).
 - **Connection hardening**: global + per-IP caps, slowloris timeout (both directions — sending and reading the response), HTTP/2 Rapid Reset mitigation, body size and read-time limits.
 - **Graceful shutdown**: SIGTERM/SIGINT drains in-flight connections within a configurable timeout.
