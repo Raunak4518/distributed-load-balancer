@@ -67,6 +67,27 @@ impl<C: Clock> Gcra<C> {
     }
 }
 
+impl<C: Clock> Gcra<C> {
+    /// The GCRA arithmetic itself, shared by both paths below so the
+    /// borrowed-lookup fast path and the allocating insert path can't drift.
+    fn admit(entry: &mut Instant, now: Instant, period: Duration, tau: Duration) -> Decision {
+        let tat = if *entry > now { *entry } else { now };
+        let new_tat = tat + period;
+        // `checked_sub` can only underflow if tau exceeds new_tat's distance
+        // from the clock's own origin (e.g. a huge burst right at process
+        // start) — treat that as "definitely allowed" rather than panicking.
+        let allow_at = new_tat.checked_sub(tau).unwrap_or(now);
+        if allow_at <= now {
+            *entry = new_tat;
+            Decision::Allow
+        } else {
+            Decision::Deny {
+                retry_after: allow_at - now,
+            }
+        }
+    }
+}
+
 impl<C: Clock> RateLimiter for Gcra<C> {
     fn check(&self, key: &str) -> Decision {
         // Bounded state: an attacker spraying source addresses must not be
@@ -89,8 +110,19 @@ impl<C: Clock> RateLimiter for Gcra<C> {
         };
 
         let now = self.clock.now();
-        // The explicit Entry match is what keeps `tracked` accurate: it is
-        // the only way to know whether this call created a key.
+
+        // Borrowed lookup first: every key past its first request takes this
+        // path, and it allocates nothing. `key.to_string()` below is only
+        // ever worth paying the first time a given key is seen.
+        if let Some(mut existing) = self.state.get_mut(key) {
+            return Self::admit(&mut existing, now, self.period, self.tau);
+        }
+
+        // Key not found above. Another thread may have inserted it in the
+        // gap between that lookup and this one; the explicit Entry match
+        // handles that race correctly (Occupied, not double-counted) and is
+        // also what keeps `tracked` accurate -- it is the only way to know
+        // whether this call is the one that created the key.
         let mut entry = match self.state.entry(key.to_string()) {
             Entry::Occupied(occupied) => occupied.into_ref(),
             Entry::Vacant(vacant) => {
@@ -98,20 +130,7 @@ impl<C: Clock> RateLimiter for Gcra<C> {
                 vacant.insert(now)
             }
         };
-        let tat = if *entry > now { *entry } else { now };
-        let new_tat = tat + self.period;
-        // `checked_sub` can only underflow if tau exceeds new_tat's distance
-        // from the clock's own origin (e.g. a huge burst right at process
-        // start) — treat that as "definitely allowed" rather than panicking.
-        let allow_at = new_tat.checked_sub(self.tau).unwrap_or(now);
-        if allow_at <= now {
-            *entry = new_tat;
-            Decision::Allow
-        } else {
-            Decision::Deny {
-                retry_after: allow_at - now,
-            }
-        }
+        Self::admit(&mut entry, now, self.period, self.tau)
     }
 }
 

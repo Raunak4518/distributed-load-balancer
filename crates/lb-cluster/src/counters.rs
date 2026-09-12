@@ -60,17 +60,40 @@ impl CounterStore {
     /// node never over-admits against its own view. The only slack in the
     /// system is cross-node propagation delay.
     pub fn try_admit(&self, key: &str, node_id: &str, now_secs: u64, limit: u64) -> bool {
-        let mut entry = self.keys.entry(key.to_string()).or_default();
-        if entry.total_in_window(now_secs, self.window_secs) >= limit {
+        // Borrowed lookup first: every key past its first request in this
+        // window takes this path and allocates nothing. `key.to_string()`
+        // below is only worth paying the first time a key is seen.
+        if let Some(mut counts) = self.keys.get_mut(key) {
+            return Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit);
+        }
+        let mut counts = self.keys.entry(key.to_string()).or_default();
+        Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit)
+    }
+
+    fn try_record(
+        counts: &mut KeyCounts,
+        node_id: &str,
+        now_secs: u64,
+        window_secs: u64,
+        limit: u64,
+    ) -> bool {
+        if counts.total_in_window(now_secs, window_secs) >= limit {
             return false;
         }
-        *entry
-            .per_node
-            .entry(node_id.to_string())
-            .or_default()
-            .entry(now_secs)
-            .or_insert(0) += 1;
+        Self::record(counts, node_id, now_secs);
         true
+    }
+
+    /// Same borrowed-lookup-first shape as `try_admit` above, one level
+    /// down: `node_id` is almost always this same node's own fixed id, so
+    /// the allocating path is only ever taken once per node per key.
+    fn record(counts: &mut KeyCounts, node_id: &str, now_secs: u64) {
+        if let Some(buckets) = counts.per_node.get_mut(node_id) {
+            *buckets.entry(now_secs).or_insert(0) += 1;
+            return;
+        }
+        let buckets = counts.per_node.entry(node_id.to_string()).or_default();
+        *buckets.entry(now_secs).or_insert(0) += 1;
     }
 
     pub fn total_in_window(&self, key: &str, now_secs: u64) -> u64 {
@@ -83,8 +106,20 @@ impl CounterStore {
     /// Merges a peer's view of its own cells. Per-cell `max`, never sum:
     /// re-receiving the same update must not inflate the count.
     pub fn merge(&self, key: &str, node_id: &str, buckets: &[(u64, u64)]) {
-        let mut entry = self.keys.entry(key.to_string()).or_default();
-        let node_buckets = entry.per_node.entry(node_id.to_string()).or_default();
+        if let Some(mut counts) = self.keys.get_mut(key) {
+            Self::merge_into(&mut counts, node_id, buckets);
+            return;
+        }
+        let mut counts = self.keys.entry(key.to_string()).or_default();
+        Self::merge_into(&mut counts, node_id, buckets);
+    }
+
+    fn merge_into(counts: &mut KeyCounts, node_id: &str, buckets: &[(u64, u64)]) {
+        let node_buckets = if let Some(existing) = counts.per_node.get_mut(node_id) {
+            existing
+        } else {
+            counts.per_node.entry(node_id.to_string()).or_default()
+        };
         for (epoch, count) in buckets {
             let slot = node_buckets.entry(*epoch).or_insert(0);
             *slot = (*slot).max(*count);

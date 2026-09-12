@@ -369,6 +369,58 @@ suggest is a small remaining slice of this cost, now that the per-element
 clone is nearly free. Worth revisiting only if a future measurement shows
 the `Vec` allocation itself, not its contents, is the binding cost.
 
+## Phase 7, target 4 delta: `Gcra::check()`'s allocation removed
+
+`Gcra::check()` called `self.state.entry(key.to_string())` unconditionally —
+allocating a new `String` on *every* call, even though the overwhelmingly
+common case is a key that is already tracked. Fixed with a borrowed lookup
+first (`self.state.get_mut(key)`, which `DashMap<String, _>` supports
+directly since `String: Borrow<str>` — no new type or dependency needed):
+only a genuinely new key falls through to the allocating `entry()` path,
+and only once per key's lifetime rather than once per request against it.
+The GCRA arithmetic itself was pulled into a shared `admit()` helper so the
+two paths can't drift apart.
+
+| | Before | After |
+|---|---:|---:|
+| `Gcra::check()` | ~145–150 ns | ~100–109 ns |
+
+A clean, full fix — no remaining allocation on the hot (repeat-key) path.
+
+## Phase 7, target 3 delta: `ListenerCoordinator::try_admit()`, partially fixed
+
+This one has two allocations layered on top of each other, and only one of
+them is removable without a larger change.
+
+`CounterStore::try_admit()`/`merge()` (`crates/lb-cluster/src/counters.rs`)
+were allocating **twice** per call: once for the outer `DashMap<String,
+KeyCounts>` entry (`key.to_string()`, where `key` was *already* an owned
+`String` handed in by the caller) and again for the inner `per_node`
+`HashMap<String, _>` entry (`node_id.to_string()`) — and the second one is
+almost pure waste, since `try_admit`'s `node_id` is always this node's own
+fixed id. Both got the same borrowed-lookup-first treatment as target 4
+(`get_mut` before `entry(...to_string())`), fully contained inside
+`counters.rs` with no public signature change.
+
+**Not fixed:** the `format!("{}\u{1}{}", namespace, key)` in
+`ListenerCoordinator::namespaced()` that produces the `key: &str` those two
+methods receive in the first place. Removing it would mean `CounterStore`
+storing `(namespace, key)` as two separate pieces instead of one
+concatenated `String` — but looking that up without allocating requires a
+type implementing `Borrow<Q>` for some borrowed, non-owning `Q`, and there
+is no such `Q` for a two-part *unsized* key (`(str, str)` is not a
+constructible Rust type; a wrapper struct hits the same wall, since `Borrow`
+must return a reference borrowed *from `self`*, and no field of an owned
+`(String, String)` is itself a `(&str, &str)`). Solving this properly needs
+either a raw-entry-style API (`hashbrown`'s `Equivalent`, which `DashMap`
+does not expose) or a reusable interior-mutable scratch buffer per listener
+— both real changes, not proportionate to a cost this file already ranks
+last of four, and now smaller still after the fix below.
+
+| (5-backend-scale single key) | Before | After |
+|---|---:|---:|
+| `ListenerCoordinator::try_admit()` | ~469–483 ns | ~377–404 ns |
+
 ## Phase 8 (HTTP/2)
 
 `lb-bench` needs no new benchmark for this phase. HTTP/2 does not add a new
