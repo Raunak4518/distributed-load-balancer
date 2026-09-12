@@ -24,6 +24,12 @@ pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
     pub pool: Arc<BackendPool>,
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
     pub client: ProxyClient,
+    /// Set only for a `dns_discovery` + `backend_tls` HTTP listener, where
+    /// several backends share one `server_name` and so cannot safely share
+    /// `client`'s connection pool -- see `lb_proxy::per_backend`. Checked
+    /// ahead of `client` in the forwarding loop; `client` itself stays
+    /// harmless (an empty dial-pinning table, never consulted) in that case.
+    pub per_backend_client: Option<Arc<crate::per_backend::PerBackendClients>>,
     /// Whether this listener has a `[listeners.backend_tls]` section.
     ///
     /// A listener-level fact, not a per-backend one: it decides the
@@ -416,7 +422,11 @@ where
         };
         let attempt_started = std::time::Instant::now();
 
-        match forward(&ctx.client, outbound, ctx.forward_timeout).await {
+        let client = match &ctx.per_backend_client {
+            Some(per_backend) => per_backend.get_or_build(&backend),
+            None => ctx.client.clone(),
+        };
+        match forward(&client, outbound, ctx.forward_timeout).await {
             Ok(resp) => {
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_success.inc();
@@ -594,6 +604,7 @@ mod tests {
             pool: empty_pool(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -617,6 +628,7 @@ mod tests {
             pool: empty_pool(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -649,6 +661,7 @@ mod tests {
             pool,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -676,6 +689,7 @@ mod tests {
             pool,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -709,6 +723,7 @@ mod tests {
             pool,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -750,6 +765,7 @@ mod tests {
             pool: pool.clone(),
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -795,6 +811,7 @@ mod tests {
             pool,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -840,6 +857,7 @@ mod tests {
             pool,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
             backend_tls: false,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),

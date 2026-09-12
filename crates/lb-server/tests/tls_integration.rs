@@ -766,6 +766,17 @@ impl TlsBackend {
 }
 
 async fn spawn_tls_backend(cert: &std::path::Path, key: &std::path::Path) -> TlsBackend {
+    spawn_tls_backend_at("127.0.0.1:0".parse().unwrap(), cert, key).await
+}
+
+/// Same as `spawn_tls_backend`, but at a caller-chosen address rather than an
+/// ephemeral `127.0.0.1` port -- needed to put two backends at two distinct
+/// addresses sharing one port, the shape `dns_discovery` resolution produces.
+async fn spawn_tls_backend_at(
+    addr: SocketAddr,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> TlsBackend {
     use std::sync::atomic::{AtomicUsize, Ordering};
     lb_tls::install_crypto_provider();
 
@@ -782,7 +793,7 @@ async fn spawn_tls_backend(cert: &std::path::Path, key: &std::path::Path) -> Tls
         hsts_max_age_secs: None,
     };
     let acceptor = std::sync::Arc::new(lb_tls::TlsAcceptor::new(&tls_cfg, &[b"http/1.1"]).unwrap());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind(addr).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = std::sync::Arc::new(AtomicUsize::new(0));
     let health_hits = std::sync::Arc::new(AtomicUsize::new(0));
@@ -1507,6 +1518,98 @@ async fn a_backend_we_can_verify_probes_healthy() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(backend.hits(), 1);
+}
+
+/// The core proof for allowing `dns_discovery` + `backend_tls` together on
+/// an HTTP listener: two backends resolved under one `server_name` must not
+/// collapse onto a single pooled connection, or round-robin, per-backend
+/// circuit-breaking and health metrics all become fictional -- see
+/// `lb_proxy::per_backend`. `localhost` resolving to both `127.0.0.1` and
+/// `::1` (true on this repo's CI runners and on a default dev machine) gives
+/// two real, distinct, DNS-resolved addresses without a test-only resolver,
+/// so this exercises the real `TokioResolver`, not a fake one.
+#[tokio::test]
+async fn dns_discovery_with_backend_tls_reaches_both_resolved_addresses() {
+    let (_bdir, bcert, bkey) = cert_files(&["localhost"]);
+    let port = free_addr().await.port();
+    let backend_v4 =
+        spawn_tls_backend_at(format!("127.0.0.1:{port}").parse().unwrap(), &bcert, &bkey).await;
+    let backend_v6 =
+        spawn_tls_backend_at(format!("[::1]:{port}").parse().unwrap(), &bcert, &bkey).await;
+
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let config = Config::parse(&format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+
+  [listeners.tls]
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "{cert}"
+    key_file = "{key}"
+    hostnames = ["localhost"]
+
+  [listeners.dns_discovery]
+  name = "localhost"
+  port = {port}
+  poll_interval_secs = 1
+  server_name = "localhost"
+
+  [listeners.backend_tls]
+  danger_accept_invalid_certs = false
+  ca_file = "{bcert}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#,
+        listen = listen,
+        cert = cert.display().to_string().replace('\\', "\\\\"),
+        key = key.display().to_string().replace('\\', "\\\\"),
+        port = port,
+        bcert = bcert.display().to_string().replace('\\', "\\\\"),
+    ))
+    .unwrap();
+
+    tokio::spawn(lb_server::run(config));
+    support::wait_until_listening(listen).await;
+    // dns_discovery polls every 1s; give it a couple of ticks to resolve
+    // "localhost" and for the health checker to confirm both backends up.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    let client = trusting_client();
+    for _ in 0..10 {
+        let resp = client
+            .get(format!("https://localhost:{}/", listen.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    assert!(
+        backend_v4.hits() > 0,
+        "the v4 address never received traffic -- collapsed onto one pooled connection?"
+    );
+    assert!(
+        backend_v6.hits() > 0,
+        "the v6 address never received traffic -- collapsed onto one pooled connection?"
+    );
 }
 
 /// The L4 half of the same invariant. A completed TCP handshake says nothing

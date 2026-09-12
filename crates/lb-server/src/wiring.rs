@@ -311,8 +311,27 @@ pub fn build_app(
                     server_name_addresses,
                     backend_h2c,
                 );
-                let probe_client: Arc<dyn lb_core::ProbeClient> =
-                    Arc::new(lb_proxy::ProbeCapableClient(client.clone()));
+                // A `dns_discovery` + `backend_tls` listener puts several
+                // backends behind one `server_name`, which `client` above
+                // cannot serve correctly -- see `lb_proxy::per_backend`.
+                // Each such backend gets its own client (and so its own
+                // connection pool) instead, built lazily as backends are
+                // first seen; `client` stays built but unused, its
+                // dial-pinning table simply empty.
+                let per_backend_client = match (&lc.dns_discovery, &backend_tls) {
+                    (Some(dns), Some(connector)) => Some(Arc::new(lb_proxy::PerBackendClients::new(
+                        dns.server_name
+                            .clone()
+                            .expect("validated: server_name is required when backend_tls is set"),
+                        Arc::clone(connector),
+                        backend_h2c,
+                    ))),
+                    _ => None,
+                };
+                let probe_client: Arc<dyn lb_core::ProbeClient> = match &per_backend_client {
+                    Some(per_backend) => Arc::clone(per_backend) as Arc<dyn lb_core::ProbeClient>,
+                    None => Arc::new(lb_proxy::ProbeCapableClient(client.clone())),
+                };
                 spawn_health_checkers(
                     lc,
                     &backends,
@@ -333,6 +352,7 @@ pub fn build_app(
                         pool,
                         circuit_breakers,
                         client,
+                        per_backend_client,
                         backend_tls: backend_tls.is_some(),
                         rate_limit_key: lc.rate_limit.key.clone(),
                         forward_timeout: lc.forward_timeout(),
@@ -695,6 +715,108 @@ mod tests {
         // TCP: HTTP/2 is an application protocol the L4 data plane never
         // parses, whatever the config says.
         assert!(app.listeners[1].http2().is_none());
+
+        for task in app.background_tasks {
+            task.abort();
+        }
+    }
+
+    /// `dns_discovery` + `backend_tls` on an HTTP listener used to be
+    /// rejected outright at config validation. Now that it's accepted, the
+    /// listener must come up with a `per_backend_client` -- the shared
+    /// `client` cannot serve several DNS-resolved addresses safely, since
+    /// they'd all share one `server_name` authority. See
+    /// `lb_proxy::per_backend`.
+    #[tokio::test]
+    async fn dns_discovery_with_backend_tls_on_http_gets_a_per_backend_client() {
+        const CONFIG: &str = r#"
+            [[listeners]]
+            name = "web"
+            protocol = "http"
+            listen = "127.0.0.1:0"
+
+              [listeners.dns_discovery]
+              name = "backend.svc.cluster.local"
+              port = 9001
+              server_name = "backend.internal"
+
+              [listeners.backend_tls]
+              danger_accept_invalid_certs = true
+
+              [listeners.health_check]
+              path = "/health"
+              interval_ms = 2000
+              timeout_ms = 500
+              failure_threshold = 3
+              cooldown_ms = 5000
+
+              [listeners.rate_limit]
+              key = "source_ip"
+              rate_per_sec = 50
+              burst = 100
+
+              [listeners.load_balancing]
+              strategy = "round_robin"
+        "#;
+        let config = Config::parse(CONFIG).unwrap();
+        let app = build_app(&config, None).unwrap();
+
+        match &app.listeners[0] {
+            ListenerRuntime::Http { ctx, .. } => {
+                assert!(ctx.per_backend_client.is_some());
+            }
+            _ => panic!("expected an http listener"),
+        }
+
+        for task in app.background_tasks {
+            task.abort();
+        }
+    }
+
+    /// A static `backend_tls` listener (no `dns_discovery`) already gives
+    /// each backend its own distinct `server_name`, so it never needs the
+    /// per-backend client path -- confirming the new branch in `build_app`
+    /// stays off for the case it was never meant to touch.
+    #[tokio::test]
+    async fn a_static_backend_tls_listener_has_no_per_backend_client() {
+        const CONFIG: &str = r#"
+            [[listeners]]
+            name = "web"
+            protocol = "http"
+            listen = "127.0.0.1:0"
+
+              [listeners.backend_tls]
+              danger_accept_invalid_certs = true
+
+              [[listeners.backends]]
+              id = "b1"
+              address = "127.0.0.1:9001"
+              server_name = "b1.internal"
+
+              [listeners.health_check]
+              path = "/health"
+              interval_ms = 2000
+              timeout_ms = 500
+              failure_threshold = 3
+              cooldown_ms = 5000
+
+              [listeners.rate_limit]
+              key = "source_ip"
+              rate_per_sec = 50
+              burst = 100
+
+              [listeners.load_balancing]
+              strategy = "round_robin"
+        "#;
+        let config = Config::parse(CONFIG).unwrap();
+        let app = build_app(&config, None).unwrap();
+
+        match &app.listeners[0] {
+            ListenerRuntime::Http { ctx, .. } => {
+                assert!(ctx.per_backend_client.is_none());
+            }
+            _ => panic!("expected an http listener"),
+        }
 
         for task in app.background_tasks {
             task.abort();

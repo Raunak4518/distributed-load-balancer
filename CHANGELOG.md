@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Active health checks now log a transition (`recovered` / `removed from
   rotation`) instead of failing silently — a backend going down or coming
   back up previously left no trace in the logs.
+- **`dns_discovery` is now allowed together with `[listeners.backend_tls]`
+  on HTTP listeners** (previously rejected at config validation — see the
+  `[0.2.0]` notes below for why). Each backend resolved under the shared
+  `server_name` now gets its own connection pool (`lb_proxy::per_backend`),
+  built lazily per backend id, so several DNS-resolved addresses sharing one
+  certificate name no longer collapse onto a single pooled connection —
+  round-robin, per-backend circuit-breaking, and health-check attribution
+  are all real again. TCP listeners were never affected.
 
 ## [0.2.0] - 2026-09-12
 

@@ -589,16 +589,6 @@ impl ListenerConfig {
 
         if self.backend_tls.is_some() {
             if let Some(dns) = &self.dns_discovery {
-                if self.protocol == Protocol::Http {
-                    return Err(invalid(
-                        "dns_discovery and backend_tls cannot both be set on an http \
-                         listener — the L7 dial-pinning table is keyed by server_name, \
-                         and dns_discovery can resolve to several addresses sharing one \
-                         name, which would collapse them onto a single pinned address \
-                         and silently defeat load balancing"
-                            .into(),
-                    ));
-                }
                 let Some(name) = dns.server_name.as_deref() else {
                     return Err(invalid(
                         "dns_discovery.server_name is required when backend_tls is set".into(),
@@ -1240,15 +1230,18 @@ listen = "0.0.0.0:443"
     }
 
     #[test]
-    fn dns_discovery_with_backend_tls_is_rejected_for_http_listeners() {
-        let toml = dns_discovery_with_backend_tls_toml("http", Some("backend.internal"));
+    fn dns_discovery_with_backend_tls_requires_a_server_name_for_tcp_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("tcp", None);
         let err = Config::parse(&toml).unwrap_err().to_string();
-        assert!(err.contains("dial-pinning table"), "unhelpful error: {err}");
+        assert!(
+            err.contains("dns_discovery.server_name"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]
-    fn dns_discovery_with_backend_tls_requires_a_server_name_for_tcp_listeners() {
-        let toml = dns_discovery_with_backend_tls_toml("tcp", None);
+    fn dns_discovery_with_backend_tls_requires_a_server_name_for_http_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("http", None);
         let err = Config::parse(&toml).unwrap_err().to_string();
         assert!(
             err.contains("dns_discovery.server_name"),
@@ -1264,8 +1257,30 @@ listen = "0.0.0.0:443"
     }
 
     #[test]
+    fn dns_discovery_backend_tls_server_name_must_not_be_an_ip_for_http_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("http", Some("203.0.113.7"));
+        let err = Config::parse(&toml).unwrap_err().to_string();
+        assert!(err.contains("IP address"), "unhelpful error: {err}");
+    }
+
+    #[test]
     fn dns_discovery_with_backend_tls_and_a_server_name_is_accepted_for_tcp_listeners() {
         let toml = dns_discovery_with_backend_tls_toml("tcp", Some("backend.internal"));
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.listeners[0]
+                .dns_discovery
+                .as_ref()
+                .unwrap()
+                .server_name
+                .as_deref(),
+            Some("backend.internal")
+        );
+    }
+
+    #[test]
+    fn dns_discovery_with_backend_tls_and_a_server_name_is_accepted_for_http_listeners() {
+        let toml = dns_discovery_with_backend_tls_toml("http", Some("backend.internal"));
         let config = Config::parse(&toml).unwrap();
         assert_eq!(
             config.listeners[0]
