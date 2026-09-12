@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificate name no longer collapse onto a single pooled connection —
   round-robin, per-backend circuit-breaking, and health-check attribution
   are all real again. TCP listeners were never affected.
+- **`.deb`/`.rpm` packages** for `x86_64` Linux, published on each release
+  alongside the existing binaries and Docker image, installing the binary,
+  the systemd unit, and a default config in one step. The project is now
+  dual-licensed under MIT or Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`),
+  required for both package formats and previously undeclared anywhere in
+  the repository.
 
 ## [0.2.0] - 2026-09-12
 

@@ -64,6 +64,37 @@ jobs:
           name: lb-server-${{ matrix.target }}
           path: lb-server-${{ matrix.target }}.tar.gz
 
+  packages:
+    name: Build .deb / .rpm packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build release binary
+        run: cargo build --release -p lb-server
+
+      - name: Build .deb
+        run: (cd crates/lb-server && cargo deb --no-build)
+
+      - name: Build .rpm
+        run: cargo generate-rpm -p crates/lb-server
+
+      - name: Collect packages
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lb-server-packages
+          path: dist/*
+
   docker:
     name: Build and push multi-arch image
     runs-on: ubuntu-latest
@@ -104,7 +135,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [binaries, macos, docker]
+    needs: [binaries, macos, packages, docker]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -115,5 +146,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*/*.tar.gz
+          files: |
+            dist/*/*.tar.gz
+            dist/*/*.deb
+            dist/*/*.rpm
           generate_release_notes: true

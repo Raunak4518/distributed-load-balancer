@@ -2,6 +2,41 @@
 name = "lb-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "A multi-protocol load balancer: TLS termination, HTTP/1.1 and HTTP/2, rate limiting, health checks, and distributed rate-limit coordination"
+repository = "https://github.com/Raunak4518/distributed-load-balancer"
+
+[package.metadata.deb]
+maintainer = "Raunak4518 <u24ai109@aid.svnit.ac.in>"
+copyright = "2026, the distributed-load-balancer contributors"
+license-file = ["../../LICENSE-MIT", "4"]
+extended-description = """\
+A multi-protocol load balancer in Rust. Terminates TLS, speaks HTTP/1.1 and \
+HTTP/2, rate-limits by IP or header, health-checks backends, and forwards \
+traffic over HTTP or raw TCP. Multiple instances share rate-limit counters \
+through a gossip-based CRDT protocol -- no central data store required."""
+depends = "$auto"
+section = "net"
+priority = "optional"
+# Invoked as `cd crates/lb-server && cargo deb --no-build` in CI, so these
+# resolve relative to this crate's own directory -- `target/` is shared at
+# the workspace root, two levels up from here.
+assets = [
+    ["../../target/release/lb-server", "usr/bin/", "755"],
+    ["../../packaging/systemd/lb-server.service", "lib/systemd/system/", "644"],
+    ["../../config.example.toml", "etc/lb-server/config.toml", "644"],
+]
+conf-files = ["/etc/lb-server/config.toml"]
+
+# Invoked as `cargo generate-rpm -p crates/lb-server` from the workspace
+# root in CI (its documented way to target one workspace member), so these
+# resolve relative to the workspace root, unlike the `deb` assets above.
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/lb-server", dest = "/usr/bin/lb-server", mode = "755" },
+    { source = "packaging/systemd/lb-server.service", dest = "/usr/lib/systemd/system/lb-server.service", mode = "644" },
+    { source = "config.example.toml", dest = "/etc/lb-server/config.toml", mode = "644", config = true },
+]
 
 [dependencies]
 lb-core = { path = "../lb-core" }

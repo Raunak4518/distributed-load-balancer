@@ -79,7 +79,15 @@ lb-server --help
 
 ### Running it
 
-Three ways to run `lb-server`, none tied to a particular platform:
+Several ways to run `lb-server`, none tied to a particular platform:
+
+**`.deb` / `.rpm`** (Debian/Ubuntu or Fedora/RHEL — installs the binary, the systemd unit, and a default config in one step):
+```bash
+sudo dpkg -i lb-server_*.deb        # Debian/Ubuntu
+sudo rpm -i lb-server-*.rpm         # Fedora/RHEL
+sudo $EDITOR /etc/lb-server/config.toml
+sudo systemctl enable --now lb-server
+```
 
 **Docker** (published for `linux/amd64` and `linux/arm64`):
 ```bash
@@ -104,7 +112,7 @@ sudo systemctl enable --now lb-server
 curl -fsSL https://raw.githubusercontent.com/Raunak4518/distributed-load-balancer/main/scripts/install.sh | sh
 ```
 
-Prebuilt binaries are published on each [GitHub Release](https://github.com/Raunak4518/distributed-load-balancer/releases) by [`.github/workflows/release.yml`](.github/workflows/release.yml): static, dependency-free `musl` builds for `x86_64`/`aarch64` Linux (run on any distro, any glibc version, containers included), and native builds for `x86_64`/`aarch64` (Apple Silicon) macOS.
+Prebuilt binaries and packages are published on each [GitHub Release](https://github.com/Raunak4518/distributed-load-balancer/releases) by [`.github/workflows/release.yml`](.github/workflows/release.yml): static, dependency-free `musl` builds for `x86_64`/`aarch64` Linux (run on any distro, any glibc version, containers included), native builds for `x86_64`/`aarch64` (Apple Silicon) macOS, and `x86_64` `.deb`/`.rpm` packages.
 
 ## Configuration
 
@@ -198,4 +206,4 @@ GitHub Actions runs `cargo fmt`, `cargo clippy`, and `cargo test` on every push 
 
 ## License
 
-See the repository for license terms.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
