@@ -1,0 +1,29 @@
+[cluster]
+node_id           = "lb-2"
+listen            = "127.0.0.1:7947"
+peers             = ["127.0.0.1:7946"]
+shared_secret_env = "LB_CLUSTER_SECRET"
+
+[[listeners]]
+name     = "web"
+protocol = "http"
+listen   = "0.0.0.0:8081"
+
+[[listeners.backends]]
+id      = "node2-backend"
+address = "127.0.0.1:9002"
+
+[listeners.health_check]
+path              = "/health"
+interval_ms       = 2000
+timeout_ms        = 500
+failure_threshold = 3
+cooldown_ms       = 5000
+
+[listeners.rate_limit]
+key          = "source_ip"
+rate_per_sec = 50
+burst        = 100
+
+[listeners.load_balancing]
+strategy = "round_robin"

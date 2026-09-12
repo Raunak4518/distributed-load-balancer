@@ -7,6 +7,7 @@ edition.workspace = true
 lb-core = { path = "../lb-core" }
 lb-metrics = { path = "../lb-metrics" }
 tokio = { version = "1", features = ["rt", "time", "macros", "net"] }
+tracing = "0.1"
 
 # No HTTP client and no TLS crate, deliberately. The probes are built on the
 # `lb_core::ProbeClient` and `lb_core::OutboundTransport` seams and are handed

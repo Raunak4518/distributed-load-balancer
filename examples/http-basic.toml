@@ -1,0 +1,27 @@
+[[listeners]]
+name     = "web"
+protocol = "http"
+listen   = "0.0.0.0:8080"
+
+[[listeners.backends]]
+id      = "web1"
+address = "127.0.0.1:9001"
+
+[[listeners.backends]]
+id      = "web2"
+address = "127.0.0.1:9002"
+
+[listeners.health_check]
+path              = "/health"
+interval_ms       = 2000
+timeout_ms        = 500
+failure_threshold = 3
+cooldown_ms       = 5000
+
+[listeners.rate_limit]
+key          = "source_ip"
+rate_per_sec = 50
+burst        = 100
+
+[listeners.load_balancing]
+strategy = "round_robin"

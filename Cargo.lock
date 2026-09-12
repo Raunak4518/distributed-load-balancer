@@ -730,6 +730,7 @@ dependencies = [
  "lb-core",
  "lb-metrics",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

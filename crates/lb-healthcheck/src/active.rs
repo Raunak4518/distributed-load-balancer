@@ -25,9 +25,18 @@ where
 {
     tokio::spawn(async move {
         let mut ticker = time::interval(config.interval);
+        let mut previous: Option<bool> = None;
         loop {
             ticker.tick().await;
             let healthy = probe.probe(&backend).await;
+            if previous != Some(healthy) {
+                if healthy {
+                    tracing::info!(backend = %backend.id, "backend health check recovered");
+                } else {
+                    tracing::warn!(backend = %backend.id, "backend health check failed; removed from rotation");
+                }
+                previous = Some(healthy);
+            }
             pool.set_active_healthy(&backend.id, healthy);
             if let Some(gauge) = &config.healthy_gauge {
                 gauge.set(if healthy { 1 } else { 0 });

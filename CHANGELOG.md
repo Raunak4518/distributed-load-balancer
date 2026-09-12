@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`examples/`**: one minimal, runnable config per deployment shape (plain
+  HTTP reverse proxy, TCP passthrough, TLS termination with backend
+  re-encryption, DNS-discovered backends, a two-node cluster), each validated
+  against a real running instance rather than written speculatively.
+- Active health checks now log a transition (`recovered` / `removed from
+  rotation`) instead of failing silently — a backend going down or coming
+  back up previously left no trace in the logs.
+
 ## [0.2.0] - 2026-09-12
 
 ### Added

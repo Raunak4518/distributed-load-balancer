@@ -1,0 +1,41 @@
+[[listeners]]
+name     = "secure-web"
+protocol = "http"
+listen   = "0.0.0.0:8443"
+
+[listeners.tls]
+min_version = "1.2"
+
+[[listeners.tls.certificates]]
+name      = "edge"
+cert_file = "/etc/lb/tls/edge.crt"
+key_file  = "/etc/lb/tls/edge.key"
+hostnames = ["localhost"]
+
+[listeners.backend_tls]
+ca_file = "/etc/lb/tls/internal-ca.crt"
+
+[[listeners.backends]]
+id          = "secure1"
+address     = "127.0.0.1:9001"
+server_name = "secure1.internal"
+
+[[listeners.backends]]
+id          = "secure2"
+address     = "127.0.0.1:9002"
+server_name = "secure2.internal"
+
+[listeners.health_check]
+path              = "/health"
+interval_ms       = 2000
+timeout_ms        = 500
+failure_threshold = 3
+cooldown_ms       = 5000
+
+[listeners.rate_limit]
+key          = "source_ip"
+rate_per_sec = 50
+burst        = 100
+
+[listeners.load_balancing]
+strategy = "round_robin"

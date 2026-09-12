@@ -1,0 +1,28 @@
+[[listeners]]
+name     = "tcp-service"
+protocol = "tcp"
+listen   = "0.0.0.0:5432"
+connect_timeout_ms = 2000
+idle_timeout_ms    = 300000
+
+[[listeners.backends]]
+id      = "svc1"
+address = "127.0.0.1:9001"
+
+[[listeners.backends]]
+id      = "svc2"
+address = "127.0.0.1:9002"
+
+[listeners.health_check]
+interval_ms       = 2000
+timeout_ms        = 500
+failure_threshold = 3
+cooldown_ms       = 5000
+
+[listeners.rate_limit]
+key          = "source_ip"
+rate_per_sec = 100
+burst        = 200
+
+[listeners.load_balancing]
+strategy = "round_robin"

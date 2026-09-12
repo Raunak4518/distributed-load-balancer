@@ -110,6 +110,8 @@ Prebuilt binaries are published on each [GitHub Release](https://github.com/Raun
 
 All configuration lives in a single TOML file. A bad config fails the process at startup — no partial or default-assumed settings are served.
 
+**Pick your setup**: [`examples/`](examples/) has one minimal, runnable config per common deployment shape — plain HTTP reverse proxy, TCP passthrough, TLS termination with backend re-encryption, DNS-discovered backends, and a two-node cluster. Copy the one closest to your use case and adjust the addresses.
+
 See [`config.example.toml`](config.example.toml) for the authoritative reference with inline commentary. The major sections:
 
 - **`[[listeners]]`** — one per entry point: protocol (`http`/`tcp`), bind address, backends, rate limits, health checks, optional TLS.
