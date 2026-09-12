@@ -125,8 +125,14 @@ listen = "{listen}"
         )
     };
 
-    tokio::spawn(lb_server::run(Config::parse(&solo(traffic_a)).unwrap(), None));
-    tokio::spawn(lb_server::run(Config::parse(&solo(traffic_b)).unwrap(), None));
+    tokio::spawn(lb_server::run(
+        Config::parse(&solo(traffic_a)).unwrap(),
+        None,
+    ));
+    tokio::spawn(lb_server::run(
+        Config::parse(&solo(traffic_b)).unwrap(),
+        None,
+    ));
     support::wait_until_listening(traffic_a).await;
     support::wait_until_listening(traffic_b).await;
 

@@ -20,9 +20,7 @@
 //! The model is `lb_tls::reload`'s: validate everything a change would touch
 //! *before* touching anything, and only if every part succeeds. A reload
 //! that would be partially applied is worse than one that is refused.
-use crate::wiring::{
-    self, ListenerCoreKind, ListenerReloadHandle, ReloadState,
-};
+use crate::wiring::{self, ListenerCoreKind, ListenerReloadHandle, ReloadState};
 use lb_core::{Config, ListenerConfig, Protocol};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -116,7 +114,9 @@ pub async fn apply_reload(
     }
 
     if changed_lcs.is_empty() {
-        return ReloadOutcome::Applied { changed: Vec::new() };
+        return ReloadOutcome::Applied {
+            changed: Vec::new(),
+        };
     }
 
     // Phase 1: the one fallible step (real file I/O) for every changed
@@ -160,7 +160,7 @@ pub async fn apply_reload(
     for (name, kind, new_tasks) in prepared {
         match (reload.listeners.get(&name), kind) {
             (Some(ListenerReloadHandle::Http(swap)), ListenerCoreKind::Http(ctx)) => {
-                swap.store(Arc::new(ctx));
+                swap.store(Arc::new(*ctx));
             }
             (Some(ListenerReloadHandle::Tcp(swap)), ListenerCoreKind::Tcp(ctx)) => {
                 swap.store(Arc::new(ctx));
@@ -314,10 +314,17 @@ mod tests {
         let b_before = http_ctx_arc(&app.reload, "b");
 
         // "a" is declared first, so the first `rate_per_sec = 50` is its own.
-        let new = Config::parse(&TWO_LISTENERS.replacen("rate_per_sec = 50", "rate_per_sec = 999", 1)).unwrap();
+        let new =
+            Config::parse(&TWO_LISTENERS.replacen("rate_per_sec = 50", "rate_per_sec = 999", 1))
+                .unwrap();
 
         let outcome = apply_reload(&new, &old, &app.reload).await;
-        assert_eq!(outcome, ReloadOutcome::Applied { changed: vec!["a".to_string()] });
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Applied {
+                changed: vec!["a".to_string()]
+            }
+        );
 
         let a_after = http_ctx_arc(&app.reload, "a");
         let b_after = http_ctx_arc(&app.reload, "b");
@@ -339,7 +346,12 @@ mod tests {
         let app = build_app(&config, None).unwrap();
 
         let outcome = apply_reload(&config, &config, &app.reload).await;
-        assert_eq!(outcome, ReloadOutcome::Applied { changed: Vec::new() });
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Applied {
+                changed: Vec::new()
+            }
+        );
 
         abort_everything(app).await;
     }
@@ -404,7 +416,9 @@ mod tests {
         let outcome = apply_reload(&new, &old, &app.reload).await;
         assert_eq!(
             outcome,
-            ReloadOutcome::Applied { changed: vec!["a".to_string()] }
+            ReloadOutcome::Applied {
+                changed: vec!["a".to_string()]
+            }
         );
 
         let a_after = http_ctx_arc(&app.reload, "a");
@@ -422,8 +436,9 @@ mod tests {
         let config = Config::parse(TWO_LISTENERS).unwrap();
         let app = build_app(&config, None).unwrap();
 
-        let ListenerRuntime::Http { ctx: runtime_ctx, .. } =
-            app.listeners.iter().find(|l| l.name() == "a").unwrap()
+        let ListenerRuntime::Http {
+            ctx: runtime_ctx, ..
+        } = app.listeners.iter().find(|l| l.name() == "a").unwrap()
         else {
             panic!("expected an http listener");
         };

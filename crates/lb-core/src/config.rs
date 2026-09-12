@@ -994,9 +994,7 @@ mod tests {
 
     #[test]
     fn parses_tracing_section_with_defaults() {
-        let text = format!(
-            "[tracing]\notlp_endpoint = \"http://localhost:4318\"\n\n{VALID}"
-        );
+        let text = format!("[tracing]\notlp_endpoint = \"http://localhost:4318\"\n\n{VALID}");
         let cfg = Config::parse(&text).unwrap();
         let t = cfg.tracing.unwrap();
         assert_eq!(t.otlp_endpoint, "http://localhost:4318");
@@ -1008,7 +1006,10 @@ mod tests {
     fn rejects_an_empty_otlp_endpoint() {
         let text = format!("[tracing]\notlp_endpoint = \"\"\n\n{VALID}");
         let err = Config::parse(&text).unwrap_err().to_string();
-        assert!(err.contains("tracing.otlp_endpoint"), "unhelpful error: {err}");
+        assert!(
+            err.contains("tracing.otlp_endpoint"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]
@@ -1017,7 +1018,10 @@ mod tests {
             "[tracing]\notlp_endpoint = \"http://localhost:4318\"\nsample_ratio = 1.5\n\n{VALID}"
         );
         let err = Config::parse(&text).unwrap_err().to_string();
-        assert!(err.contains("tracing.sample_ratio"), "unhelpful error: {err}");
+        assert!(
+            err.contains("tracing.sample_ratio"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]

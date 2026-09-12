@@ -75,8 +75,8 @@ async fn main() -> std::io::Result<()> {
             // stderr directly -- there is no subscriber yet to route it
             // through.
             let config = load_config_or_exit(&config_path);
-            let tracing_guard =
-                lb_tracing::init(&config.logging, config.tracing.as_ref()).unwrap_or_else(|err| {
+            let tracing_guard = lb_tracing::init(&config.logging, config.tracing.as_ref())
+                .unwrap_or_else(|err| {
                     eprintln!("failed to initialize tracing: {err}");
                     std::process::exit(1);
                 });

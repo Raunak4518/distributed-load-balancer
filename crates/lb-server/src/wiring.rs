@@ -291,8 +291,11 @@ pub fn build_app(
 
         let runtime = match core.kind {
             ListenerCoreKind::Http(ctx) => {
-                let ctx = Arc::new(ArcSwap::from_pointee(ctx));
-                reload_listeners.insert(lc.name.clone(), ListenerReloadHandle::Http(Arc::clone(&ctx)));
+                let ctx = Arc::new(ArcSwap::from_pointee(*ctx));
+                reload_listeners.insert(
+                    lc.name.clone(),
+                    ListenerReloadHandle::Http(Arc::clone(&ctx)),
+                );
                 ListenerRuntime::Http {
                     name: lc.name.clone(),
                     listen: lc.listen,
@@ -315,7 +318,8 @@ pub fn build_app(
             }
             ListenerCoreKind::Tcp(ctx) => {
                 let ctx = Arc::new(ArcSwap::from_pointee(ctx));
-                reload_listeners.insert(lc.name.clone(), ListenerReloadHandle::Tcp(Arc::clone(&ctx)));
+                reload_listeners
+                    .insert(lc.name.clone(), ListenerReloadHandle::Tcp(Arc::clone(&ctx)));
                 ListenerRuntime::Tcp {
                     name: lc.name.clone(),
                     listen: lc.listen,
@@ -369,7 +373,12 @@ pub(crate) struct ListenerCore {
 }
 
 pub(crate) enum ListenerCoreKind {
-    Http(HttpContext),
+    // Boxed: `HttpContext` runs ~3x larger than `TcpAppContext` (the extra
+    // client/per_backend_client/access_log fields), and clippy's
+    // `large_enum_variant` is right that leaving it unboxed would size every
+    // `ListenerCoreKind` -- including every `Tcp` one -- to the bigger of
+    // the two.
+    Http(Box<HttpContext>),
     Tcp(TcpAppContext),
 }
 
@@ -440,18 +449,18 @@ pub(crate) fn build_listener_core(
 
     // The global cap is the sustained rate over the whole window; the local
     // GCRA continues to shape bursts inside it.
-    let cluster_coordinator: Option<Arc<dyn ClusterCoordinator>> =
-        match (cluster_node, cluster_cfg) {
-            (Some(node), Some(cc)) => {
-                let limit = (lc.rate_limit.rate_per_sec * cc.window_secs as f64).ceil() as u64;
-                Some(Arc::new(ListenerCoordinator::new(
-                    Arc::clone(node),
-                    lc.name.clone(),
-                    limit.max(1),
-                )))
-            }
-            _ => None,
-        };
+    let cluster_coordinator: Option<Arc<dyn ClusterCoordinator>> = match (cluster_node, cluster_cfg)
+    {
+        (Some(node), Some(cc)) => {
+            let limit = (lc.rate_limit.rate_per_sec * cc.window_secs as f64).ceil() as u64;
+            Some(Arc::new(ListenerCoordinator::new(
+                Arc::clone(node),
+                lc.name.clone(),
+                limit.max(1),
+            )))
+        }
+        _ => None,
+    };
 
     let kind = match lc.protocol {
         Protocol::Http => {
@@ -469,11 +478,8 @@ pub(crate) fn build_listener_core(
             // operator has said so -- a TLS backend negotiates via ALPN
             // regardless (see `lb_proxy::build_client`).
             let backend_h2c = lc.http2.as_ref().map(|h| h.backend_h2c()).unwrap_or(false);
-            let client = lb_proxy::build_client(
-                backend_tls.as_deref(),
-                server_name_addresses,
-                backend_h2c,
-            );
+            let client =
+                lb_proxy::build_client(backend_tls.as_deref(), server_name_addresses, backend_h2c);
             // A `dns_discovery` + `backend_tls` listener puts several backends
             // behind one `server_name`, which `client` above cannot serve
             // correctly -- see `lb_proxy::per_backend`. Each such backend gets
@@ -490,7 +496,7 @@ pub(crate) fn build_listener_core(
                 ))),
                 _ => None,
             };
-            ListenerCoreKind::Http(ProxyContext {
+            ListenerCoreKind::Http(Box::new(ProxyContext {
                 rate_limiter,
                 balancer: Arc::new(RoundRobin::new()),
                 pool: Arc::clone(&pool),
@@ -517,7 +523,7 @@ pub(crate) fn build_listener_core(
                     .as_ref()
                     .map(|t| t.hsts_max_age_secs())
                     .filter(|&v| v > 0),
-            })
+            }))
         }
         Protocol::Tcp => {
             // The one place the L4 data plane's re-encryption is chosen.
@@ -526,7 +532,8 @@ pub(crate) fn build_listener_core(
             // HTTP client above, the probe is handed this same `Arc` rather
             // than a second transport built from the same config.
             let outbound: Option<Arc<dyn lb_core::OutboundTransport>> = backend_tls.map(|c| {
-                Arc::new(lb_tls::BackendTlsTransport::new(&c)) as Arc<dyn lb_core::OutboundTransport>
+                Arc::new(lb_tls::BackendTlsTransport::new(&c))
+                    as Arc<dyn lb_core::OutboundTransport>
             });
             ListenerCoreKind::Tcp(TcpContext {
                 rate_limiter,
@@ -543,7 +550,11 @@ pub(crate) fn build_listener_core(
         }
     };
 
-    ListenerCore { backends, pool, kind }
+    ListenerCore {
+        backends,
+        pool,
+        kind,
+    }
 }
 
 /// Spawns one listener's health checkers, DNS poller (if `dns_discovery` is

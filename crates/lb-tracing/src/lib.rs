@@ -84,7 +84,11 @@ where
         .map_err(|err| format!("failed to build the OTLP exporter: {err}"))?;
 
     let resource = opentelemetry_sdk::Resource::builder()
-        .with_service_name(cfg.service_name.clone().unwrap_or_else(|| "lb-server".into()))
+        .with_service_name(
+            cfg.service_name
+                .clone()
+                .unwrap_or_else(|| "lb-server".into()),
+        )
         .build();
 
     let provider = SdkTracerProvider::builder()

@@ -30,7 +30,11 @@ pub struct PerBackendClients {
 }
 
 impl PerBackendClients {
-    pub fn new(server_name: String, backend_tls: Arc<lb_tls::BackendConnector>, backend_h2c: bool) -> Self {
+    pub fn new(
+        server_name: String,
+        backend_tls: Arc<lb_tls::BackendConnector>,
+        backend_h2c: bool,
+    ) -> Self {
         PerBackendClients {
             server_name,
             backend_tls,
