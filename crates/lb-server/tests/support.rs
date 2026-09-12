@@ -181,6 +181,47 @@ listen = "{listen}"
     )
 }
 
+/// A backend that answers every non-health request with a `body_len`-byte
+/// body. Used to test the load balancer's write-side timeout: a small
+/// response fits entirely in the kernel's send buffer and "succeeds"
+/// immediately no matter whether the peer ever reads it, so proving a
+/// stalled write actually times out needs a body large enough that writing
+/// it genuinely blocks once the client stops draining its socket.
+pub async fn spawn_large_body_backend(body_len: usize) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let io = TokioIo::new(stream);
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| async move {
+                    if req.uri().path() == "/health" {
+                        return Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        );
+                    }
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from(vec![0u8; body_len])))
+                            .unwrap(),
+                    )
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+
+    addr
+}
+
 /// A TCP backend that echoes whatever it receives, and counts connections.
 pub async fn spawn_echo_backend() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -4,6 +4,7 @@ mod limits;
 pub mod reload;
 mod shutdown;
 mod wiring;
+mod write_timeout;
 
 pub use wiring::{
     build_app, AppClusterNode, ClusterSetup, HttpContext, ListenerReloadHandle, ListenerRuntime,
@@ -343,6 +344,7 @@ where
         ListenerRuntime::Http {
             ctx,
             header_read_timeout,
+            write_timeout,
             http2,
             ..
         } => {
@@ -355,6 +357,10 @@ where
             let ctx = ctx.load_full();
             let peer_ip = peer.ip();
             let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
+            // Read and write sides are policed independently and compose
+            // transparently: each is a pure passthrough on the direction it
+            // doesn't own, so wrapping order between them doesn't matter.
+            let stream = write_timeout::WriteIdleTimeout::new(stream, *write_timeout);
             if is_h2 {
                 // Holds by construction, not by hope: `h2` is advertised only
                 // when `http2_enabled()` is true, and this field is populated

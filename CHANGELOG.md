@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`write_timeout_ms` (HTTP listeners)**: caps how long a client may take to
+  *read* the response, mirroring `header_read_timeout_ms`/`body_read_timeout_ms`
+  on the send side. Without it, a client that stops draining its socket
+  (a full TCP receive window, or a client that has simply gone away) could
+  hold a connection, its connection-limit permit, and its per-IP slot open
+  forever — resource-bounded but not time-bounded. Defaults to 30s. TCP
+  listeners get the same protection for free: `idle_timeout_ms` now applies
+  to both directions of the byte pump, not just reads.
 - **Three new `load_balancing.strategy` options**: `least_connections` (picks
   the eligible backend with the fewest in-flight requests/connections),
   `weighted_round_robin` (round-robin, but each backend's `weight` now

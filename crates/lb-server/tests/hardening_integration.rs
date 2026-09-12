@@ -4,10 +4,10 @@ use hyper::StatusCode;
 use lb_core::Config;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-use support::spawn_counting_backend;
+use support::{spawn_counting_backend, spawn_large_body_backend};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 async fn free_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -35,6 +35,40 @@ max_connections = {max_connections}
 max_connections_per_ip = {max_per_ip}
 header_read_timeout_ms = {header_timeout_ms}
 body_read_timeout_ms = {body_timeout_ms}
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    )
+}
+
+/// Like `hardened_config`, but with a tight `write_timeout_ms` instead of
+/// the read-side timeouts — the write-side counterpart used by the slow
+/// reader test below.
+fn write_timeout_config(listen: SocketAddr, backend: SocketAddr, write_timeout_ms: u64) -> String {
+    format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+write_timeout_ms = {write_timeout_ms}
 
   [[listeners.backends]]
   id = "b1"
@@ -184,6 +218,58 @@ async fn a_single_source_cannot_exceed_its_per_ip_budget() {
         .expect("read failed");
     assert!(n > 0, "no bytes after freeing a per-IP slot");
     assert!(String::from_utf8_lossy(&buf[..n]).contains("200"));
+}
+
+/// The write-side counterpart of the slowloris tests above: a client that
+/// reads its response, then simply stops draining its socket, must not be
+/// able to hold the connection open forever either.
+#[tokio::test]
+async fn a_client_that_stops_reading_the_response_is_disconnected() {
+    // Far larger than any default OS socket buffer, so the server's write
+    // genuinely blocks once the client below stops draining it -- a small
+    // response would fit entirely in the kernel's send buffer and "succeed"
+    // immediately regardless of whether the peer ever reads it.
+    let backend = spawn_large_body_backend(8 * 1024 * 1024).await;
+    let listen = free_addr().await;
+    let config = Config::parse(&write_timeout_config(listen, backend, 300)).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    // A tiny receive buffer makes the client's side fill (and so the
+    // server's write stall) almost immediately, rather than depending on
+    // exactly how large the OS's default buffers happen to be.
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(1024).unwrap();
+    let mut victim = socket.connect(listen).await.unwrap();
+    victim
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+
+    // Read once, to receive the response headers and the start of the body
+    // -- an established response, not a first-byte stall (that is
+    // `FirstByteDeadline`'s problem, not this one's).
+    let mut buf = [0u8; 256];
+    let n = victim
+        .read(&mut buf)
+        .await
+        .expect("no response headers at all");
+    assert!(n > 0, "connection closed before any response arrived");
+
+    // Then stop reading entirely. The server must give up and close its
+    // side rather than hold the connection (and the 8 MiB still unsent)
+    // open indefinitely.
+    let started = Instant::now();
+    let closed = tokio::time::timeout(Duration::from_secs(5), victim.read(&mut buf)).await;
+    assert!(
+        closed.is_ok(),
+        "server never closed a connection whose write stalled, within 5s"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "connection held for {:?}, far longer than the 300ms write timeout",
+        started.elapsed()
+    );
 }
 
 /// Ordinary traffic must be unaffected by the limits being present.

@@ -45,6 +45,12 @@ max_connections        = 10000   # total in-flight connections for this listener
 max_connections_per_ip = 100     # stops one source consuming the whole budget
 header_read_timeout_ms = 5000    # slowloris: caps time to send the request head
 body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
+write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
+                                  # time to *read* the response. Without this a
+                                  # client that stops draining its socket holds
+                                  # the connection open forever. HTTP-only — a
+                                  # TCP listener gets the same protection from
+                                  # idle_timeout_ms below instead.
 
 # ── TLS termination (optional) ──────────────────────────────────────────
 # Uncomment to terminate TLS on this listener. Certificates are read from
@@ -230,7 +236,9 @@ listen   = "0.0.0.0:5432"
 # an 8s worst case under backend_tls, not a 2s one — size it with that in
 # mind rather than as a single-hop budget.
 connect_timeout_ms = 2000
-idle_timeout_ms    = 300000
+idle_timeout_ms    = 300000  # applies to both directions of the byte pump --
+                              # a client that stops reading its half is timed
+                              # out the same as one that stops sending
 max_connections        = 10000
 max_connections_per_ip = 100
 

@@ -5,8 +5,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const BUFFER_SIZE: usize = 8 * 1024;
 
 /// Copies bytes from `reader` to `writer` until EOF, enforcing an *idle*
-/// timeout: the clock restarts on every successful read, so a long-lived but
-/// active connection is never cut off — only a stalled one is.
+/// timeout on both the read and the write: the clock restarts on every
+/// successful transfer in either direction, so a long-lived but active
+/// connection is never cut off — only one that stalls is. The write side
+/// matters exactly as much as the read side: a peer that stops reading its
+/// half (TCP receive window full, or simply gone quiet) would otherwise hold
+/// this pump's `write_all` open forever, since only the far end's flow
+/// control -- never a clock -- would ever unblock it.
 ///
 /// On EOF the writer is explicitly shut down, which propagates the half-close
 /// to the peer. That is what lets a caller run two pumps under `try_join!`
@@ -30,7 +35,9 @@ where
             return Ok(total);
         }
 
-        writer.write_all(&buf[..read]).await?;
+        tokio::time::timeout(idle_timeout, writer.write_all(&buf[..read]))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle timeout"))??;
         total += read as u64;
     }
 }
@@ -55,6 +62,27 @@ mod tests {
 
         assert_eq!(received, b"hello world");
         assert_eq!(copied.await.unwrap().unwrap(), 11);
+    }
+
+    /// The write-side counterpart of the read timeout above: a peer that
+    /// stops reading its half (here, `sink_rx` is simply never touched, so
+    /// the duplex's bounded buffer fills and `write_all` blocks) must not be
+    /// able to hold the pump open forever either.
+    #[tokio::test(start_paused = true)]
+    async fn times_out_when_the_writer_never_drains() {
+        let (mut source_tx, source_rx) = tokio::io::duplex(16);
+        let (sink_tx, _sink_rx) = tokio::io::duplex(16);
+
+        let pumped = tokio::spawn(pump(source_rx, sink_tx, Duration::from_secs(5)));
+        // Not awaited to completion here -- it stalls once `pump` stops
+        // draining `source_rx`, which is fine: only `pumped`'s outcome
+        // matters to this test.
+        tokio::spawn(async move {
+            let _ = source_tx.write_all(&[0u8; 256]).await;
+        });
+
+        let err = pumped.await.unwrap().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test(start_paused = true)]

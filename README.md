@@ -18,7 +18,7 @@ Client → TLS termination → Rate limiter → Backend selection → Forward
 - **Active health checking**: HTTP probes (GET, 2xx = healthy) or TCP connect probes, using the *same* transport as real traffic.
 - **Circuit breaking** per backend: Closed → Open → HalfOpen, with configurable threshold and cooldown.
 - **Prometheus metrics** on a private admin port. Separate `/healthz` (liveness, always 200) and `/ready` (readiness, 503 when no backend is eligible).
-- **Connection hardening**: global + per-IP caps, slowloris timeout, HTTP/2 Rapid Reset mitigation, body size and read-time limits.
+- **Connection hardening**: global + per-IP caps, slowloris timeout (both directions — sending and reading the response), HTTP/2 Rapid Reset mitigation, body size and read-time limits.
 - **Graceful shutdown**: SIGTERM/SIGINT drains in-flight connections within a configurable timeout.
 
 ## Architecture
@@ -141,7 +141,7 @@ Full field-by-field reference: [docs/configuration-reference.md](docs/configurat
 1. Accept loop acquires a global semaphore *before* `accept()`. At capacity, the kernel refuses for us.
 2. Per-IP slot checked after accept. Rejection drops the socket.
 3. TLS handshake runs in the spawned task, not the accept loop. Both limit guards held across it.
-4. ALPN result dispatches to HTTP/1.1 (`header_read_timeout`) or HTTP/2 (stream limits, PING keep-alive, `FirstByteDeadline`).
+4. ALPN result dispatches to HTTP/1.1 (`header_read_timeout`) or HTTP/2 (stream limits, PING keep-alive, `FirstByteDeadline`). Both are additionally wrapped in `write_timeout` — the read-side timeouts bound how long a client may take to *send*; this bounds how long it may take to *read the response*, so a client that stops draining its socket can't hold the connection open forever either.
 5. Local GCRA check — free, in-process. Then cluster budget if configured.
 6. Circuit-breaker states refreshed from the breakers to the pool.
 7. Body read with size cap and timeout.

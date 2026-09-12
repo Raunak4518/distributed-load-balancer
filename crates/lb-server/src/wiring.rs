@@ -54,6 +54,7 @@ pub enum ListenerRuntime {
         limits: ConnectionLimits,
         metrics: Arc<lb_metrics::ListenerMetrics>,
         header_read_timeout: Duration,
+        write_timeout: Duration,
         /// `None` means this listener speaks plaintext. Built once at startup
         /// so a bad certificate fails before the port is bound, rather than
         /// on the first client to arrive.
@@ -316,6 +317,7 @@ pub fn build_app(
                     limits: connection_limits,
                     metrics: Arc::clone(&listener_metrics),
                     header_read_timeout: lc.header_read_timeout(),
+                    write_timeout: lc.write_timeout(),
                     tls,
                     // Built from the same `http2_enabled()` the TLS acceptor's
                     // ALPN list is chosen from, so the two cannot drift apart.

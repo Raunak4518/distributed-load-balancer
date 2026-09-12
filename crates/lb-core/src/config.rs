@@ -182,6 +182,7 @@ pub struct ListenerConfig {
     // HTTP-only
     pub forward_timeout_ms: Option<u64>,
     pub max_request_body_bytes: Option<usize>,
+    pub write_timeout_ms: Option<u64>,
 
     // TCP-only
     pub connect_timeout_ms: Option<u64>,
@@ -246,6 +247,18 @@ impl ListenerConfig {
     /// is not a bound: 1 MiB at one byte per second is eleven days.
     pub fn body_read_timeout(&self) -> Duration {
         Duration::from_millis(self.body_read_timeout_ms.unwrap_or(10_000))
+    }
+
+    /// Caps how long a client may take to *read* the response -- the write
+    /// side of the same problem `header_read_timeout`/`body_read_timeout`
+    /// solve for reads. Without this, a client that stops draining its
+    /// socket holds the connection (and its connection-limit permit) open
+    /// forever, since nothing else on this path watches the write side.
+    /// 30s matches the same ballpark nginx's `send_timeout` and HAProxy's
+    /// `timeout client` default to: generous for a genuinely slow client,
+    /// still bounded.
+    pub fn write_timeout(&self) -> Duration {
+        Duration::from_millis(self.write_timeout_ms.unwrap_or(30_000))
     }
 
     /// Whether this listener serves HTTP/2.
@@ -598,9 +611,13 @@ impl ListenerConfig {
                 "max_connections_per_ip cannot exceed max_connections".into(),
             ));
         }
-        if self.header_read_timeout().is_zero() || self.body_read_timeout().is_zero() {
+        if self.header_read_timeout().is_zero()
+            || self.body_read_timeout().is_zero()
+            || self.write_timeout().is_zero()
+        {
             return Err(invalid(
-                "header_read_timeout_ms and body_read_timeout_ms must be positive".into(),
+                "header_read_timeout_ms, body_read_timeout_ms and write_timeout_ms must be positive"
+                    .into(),
             ));
         }
 
@@ -624,9 +641,13 @@ impl ListenerConfig {
                             .into(),
                     ));
                 }
-                if self.forward_timeout_ms.is_some() || self.max_request_body_bytes.is_some() {
+                if self.forward_timeout_ms.is_some()
+                    || self.max_request_body_bytes.is_some()
+                    || self.write_timeout_ms.is_some()
+                {
                     return Err(invalid(
-                        "forward_timeout_ms/max_request_body_bytes are http-only settings".into(),
+                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
+                            .into(),
                     ));
                 }
                 if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
@@ -908,6 +929,54 @@ mod tests {
             "        listen = \"0.0.0.0:8080\"\n        idle_timeout_ms = 1000",
         );
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_write_timeout_ms_on_tcp_listener() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:5432\"",
+            "        listen = \"0.0.0.0:5432\"\n        write_timeout_ms = 1000",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("write_timeout_ms"),
+            "error should name write_timeout_ms, got: {err}"
+        );
+    }
+
+    #[test]
+    fn write_timeout_defaults_to_30_seconds() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert_eq!(
+            cfg.listeners[0].write_timeout(),
+            Duration::from_millis(30_000)
+        );
+    }
+
+    #[test]
+    fn parses_a_configured_write_timeout() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        write_timeout_ms = 45000",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        assert_eq!(
+            cfg.listeners[0].write_timeout(),
+            Duration::from_millis(45_000)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_write_timeout() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        write_timeout_ms = 0",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("write_timeout_ms"),
+            "error should name write_timeout_ms, got: {err}"
+        );
     }
 
     #[test]
