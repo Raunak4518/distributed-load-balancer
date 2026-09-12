@@ -7,8 +7,11 @@
 //!    `BackendId` (each holding a `String`) on every backend selection.
 //! 2. `Gcra::check()` — `key.to_string()` allocation per call.
 //! 3. `ListenerCoordinator::try_admit()` — `format!()` allocation per call.
-//! 4. The circuit-breaker refresh loop — two mutex acquisitions per backend
-//!    per request, contended across worker threads in production.
+//! 4. The circuit-breaker refresh loop — several atomic loads per backend
+//!    per request. Used to be two mutex acquisitions per backend until
+//!    Phase 7 target 1 replaced them (see `docs/BASELINE.md`); this harness
+//!    is single-threaded and uncontended, so it cannot show that win --
+//!    only a concurrent benchmark or production traffic can.
 //!
 //! Deliberately hand-rolled rather than using `criterion`: this has to build
 //! and run on the development machine, and criterion's dependency tree does
@@ -129,7 +132,7 @@ fn bench_cluster_try_admit() {
 }
 
 fn bench_circuit_refresh() {
-    println!("\nCircuit-breaker refresh loop  [2 mutex acquisitions per backend]");
+    println!("\nCircuit-breaker refresh loop  [atomic loads per backend, no mutex]");
     for n in [1usize, 5, 20] {
         let pool = pool_of(n);
         let breakers = breakers_for(&pool);

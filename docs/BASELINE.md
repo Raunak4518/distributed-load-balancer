@@ -277,6 +277,86 @@ and Phase 7 should not be planned as though they are.
 4. **Remove `key.to_string()` in `Gcra::check()`** — use a borrowed-key lookup
    before falling back to an owning insert.
 
+## Phase 7, target 1 delta: circuit-breaker mutex removed
+
+`CircuitBreaker` (`crates/lb-healthcheck/src/circuit_breaker.rs`) no longer
+holds a `Mutex<CircuitState>`/`Mutex<Option<Instant>>` pair. State is an
+`AtomicU8`; `opened_at` is nanoseconds elapsed since the breaker's creation
+`Instant` in an `AtomicU64` (`Instant` itself has no atomic form, and
+`u64::MAX` nanoseconds is tens of thousands of years, so a sentinel for
+"not open" costs nothing realistic). Transitions that must not race —
+tripping open, the Open→HalfOpen cooldown flip — go through
+`compare_exchange` rather than a lock; a losing CAS means another thread
+already made the same transition, so it is not retried. A new stress test
+(`concurrent_failures_from_many_threads_trip_exactly_once`) hammers one
+breaker from 8 threads at once and asserts no panic and a consistent final
+state — the only property a lock-free structure can promise, since there is
+no linearization point to assert an exact interleaving against.
+
+**Re-measuring this immediately produced a false alarm worth recording.**
+Fresh numbers for the circuit-breaker refresh bench at 5 backends came back
+at ~800 ns/op — more than double this file's Phase 5/6 figure of 344–361 ns,
+which looked like a regression until checked. Rather than trust that
+delta, the old `Mutex`-based file was restored on top of today's code via
+`git show HEAD:...` and re-benched *on this same machine, back to back*
+with the atomics version, before writing anything down:
+
+| Version | 1 backend | 5 backends | 20 backends |
+|---|---:|---:|---:|
+| Mutex (restored, pre-change) | ~230–255 ns | ~810–880 ns | ~3,190–3,390 ns |
+| Atomics (this change) | ~224–233 ns | ~790–840 ns | ~2,980–3,100 ns |
+
+Statistically indistinguishable — atomics are not measurably faster here,
+and that is expected, not a failed optimisation: this bench's closure also
+calls `pool.all_backend_ids()` every iteration (it always has, see the
+`eligible_backends()` section above for that same allocation's cost), which
+dominates the timing at 5+ backends far more than either a mutex or a
+handful of atomic loads does. The gap between *this file's* old 344–361 ns
+and *today's* ~800–880 ns for the identical Mutex code is real but has
+nothing to do with target 1 — it is drift in `all_backend_ids()`'s own cost
+(or the machine's noise floor) between when Phase 5/6 were measured and
+today, and the A/B above is what proves that rather than assuming it.
+
+The actual point of target 1 was never the uncontended ns/op — it was the
+production risk this file already named: "a single-threaded measurement
+cannot show contention... the real cost under concurrent load is *higher
+than measured*." That risk is now structurally gone (there is no lock left
+to contend on), which this single-threaded harness cannot demonstrate by
+design. Target 2 (`eligible_backends()`/`all_backend_ids()` allocation) is
+the next item on this list, and — per the table above — is now also the
+dominant cost left in this specific bench.
+
+## Phase 8 (HTTP/2)
+
+`lb-bench` needs no new benchmark for this phase. HTTP/2 does not add a new
+kind of cost to measure — it amortises a cost this harness already measures.
+The full-handshake figure from target 0 above (1,013,109 ns/op, ~987
+handshakes/s, single-threaded) is paid once per *connection*, not once per
+*request*; HTTP/2 multiplexing means one connection now carries many
+concurrent requests instead of one. The win from that is a division of the
+existing handshake figure by requests-per-connection, not a new number this
+harness would need to produce.
+
+**The prediction, stated explicitly:** handshakes per request should fall
+roughly in proportion to requests per connection. A connection that serves 1
+request still pays the full ~1,013 µs handshake for that request. A
+connection that serves 100 requests over HTTP/2 multiplexing pays that same
+~1,013 µs once, amortised to ~10 µs/request — the same arithmetic the
+"connection reuse" lever in target 1 above already describes for keep-alive,
+now available within a single connection rather than only across a pool of
+them.
+
+This is a prediction about handshake amortisation, not a benchmark result:
+`lb-bench`'s handshake measurement is synthetic (rustls `ClientConnection`/
+`ServerConnection` over in-memory byte buffers, no sockets, no real HTTP/2
+framing), so it cannot itself show requests multiplexed onto one connection.
+**`lb_requests_total{protocol="http2"}`** — the `protocol` label already
+present on this counter, with values `http1`/`http2` — is how an operator
+confirms the amortisation is actually happening in a running deployment:
+a rising `http2` share at a roughly steady TLS-handshake rate
+(`lb_tls_handshakes_total{outcome="success"}`) is the multiplexing effect
+showing up outside the lab.
+
 ## Before any SLA commitment
 
 These figures cannot support a capacity claim. That requires:
