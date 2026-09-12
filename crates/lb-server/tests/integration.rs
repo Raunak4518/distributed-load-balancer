@@ -4,7 +4,10 @@ use hyper::StatusCode;
 use lb_core::Config;
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use support::{config_toml, spawn_counting_backend};
+use std::time::Duration;
+use support::{
+    config_toml, least_connections_config_toml, spawn_counting_backend, spawn_slow_counting_backend,
+};
 use tokio::net::TcpListener;
 
 async fn free_addr() -> SocketAddr {
@@ -106,4 +109,56 @@ async fn fails_over_when_a_backend_stops_responding() {
     // retried onto it after the dead one fails — none should hard-fail.
     assert_eq!(ok_count, 6);
     assert_eq!(healthy_count.load(Ordering::SeqCst), 6);
+}
+
+#[tokio::test]
+async fn least_connections_routes_around_a_backend_still_mid_flight() {
+    let (slow_addr, slow_count) =
+        spawn_slow_counting_backend(StatusCode::OK, Duration::from_millis(400)).await;
+    let (fast_addr, fast_count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+
+    // "slow" listed first so the very first request (both backends at zero
+    // active connections) lands on it via the stable tie-break -- that
+    // request is what puts it mid-flight for the rest of this test.
+    let config = Config::parse(&least_connections_config_toml(
+        &listen.to_string(),
+        &[("slow", slow_addr), ("fast", fast_addr)],
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    let client = reqwest::Client::new();
+
+    // Kicks off the request that will occupy "slow" for the next second;
+    // deliberately not awaited yet.
+    let occupying = {
+        let client = client.clone();
+        let url = format!("http://{listen}/");
+        tokio::spawn(async move { client.get(url).send().await.unwrap() })
+    };
+    // Give it time to be accepted, picked, and dialed before the sequential
+    // requests below start, so its active-connection guard is reliably held
+    // first. Each of the five below is awaited to completion before the next
+    // starts (unlike a concurrent burst), so its own pick only ever
+    // competes against "slow" still mid-flight, not against a sibling
+    // request racing the same tie.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for _ in 0..5 {
+        let resp = client
+            .get(format!("http://{listen}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(occupying.await.unwrap().status(), StatusCode::OK);
+
+    // "slow" was busy for the whole run, so every one of those 5 requests
+    // must have gone to "fast" instead -- the property that distinguishes
+    // this from round-robin, which would have split them evenly.
+    assert_eq!(fast_count.load(Ordering::SeqCst), 5);
+    assert_eq!(slow_count.load(Ordering::SeqCst), 1);
 }

@@ -169,6 +169,11 @@ body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
   [[listeners.backends]]
   id = "web1"
   address = "127.0.0.1:9001"
+  # Consulted only by load_balancing.strategy = "weighted_round_robin" (as a
+  # multiplier on how often this backend is picked) and "consistent_hash"
+  # (as a multiplier on its share of the hash ring). Ignored by
+  # "round_robin" and "least_connections". A weight of 0 drains a backend
+  # without removing it from the list.
   weight  = 1
   # Required whenever [listeners.backend_tls] is set: the hostname on this
   # backend's certificate, used only for SNI and hostname verification. The
@@ -200,6 +205,16 @@ body_read_timeout_ms   = 10000   # slow POST: a size limit alone is not a bound
   max_tracked_keys = 100000
 
   [listeners.load_balancing]
+  # One of:
+  #   "round_robin"          -- cycles through eligible backends in order.
+  #   "least_connections"    -- picks whichever eligible backend currently
+  #                             has the fewest in-flight requests.
+  #   "weighted_round_robin" -- round-robin, but each backend's `weight`
+  #                             (above) controls how often it's picked.
+  #   "consistent_hash"      -- hashes this listener's rate-limit key onto a
+  #                             ring of backends, so the same client keeps
+  #                             landing on the same backend as long as the
+  #                             backend set doesn't change.
   strategy = "round_robin"
 
 # ── TCP (L4) listener ─────────────────────────────────────────────────
@@ -273,4 +288,6 @@ max_connections_per_ip = 100
   burst = 20
 
   [listeners.load_balancing]
+  # See the HTTP listener's load_balancing block above for the full list of
+  # strategies and what each one does.
   strategy = "round_robin"

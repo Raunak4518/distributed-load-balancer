@@ -98,6 +98,89 @@ listen = "{listen}"
     )
 }
 
+/// Like `spawn_counting_backend`, but waits `delay` before answering each
+/// request -- long enough that the proxy's active-connection guard for this
+/// backend is still held when other concurrent requests are routed, which is
+/// the only way a `least_connections` test can observe anything.
+pub async fn spawn_slow_counting_backend(
+    status: StatusCode,
+    delay: std::time::Duration,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_clone = count.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let io = TokioIo::new(stream);
+            let count = count_clone.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let count = count.clone();
+                    async move {
+                        if req.uri().path() == "/health" {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap(),
+                            );
+                        }
+                        tokio::time::sleep(delay).await;
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = http1::Builder::new().serve_connection(io, svc).await;
+            });
+        }
+    });
+
+    (addr, count)
+}
+
+pub fn least_connections_config_toml(listen: &str, backends: &[(&str, SocketAddr)]) -> String {
+    let backends_toml: String = backends
+        .iter()
+        .map(|(id, addr)| {
+            format!("  [[listeners.backends]]\n  id = \"{id}\"\n  address = \"{addr}\"\n\n")
+        })
+        .collect();
+    format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+
+{backends_toml}
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 50
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 1000.0
+  burst = 1000
+
+  [listeners.load_balancing]
+  strategy = "least_connections"
+"#
+    )
+}
+
 /// A TCP backend that echoes whatever it receives, and counts connections.
 pub async fn spawn_echo_backend() -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

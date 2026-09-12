@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
-pub struct TcpContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
+pub struct TcpContext<R: RateLimiter, C: Clock> {
     pub rate_limiter: Arc<R>,
-    pub balancer: Arc<L>,
+    pub balancer: Arc<dyn LoadBalancer>,
     pub pool: Arc<BackendPool>,
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
     pub connect_timeout: Duration,
@@ -46,7 +46,7 @@ impl Drop for ConnectionGuard {
     }
 }
 
-impl<R: RateLimiter, L: LoadBalancer, C: Clock> TcpContext<R, L, C> {
+impl<R: RateLimiter, C: Clock> TcpContext<R, C> {
     fn circuit_breaker(&self, id: &BackendId) -> Option<&CircuitBreaker<C>> {
         self.circuit_breakers.get(id)
     }
@@ -72,13 +72,9 @@ impl<R: RateLimiter, L: LoadBalancer, C: Clock> TcpContext<R, L, C> {
 /// a failed handshake. A backend we cannot hand bytes to is a backend that
 /// did not answer, whichever step failed, so the caller records one outcome
 /// and retries once.
-async fn establish<R, L, C>(
-    ctx: &TcpContext<R, L, C>,
-    backend: &Backend,
-) -> Option<Box<dyn ProxyStream>>
+async fn establish<R, C>(ctx: &TcpContext<R, C>, backend: &Backend) -> Option<Box<dyn ProxyStream>>
 where
     R: RateLimiter,
-    L: LoadBalancer,
     C: Clock,
 {
     let stream = match tokio::time::timeout(
@@ -145,15 +141,14 @@ pub enum ConnectionOutcome {
 /// when nothing is exporting, same as there: this code does not need to
 /// know whether OpenTelemetry export is turned on.
 #[tracing::instrument(name = "tcp_session", skip(inbound, ctx), fields(peer = %peer))]
-pub async fn handle_connection<S, R, L, C>(
+pub async fn handle_connection<S, R, C>(
     inbound: S,
     peer: SocketAddr,
-    ctx: Arc<TcpContext<R, L, C>>,
+    ctx: Arc<TcpContext<R, C>>,
 ) -> ConnectionOutcome
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
     R: RateLimiter,
-    L: LoadBalancer,
     C: Clock,
 {
     ctx.metrics.connections_total.inc();
@@ -181,12 +176,16 @@ where
 
     let mut outbound: Option<Box<dyn ProxyStream>> = None;
     for attempt in 0..2u8 {
-        let Some(backend_id) = ctx.balancer.pick(&ctx.pool) else {
+        let Some(backend_id) = ctx.balancer.pick(&ctx.pool, &key) else {
             return ConnectionOutcome::NoBackend;
         };
         let Some(backend) = ctx.pool.backend(&backend_id) else {
             continue;
         };
+        // Held across the connect attempt and dropped at the end of this
+        // iteration regardless of outcome -- same reasoning as the HTTP
+        // path's guard.
+        let _active_guard = ctx.pool.track_active(&backend_id);
 
         match establish(&ctx, &backend).await {
             Some(stream) => {
@@ -275,14 +274,14 @@ mod tests {
 
     struct FirstEligible;
     impl LoadBalancer for FirstEligible {
-        fn pick(&self, pool: &BackendPool) -> Option<BackendId> {
+        fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
             pool.eligible_backends().into_iter().next()
         }
     }
 
     struct NoBackendPicker;
     impl LoadBalancer for NoBackendPicker {
-        fn pick(&self, _pool: &BackendPool) -> Option<BackendId> {
+        fn pick(&self, _pool: &BackendPool, _key: &str) -> Option<BackendId> {
             None
         }
     }
@@ -314,11 +313,11 @@ mod tests {
         addr
     }
 
-    fn context<R: RateLimiter, L: LoadBalancer>(
+    fn context<R: RateLimiter, L: LoadBalancer + 'static>(
         rate_limiter: R,
         balancer: L,
         backends: Vec<Backend>,
-    ) -> Arc<TcpContext<R, L, FakeClock>> {
+    ) -> Arc<TcpContext<R, FakeClock>> {
         let pool = Arc::new(BackendPool::new(backends.clone()));
         let mut circuit_breakers = HashMap::new();
         for b in &backends {
@@ -346,13 +345,12 @@ mod tests {
 
     /// Runs one client connection through `handle_connection`, returning the
     /// outcome plus whatever the client read back.
-    async fn run_session<R, L>(
-        ctx: Arc<TcpContext<R, L, FakeClock>>,
+    async fn run_session<R>(
+        ctx: Arc<TcpContext<R, FakeClock>>,
         payload: &'static [u8],
     ) -> (ConnectionOutcome, Vec<u8>)
     where
         R: RateLimiter + 'static,
-        L: LoadBalancer + 'static,
     {
         let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let front_addr = front.local_addr().unwrap();
@@ -469,12 +467,12 @@ mod tests {
     /// `context`, plus an outbound transport. Set after construction rather
     /// than threaded through `context`'s signature, so the four plaintext
     /// tests above stay unchanged.
-    fn context_with_transport<R: RateLimiter, L: LoadBalancer>(
+    fn context_with_transport<R: RateLimiter, L: LoadBalancer + 'static>(
         rate_limiter: R,
         balancer: L,
         backends: Vec<Backend>,
         transport: Arc<dyn lb_core::OutboundTransport>,
-    ) -> Arc<TcpContext<R, L, FakeClock>> {
+    ) -> Arc<TcpContext<R, FakeClock>> {
         let mut ctx = context(rate_limiter, balancer, backends);
         Arc::get_mut(&mut ctx).expect("sole owner").backend_tls = Some(transport);
         ctx

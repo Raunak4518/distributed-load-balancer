@@ -337,6 +337,9 @@ pub struct BackendTlsConfig {
 pub struct BackendConfig {
     pub id: String,
     pub address: SocketAddr,
+    /// Consulted only by `load_balancing.strategy = "weighted_round_robin"`
+    /// or `"consistent_hash"` -- ignored by every other strategy, including
+    /// the default `round_robin`.
     #[serde(default = "default_weight")]
     pub weight: u32,
     #[serde(default)]
@@ -406,6 +409,17 @@ pub struct LoadBalancingConfig {
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalancingStrategy {
     RoundRobin,
+    /// Fewest in-flight requests/connections wins. Needs no per-request
+    /// identity, unlike `ConsistentHash`.
+    LeastConnections,
+    /// Round-robin, but each backend's `weight` (default 1) controls how
+    /// often it's picked relative to the others.
+    WeightedRoundRobin,
+    /// Hashes this listener's rate-limit key (`source_ip`, or the header
+    /// value) onto a ring of backends, so the same client keeps landing on
+    /// the same backend as long as the backend set doesn't change. Backend
+    /// `weight` still applies, via virtual nodes on the ring.
+    ConsistentHash,
 }
 
 impl Config {
@@ -1895,5 +1909,53 @@ listen = "0.0.0.0:443"
         let err = Config::parse(&toml).unwrap_err().to_string();
         assert!(err.contains("backend_h2c"), "unhelpful error: {err}");
         assert!(err.contains("backend_tls"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn parses_least_connections_strategy() {
+        let text = VALID.replacen(
+            "strategy = \"round_robin\"",
+            "strategy = \"least_connections\"",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.listeners[0].load_balancing.strategy,
+            LoadBalancingStrategy::LeastConnections
+        );
+    }
+
+    #[test]
+    fn parses_weighted_round_robin_strategy() {
+        let text = VALID.replacen(
+            "strategy = \"round_robin\"",
+            "strategy = \"weighted_round_robin\"",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.listeners[0].load_balancing.strategy,
+            LoadBalancingStrategy::WeightedRoundRobin
+        );
+    }
+
+    #[test]
+    fn parses_consistent_hash_strategy() {
+        let text = VALID.replacen(
+            "strategy = \"round_robin\"",
+            "strategy = \"consistent_hash\"",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.listeners[0].load_balancing.strategy,
+            LoadBalancingStrategy::ConsistentHash
+        );
+    }
+
+    #[test]
+    fn backend_weight_defaults_to_one() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert_eq!(cfg.listeners[0].backends[0].weight, 1);
     }
 }

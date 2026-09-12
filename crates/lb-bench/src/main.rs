@@ -90,7 +90,7 @@ fn bench_round_robin_pick() {
         let pool = pool_of(n);
         let rr = RoundRobin::new();
         bench(&format!("{n} backend(s)"), ITERATIONS, || {
-            black_box(rr.pick(&pool));
+            black_box(rr.pick(&pool, ""));
         });
     }
 }

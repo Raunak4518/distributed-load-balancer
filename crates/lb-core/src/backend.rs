@@ -19,6 +19,8 @@ impl std::fmt::Display for BackendId {
 pub struct Backend {
     pub id: BackendId,
     pub address: SocketAddr,
+    /// Consulted only by `WeightedRoundRobin` and `ConsistentHash` (see
+    /// `lb-balancer`) -- `RoundRobin` and `LeastConnections` ignore it.
     pub weight: u32,
     /// The name on the backend's certificate, which is a different fact from
     /// the address we dial: backends are addressed as `IP:port`, but

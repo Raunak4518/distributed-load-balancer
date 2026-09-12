@@ -19,9 +19,9 @@ use tracing::Instrument;
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
-pub struct ProxyContext<R: RateLimiter, L: LoadBalancer, C: Clock> {
+pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub rate_limiter: Arc<R>,
-    pub balancer: Arc<L>,
+    pub balancer: Arc<dyn LoadBalancer>,
     pub pool: Arc<BackendPool>,
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
     pub client: ProxyClient,
@@ -112,7 +112,7 @@ impl AccessLog {
     }
 }
 
-impl<R: RateLimiter, L: LoadBalancer, C: Clock> ProxyContext<R, L, C> {
+impl<R: RateLimiter, C: Clock> ProxyContext<R, C> {
     fn circuit_breaker(&self, id: &BackendId) -> Option<&CircuitBreaker<C>> {
         self.circuit_breakers.get(id)
     }
@@ -250,14 +250,13 @@ fn build_outbound_request(
     )
 }
 
-pub async fn handle<R, L, C>(
+pub async fn handle<R, C>(
     req: Request<Incoming>,
-    ctx: Arc<ProxyContext<R, L, C>>,
+    ctx: Arc<ProxyContext<R, C>>,
     peer_ip: IpAddr,
 ) -> Result<Response<ProxyBody>, Infallible>
 where
     R: RateLimiter,
-    L: LoadBalancer,
     C: Clock,
 {
     let started = std::time::Instant::now();
@@ -333,14 +332,13 @@ where
     result
 }
 
-async fn handle_inner<R, L, C>(
+async fn handle_inner<R, C>(
     req: Request<Incoming>,
-    ctx: Arc<ProxyContext<R, L, C>>,
+    ctx: Arc<ProxyContext<R, C>>,
     peer_ip: IpAddr,
 ) -> Result<Response<ProxyBody>, Infallible>
 where
     R: RateLimiter,
-    L: LoadBalancer,
     C: Clock,
 {
     let key = extract_key(&req, &ctx.rate_limit_key, peer_ip);
@@ -416,7 +414,7 @@ where
 
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     for attempt in 0..2u8 {
-        let Some(backend_id) = ctx.balancer.pick(&ctx.pool) else {
+        let Some(backend_id) = ctx.balancer.pick(&ctx.pool, &key) else {
             return Ok(simple_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no healthy backend",
@@ -425,6 +423,10 @@ where
         let Some(backend) = ctx.pool.backend(&backend_id) else {
             continue;
         };
+        // Held across the dial+forward below and dropped at the end of this
+        // iteration regardless of outcome -- the only way `LeastConnections`
+        // has real numbers to compare.
+        let _active_guard = ctx.pool.track_active(&backend_id);
         let Some(outbound) =
             build_outbound_request(&parts, bytes.clone(), &backend, ctx.backend_tls)
         else {
@@ -519,14 +521,14 @@ mod tests {
 
     struct NoBackend;
     impl LoadBalancer for NoBackend {
-        fn pick(&self, _pool: &BackendPool) -> Option<BackendId> {
+        fn pick(&self, _pool: &BackendPool, _key: &str) -> Option<BackendId> {
             None
         }
     }
 
     struct FixedPick(BackendId);
     impl LoadBalancer for FixedPick {
-        fn pick(&self, _pool: &BackendPool) -> Option<BackendId> {
+        fn pick(&self, _pool: &BackendPool, _key: &str) -> Option<BackendId> {
             Some(self.0.clone())
         }
     }
@@ -538,7 +540,7 @@ mod tests {
     /// (which `lb-proxy` intentionally doesn't depend on).
     struct PreferFirstEligible;
     impl LoadBalancer for PreferFirstEligible {
-        fn pick(&self, pool: &BackendPool) -> Option<BackendId> {
+        fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
             pool.eligible_backends().into_iter().next()
         }
     }
@@ -570,10 +572,9 @@ mod tests {
 
     /// Drives a real request through our own proxy listener so `handle` sees
     /// a genuine `Request<Incoming>` (the type only a real connection produces).
-    async fn run_through_proxy<R, L, C>(ctx: Arc<ProxyContext<R, L, C>>) -> Response<Bytes>
+    async fn run_through_proxy<R, C>(ctx: Arc<ProxyContext<R, C>>) -> Response<Bytes>
     where
         R: RateLimiter + 'static,
-        L: LoadBalancer + 'static,
         C: Clock + 'static,
     {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

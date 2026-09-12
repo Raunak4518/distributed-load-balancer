@@ -15,7 +15,7 @@ impl RoundRobin {
 }
 
 impl LoadBalancer for RoundRobin {
-    fn pick(&self, pool: &BackendPool) -> Option<BackendId> {
+    fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
         let eligible = pool.eligible_backends();
         if eligible.is_empty() {
             return None;
@@ -42,7 +42,7 @@ mod tests {
     fn cycles_through_all_eligible_backends() {
         let pool = pool_of(&["b1", "b2", "b3"]);
         let rr = RoundRobin::new();
-        let picks: Vec<_> = (0..6).map(|_| rr.pick(&pool).unwrap()).collect();
+        let picks: Vec<_> = (0..6).map(|_| rr.pick(&pool, "").unwrap()).collect();
         assert_eq!(
             picks,
             vec![
@@ -61,7 +61,7 @@ mod tests {
         let pool = pool_of(&["b1", "b2", "b3"]);
         pool.set_active_healthy(&BackendId::new("b2"), false);
         let rr = RoundRobin::new();
-        let picks: Vec<_> = (0..4).map(|_| rr.pick(&pool).unwrap()).collect();
+        let picks: Vec<_> = (0..4).map(|_| rr.pick(&pool, "").unwrap()).collect();
         assert!(!picks.contains(&BackendId::new("b2")));
     }
 
@@ -70,6 +70,6 @@ mod tests {
         let pool = pool_of(&["b1"]);
         pool.set_active_healthy(&BackendId::new("b1"), false);
         let rr = RoundRobin::new();
-        assert_eq!(rr.pick(&pool), None);
+        assert_eq!(rr.pick(&pool, ""), None);
     }
 }

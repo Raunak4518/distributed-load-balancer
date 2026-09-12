@@ -1,13 +1,18 @@
 use crate::backend::{Backend, BackendId};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct BackendState {
     backend: Backend,
     active_healthy: AtomicBool,
     circuit_open: AtomicBool,
+    /// In-flight requests/connections currently dialed to this backend --
+    /// what `LeastConnections` compares. Incremented/decremented only
+    /// through `ActiveConnGuard`, never directly, so a count can't leak on
+    /// an early return from the caller.
+    active_conns: AtomicUsize,
 }
 
 struct PoolState {
@@ -27,6 +32,7 @@ impl PoolState {
                     backend: b,
                     active_healthy: AtomicBool::new(true),
                     circuit_open: AtomicBool::new(false),
+                    active_conns: AtomicUsize::new(0),
                 }),
             );
         }
@@ -86,6 +92,33 @@ impl BackendPool {
         self.inner.load().order.clone()
     }
 
+    /// In-flight requests/connections currently dialed to `id`. `0` for an
+    /// unknown id, same as every other per-backend accessor here.
+    pub fn active_count(&self, id: &BackendId) -> usize {
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .map(|s| s.active_conns.load(Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// Marks one request/connection as in flight against `id` for as long as
+    /// the returned guard lives; the count decrements on `Drop` regardless of
+    /// how the caller's scope exits, matching the `ConnectionGuard`/`IpGuard`
+    /// pattern already used elsewhere for exactly this reason. A no-op guard
+    /// (nothing to decrement) if `id` is unknown -- callers should not have
+    /// to check `backend()` first just to track load.
+    pub fn track_active(self: &Arc<Self>, id: &BackendId) -> ActiveConnGuard {
+        if let Some(s) = self.inner.load().states.get(id) {
+            s.active_conns.fetch_add(1, Ordering::SeqCst);
+        }
+        ActiveConnGuard {
+            pool: Arc::clone(self),
+            id: id.clone(),
+        }
+    }
+
     pub fn apply_resolved(&self, backends: Vec<Backend>) {
         let previous = self.inner.load();
         let mut order = Vec::with_capacity(backends.len());
@@ -97,16 +130,35 @@ impl BackendPool {
                     backend: b,
                     active_healthy: AtomicBool::new(existing.active_healthy.load(Ordering::SeqCst)),
                     circuit_open: AtomicBool::new(existing.circuit_open.load(Ordering::SeqCst)),
+                    // A persisting backend's in-flight work didn't go
+                    // anywhere just because the pool was refreshed.
+                    active_conns: AtomicUsize::new(existing.active_conns.load(Ordering::SeqCst)),
                 }),
                 None => Arc::new(BackendState {
                     backend: b,
                     active_healthy: AtomicBool::new(true),
                     circuit_open: AtomicBool::new(false),
+                    active_conns: AtomicUsize::new(0),
                 }),
             };
             states.insert(order.last().unwrap().clone(), state);
         }
         self.inner.store(Arc::new(PoolState { order, states }));
+    }
+}
+
+/// Returned by `BackendPool::track_active`. Decrements the count on `Drop`
+/// so it cannot be leaked by an early return from the caller's scope.
+pub struct ActiveConnGuard {
+    pool: Arc<BackendPool>,
+    id: BackendId,
+}
+
+impl Drop for ActiveConnGuard {
+    fn drop(&mut self) {
+        if let Some(s) = self.pool.inner.load().states.get(&self.id) {
+            s.active_conns.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -234,5 +286,47 @@ mod tests {
             pool.all_backend_ids(),
             vec![BackendId::new("b3"), BackendId::new("b1")]
         );
+    }
+
+    #[test]
+    fn track_active_increments_and_decrements_on_drop() {
+        let pool = Arc::new(pool_of(&["b1"]));
+        let id = BackendId::new("b1");
+        assert_eq!(pool.active_count(&id), 0);
+
+        let guard = pool.track_active(&id);
+        assert_eq!(pool.active_count(&id), 1);
+
+        let guard2 = pool.track_active(&id);
+        assert_eq!(pool.active_count(&id), 2);
+
+        drop(guard);
+        assert_eq!(pool.active_count(&id), 1);
+        drop(guard2);
+        assert_eq!(pool.active_count(&id), 0);
+    }
+
+    #[test]
+    fn active_count_survives_apply_resolved_for_a_persisting_backend() {
+        let pool = Arc::new(pool_of(&["b1"]));
+        let id = BackendId::new("b1");
+        let _guard = pool.track_active(&id);
+
+        pool.apply_resolved(vec![Backend::new(
+            "b1",
+            "127.0.0.1:9999".parse().unwrap(),
+            1,
+            None,
+        )]);
+
+        assert_eq!(pool.active_count(&id), 1);
+    }
+
+    #[test]
+    fn active_count_is_zero_for_an_unknown_backend() {
+        let pool = Arc::new(pool_of(&["b1"]));
+        assert_eq!(pool.active_count(&BackendId::new("ghost")), 0);
+        // Must not panic, matching every other per-backend accessor here.
+        let _guard = pool.track_active(&BackendId::new("ghost"));
     }
 }

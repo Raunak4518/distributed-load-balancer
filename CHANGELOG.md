@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Three new `load_balancing.strategy` options**: `least_connections` (picks
+  the eligible backend with the fewest in-flight requests/connections),
+  `weighted_round_robin` (round-robin, but each backend's `weight` now
+  actually does something — previously parsed and stored, never read), and
+  `consistent_hash` (hashes this listener's rate-limit key onto a ring of
+  backends, so the same client keeps landing on the same backend as long as
+  the backend set doesn't change; removing a backend remaps only a minority
+  of keys, not all of them). `round_robin` remains the default.
 - **`examples/`**: one minimal, runnable config per deployment shape (plain
   HTTP reverse proxy, TCP passthrough, TLS termination with backend
   re-encryption, DNS-discovered backends, a two-node cluster), each validated

@@ -31,7 +31,8 @@ lb-server          Binary. Config, binding, wiring, shutdown.
 │                  types (Backend, BackendPool), config parsing and validation.
 ├── lb-proxy       L7 forwarding, body limits, hop-by-hop stripping, DNS-pinned resolver.
 ├── lb-tcp         L4 proxying: bidirectional pump with idle timeout.
-├── lb-balancer    Round-robin (weighted, skips ineligible backends).
+├── lb-balancer    Round-robin, least-connections, weighted round-robin,
+│                  consistent hashing (all skip ineligible backends).
 ├── lb-ratelimit   GCRA with bounded key tracking and periodic sweep.
 ├── lb-healthcheck Active health checks, HTTP/TCP probes, circuit breaker.
 ├── lb-cluster     G-Counter CRDT, HMAC-authenticated gossip, peer sync.
@@ -144,7 +145,7 @@ Full field-by-field reference: [docs/configuration-reference.md](docs/configurat
 5. Local GCRA check — free, in-process. Then cluster budget if configured.
 6. Circuit-breaker states refreshed from the breakers to the pool.
 7. Body read with size cap and timeout.
-8. Round-robin picks an eligible backend. Request forwarded through a `hyper_util::Client` with connection pooling.
+8. The configured strategy (`round_robin`, `least_connections`, `weighted_round_robin`, or `consistent_hash`) picks an eligible backend. Request forwarded through a `hyper_util::Client` with connection pooling.
 9. On backend failure, one retry to a different backend. On success, hop-by-hop headers stripped, `X-Request-Id` added, HSTS injected if configured.
 
 ### TCP

@@ -1,10 +1,10 @@
 use arc_swap::ArcSwap;
-use lb_balancer::RoundRobin;
+use lb_balancer::{ConsistentHash, LeastConnections, RoundRobin, WeightedRoundRobin};
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::ClusterCoordinator;
 use lb_core::{
-    Backend, BackendPool, ClusterConfig, Config, Http2Config, ListenerConfig, LoggingConfig,
-    Protocol, SystemClock,
+    Backend, BackendPool, ClusterConfig, Config, Http2Config, ListenerConfig, LoadBalancer,
+    LoadBalancingStrategy, LoggingConfig, Protocol, SystemClock,
 };
 use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
@@ -18,9 +18,22 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub type HttpContext = ProxyContext<Gcra<SystemClock>, RoundRobin, SystemClock>;
-pub type TcpAppContext = TcpContext<Gcra<SystemClock>, RoundRobin, SystemClock>;
+pub type HttpContext = ProxyContext<Gcra<SystemClock>, SystemClock>;
+pub type TcpAppContext = TcpContext<Gcra<SystemClock>, SystemClock>;
 pub type AppClusterNode = ClusterNode<SystemClock>;
+
+/// Builds the operator-chosen balancer for one listener. A `match` rather
+/// than a registry: this is a closed set the same way `Protocol` is, and
+/// every arm just needs a `Default`-ish constructor -- no per-strategy
+/// config to thread through yet.
+fn build_balancer(strategy: &LoadBalancingStrategy) -> Arc<dyn LoadBalancer> {
+    match strategy {
+        LoadBalancingStrategy::RoundRobin => Arc::new(RoundRobin::new()),
+        LoadBalancingStrategy::LeastConnections => Arc::new(LeastConnections::new()),
+        LoadBalancingStrategy::WeightedRoundRobin => Arc::new(WeightedRoundRobin::new()),
+        LoadBalancingStrategy::ConsistentHash => Arc::new(ConsistentHash::new()),
+    }
+}
 
 /// One configured listener, ready to accept. An enum rather than a trait:
 /// this is a genuinely closed set, and `serve_listener` must match on it
@@ -498,7 +511,7 @@ pub(crate) fn build_listener_core(
             };
             ListenerCoreKind::Http(Box::new(ProxyContext {
                 rate_limiter,
-                balancer: Arc::new(RoundRobin::new()),
+                balancer: build_balancer(&lc.load_balancing.strategy),
                 pool: Arc::clone(&pool),
                 circuit_breakers,
                 client,
@@ -537,7 +550,7 @@ pub(crate) fn build_listener_core(
             });
             ListenerCoreKind::Tcp(TcpContext {
                 rate_limiter,
-                balancer: Arc::new(RoundRobin::new()),
+                balancer: build_balancer(&lc.load_balancing.strategy),
                 pool: Arc::clone(&pool),
                 circuit_breakers,
                 connect_timeout: lc.connect_timeout(),
