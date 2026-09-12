@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Admin backend-management API**: `GET /backends` (every listener's
+  backends, with health/circuit/drain state and in-flight connection
+  counts, as JSON) and `POST /backends/{listener}/{id}/drain` /
+  `.../undrain` on the existing private admin port — runtime inspection
+  and draining with no config edit or reload, the two primitives nginx
+  paywalls into nginx Plus's dynamic reconfiguration API. Deliberately
+  narrower than adding/removing backends live (config + `SIGHUP` still
+  owns that) — this is inspection and draining only. A drain is tracked
+  as its own flag, independent of the active health checker's own
+  healthy/unhealthy verdict, so a passing probe can't silently undo an
+  operator's drain request.
 - **`proxy_protocol` (either listener type)**: reads the real client address
   from a PROXY protocol header (v1 text, v2 binary, auto-detected) sent by a
   trusted front-end proxy/ELB/CDN ahead of everything else on the

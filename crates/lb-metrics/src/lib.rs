@@ -1,7 +1,7 @@
 mod admin;
 mod handles;
 
-pub use admin::{spawn_admin_server, ReadinessCheck};
+pub use admin::{spawn_admin_server, AdminExtension, ReadinessCheck};
 pub use handles::{BackendMetrics, ListenerMetrics, RequestCounters, StatusClass};
 
 /// Re-exported so consumer crates can hold metric handles without taking a

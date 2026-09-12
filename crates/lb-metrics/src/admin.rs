@@ -7,13 +7,35 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Returns true when this instance should receive traffic.
 pub type ReadinessCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Serves `/metrics`, `/healthz` and `/ready` on a private listener.
+/// Extends this admin server with routes this crate has no way to serve
+/// itself: `lb-metrics` knows nothing of `BackendPool` or live listener
+/// state (both live in `lb-core`/`lb-server`), and `lb-server` already
+/// depends on `lb-metrics`, so a reverse dependency to reach them from here
+/// would cycle. The caller that *does* have that data supplies this closure
+/// instead -- the same "the crate that needs the extension point defines
+/// it, the crate with the concrete data implements it" shape already used
+/// for `ClusterCoordinator`.
+///
+/// Only ever invoked for a path this server's own routes don't own (see
+/// `route`'s dispatch), so it can assume ownership of the request and
+/// always produce a real response -- there is no "not mine, try something
+/// else" case once it's been called.
+pub type AdminExtension = Arc<
+    dyn Fn(Request<Incoming>) -> Pin<Box<dyn Future<Output = Response<Full<Bytes>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Serves `/metrics`, `/healthz` and `/ready` on a private listener, plus
+/// whatever `extension` adds.
 ///
 /// Deliberately separate from the traffic listeners: this surface exposes
 /// internal topology (backend names, health, traffic volumes) and must not
@@ -22,6 +44,7 @@ pub fn spawn_admin_server(
     metrics: Arc<Metrics>,
     listener: TcpListener,
     readiness: ReadinessCheck,
+    extension: Option<AdminExtension>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -31,11 +54,13 @@ pub fn spawn_admin_server(
             let io = TokioIo::new(stream);
             let metrics = Arc::clone(&metrics);
             let readiness = Arc::clone(&readiness);
+            let extension = extension.clone();
             tokio::spawn(async move {
                 let svc = service_fn(move |req| {
                     let metrics = Arc::clone(&metrics);
                     let readiness = Arc::clone(&readiness);
-                    async move { route(req, metrics, readiness).await }
+                    let extension = extension.clone();
+                    async move { route(req, metrics, readiness, extension).await }
                 });
                 if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
                     tracing::debug!(error = %err, "admin connection error");
@@ -49,7 +74,20 @@ async fn route(
     req: Request<Incoming>,
     metrics: Arc<Metrics>,
     readiness: ReadinessCheck,
+    extension: Option<AdminExtension>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    // Checked by prefix, before matching on the exact built-in paths below,
+    // so the request can be handed to the extension by value (it may need
+    // the body, e.g. for a future write endpoint) without first needing it
+    // back to fall through -- there is nothing to fall through to once a
+    // path is recognized as the extension's own.
+    if req.uri().path().starts_with("/backends") {
+        return Ok(match extension {
+            Some(ext) => ext(req).await,
+            None => text(StatusCode::NOT_FOUND, "not found".to_string()),
+        });
+    }
+
     let response = match req.uri().path() {
         "/metrics" => text(StatusCode::OK, metrics.gather_text()),
 
@@ -107,7 +145,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        spawn_admin_server(metrics, listener, readiness);
+        spawn_admin_server(metrics, listener, readiness, None);
         (format!("http://{addr}"), flag)
     }
 
@@ -163,6 +201,59 @@ mod tests {
                 .unwrap()
                 .status(),
             404
+        );
+    }
+
+    /// A `/backends...` path with no extension configured still 404s like
+    /// any other unrecognized path -- the prefix check alone must not
+    /// change behavior when there is nothing to hand the request to.
+    #[tokio::test]
+    async fn backends_path_without_an_extension_is_404() {
+        let (base, _) = start(true).await;
+        assert_eq!(
+            reqwest::get(format!("{base}/backends"))
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
+
+    /// The extension is tried for anything under `/backends`, and its
+    /// response is returned verbatim -- proving the dispatch actually wires
+    /// the closure in, not just that the built-in routes still work.
+    #[tokio::test]
+    async fn backends_path_is_handed_to_the_extension() {
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let readiness: ReadinessCheck = Arc::new(|| true);
+        let extension: AdminExtension = Arc::new(|req: Request<Incoming>| {
+            Box::pin(async move {
+                text(
+                    StatusCode::OK,
+                    format!("extension saw {}", req.uri().path()),
+                )
+            })
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_admin_server(metrics, listener, readiness, Some(extension));
+
+        let body = reqwest::get(format!("http://{addr}/backends/web/b1/drain"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "extension saw /backends/web/b1/drain");
+
+        // Built-in routes are unaffected by an extension being present.
+        assert_eq!(
+            reqwest::get(format!("http://{addr}/healthz"))
+                .await
+                .unwrap()
+                .status(),
+            200
         );
     }
 }

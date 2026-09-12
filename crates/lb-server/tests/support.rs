@@ -471,6 +471,52 @@ listen = "{traffic_listen}"
     )
 }
 
+/// Same shape as `admin_config_toml`, but with two backends on the traffic
+/// listener -- for tests proving the admin API's drain/undrain actually
+/// changes which backend receives traffic, not just that the pool method
+/// gets called.
+pub fn admin_config_toml_two_backends(
+    admin_listen: SocketAddr,
+    traffic_listen: SocketAddr,
+    backend_a: SocketAddr,
+    backend_b: SocketAddr,
+) -> String {
+    format!(
+        r#"
+[admin]
+listen = "{admin_listen}"
+
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{traffic_listen}"
+
+  [[listeners.backends]]
+  id = "a"
+  address = "{backend_a}"
+
+  [[listeners.backends]]
+  id = "b"
+  address = "{backend_b}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 1000
+  burst = 1000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    )
+}
+
 /// Waits until `addr` accepts a TCP connection, or the deadline passes.
 ///
 /// Replaces `sleep(150ms)` after starting a server. A fixed sleep is a race:

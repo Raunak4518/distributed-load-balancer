@@ -871,6 +871,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "tracing",

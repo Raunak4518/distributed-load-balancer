@@ -196,6 +196,10 @@ An optional `[tracing]` section exports one OpenTelemetry span per HTTP request 
 
 `/healthz` is always 200 — liveness must not follow backend health, or a backend outage restarts the load balancer in a loop. `/ready` returns 503 when no backend in any pool is eligible.
 
+### Admin backend API
+
+The same private admin port also serves `GET /backends` (every listener's backends, with health/circuit/drain state and in-flight connection counts, as JSON) and `POST /backends/{listener}/{id}/drain` / `.../undrain` — runtime backend inspection and draining with no config edit or reload, the two things nginx paywalls into nginx Plus's dynamic reconfiguration API. A drain is a separate flag from the active health checker's own healthy/unhealthy verdict, so a passing probe doesn't silently undo an operator's drain request. It doesn't add or remove backends — that still goes through the config file and `SIGHUP`.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) — crate graph, trait boundaries, wiring

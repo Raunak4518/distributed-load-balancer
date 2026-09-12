@@ -8,6 +8,13 @@ struct BackendState {
     backend: Backend,
     active_healthy: AtomicBool,
     circuit_open: AtomicBool,
+    /// Operator-requested drain (the admin API's `POST .../drain`),
+    /// independent of `active_healthy`: the active health checker also
+    /// writes `active_healthy` on its own probe schedule, so folding a
+    /// manual drain into that same flag would just have the next successful
+    /// probe undo it. A third, orthogonal flag is what makes "drained" survive
+    /// health checks the way "circuit open" already survives them.
+    manually_drained: AtomicBool,
     /// In-flight requests/connections currently dialed to this backend --
     /// what `LeastConnections` compares. Incremented/decremented only
     /// through `ActiveConnGuard`, never directly, so a count can't leak on
@@ -32,6 +39,7 @@ impl PoolState {
                     backend: b,
                     active_healthy: AtomicBool::new(true),
                     circuit_open: AtomicBool::new(false),
+                    manually_drained: AtomicBool::new(false),
                     active_conns: AtomicUsize::new(0),
                 }),
             );
@@ -67,9 +75,56 @@ impl BackendPool {
         }
     }
 
+    /// Operator-requested drain, e.g. the admin API's `POST .../drain` --
+    /// see `BackendState::manually_drained` for why this is a separate flag
+    /// from `active_healthy` rather than reusing it.
+    pub fn set_manually_drained(&self, id: &BackendId, drained: bool) {
+        if let Some(s) = self.inner.load().states.get(id) {
+            s.manually_drained.store(drained, Ordering::SeqCst);
+        }
+    }
+
+    /// The manual-drain flag alone, `false` for an unknown id -- see
+    /// `is_active_healthy` for why the individual flags are exposed
+    /// separately from `is_eligible`.
+    pub fn is_manually_drained(&self, id: &BackendId) -> bool {
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .is_some_and(|s| s.manually_drained.load(Ordering::SeqCst))
+    }
+
+    /// The active-health-check flag alone, `false` for an unknown id --
+    /// distinct from `is_eligible`, which also folds in `circuit_open`.
+    /// Exposed so callers (the admin API) can report *why* a backend is
+    /// ineligible: manually drained vs. circuit-tripped are different
+    /// operational facts even though both exclude it from
+    /// `eligible_backends()`.
+    pub fn is_active_healthy(&self, id: &BackendId) -> bool {
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .is_some_and(|s| s.active_healthy.load(Ordering::SeqCst))
+    }
+
+    /// The circuit-breaker flag alone, `false` for an unknown id -- see
+    /// `is_active_healthy` for why this is exposed separately from
+    /// `is_eligible`.
+    pub fn is_circuit_open(&self, id: &BackendId) -> bool {
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .is_some_and(|s| s.circuit_open.load(Ordering::SeqCst))
+    }
+
     pub fn is_eligible(&self, id: &BackendId) -> bool {
         self.inner.load().states.get(id).is_some_and(|s| {
-            s.active_healthy.load(Ordering::SeqCst) && !s.circuit_open.load(Ordering::SeqCst)
+            s.active_healthy.load(Ordering::SeqCst)
+                && !s.circuit_open.load(Ordering::SeqCst)
+                && !s.manually_drained.load(Ordering::SeqCst)
         })
     }
 
@@ -82,6 +137,7 @@ impl BackendPool {
                 snapshot.states.get(*id).is_some_and(|s| {
                     s.active_healthy.load(Ordering::SeqCst)
                         && !s.circuit_open.load(Ordering::SeqCst)
+                        && !s.manually_drained.load(Ordering::SeqCst)
                 })
             })
             .cloned()
@@ -130,6 +186,9 @@ impl BackendPool {
                     backend: b,
                     active_healthy: AtomicBool::new(existing.active_healthy.load(Ordering::SeqCst)),
                     circuit_open: AtomicBool::new(existing.circuit_open.load(Ordering::SeqCst)),
+                    manually_drained: AtomicBool::new(
+                        existing.manually_drained.load(Ordering::SeqCst),
+                    ),
                     // A persisting backend's in-flight work didn't go
                     // anywhere just because the pool was refreshed.
                     active_conns: AtomicUsize::new(existing.active_conns.load(Ordering::SeqCst)),
@@ -138,6 +197,7 @@ impl BackendPool {
                     backend: b,
                     active_healthy: AtomicBool::new(true),
                     circuit_open: AtomicBool::new(false),
+                    manually_drained: AtomicBool::new(false),
                     active_conns: AtomicUsize::new(0),
                 }),
             };
@@ -195,6 +255,69 @@ mod tests {
         let pool = pool_of(&["b1", "b2"]);
         pool.set_circuit_open(&BackendId::new("b2"), true);
         assert_eq!(pool.eligible_backends(), vec![BackendId::new("b1")]);
+    }
+
+    /// The two flags are independently observable, not just folded into
+    /// `is_eligible` -- an admin listing needs to say *why* a backend is
+    /// out of rotation, not just that it is.
+    #[test]
+    fn active_healthy_and_circuit_open_are_independently_observable() {
+        let pool = pool_of(&["b1"]);
+        let id = BackendId::new("b1");
+        assert!(pool.is_active_healthy(&id));
+        assert!(!pool.is_circuit_open(&id));
+
+        pool.set_active_healthy(&id, false);
+        assert!(!pool.is_active_healthy(&id));
+        assert!(!pool.is_circuit_open(&id));
+
+        pool.set_active_healthy(&id, true);
+        pool.set_circuit_open(&id, true);
+        assert!(pool.is_active_healthy(&id));
+        assert!(pool.is_circuit_open(&id));
+    }
+
+    #[test]
+    fn unknown_id_reports_healthy_flags_as_false() {
+        let pool = pool_of(&["b1"]);
+        let ghost = BackendId::new("ghost");
+        assert!(!pool.is_active_healthy(&ghost));
+        assert!(!pool.is_circuit_open(&ghost));
+    }
+
+    #[test]
+    fn manual_drain_removes_from_eligible() {
+        let pool = pool_of(&["b1", "b2"]);
+        pool.set_manually_drained(&BackendId::new("b1"), true);
+        assert_eq!(pool.eligible_backends(), vec![BackendId::new("b2")]);
+    }
+
+    /// The whole reason this is a separate flag from `active_healthy`: the
+    /// active health checker writes that flag on its own schedule, entirely
+    /// oblivious to an operator's drain request. If a drain were folded
+    /// into `active_healthy`, the very next successful probe would silently
+    /// undo it.
+    #[test]
+    fn manual_drain_survives_an_unrelated_healthy_report() {
+        let pool = pool_of(&["b1"]);
+        let id = BackendId::new("b1");
+        pool.set_manually_drained(&id, true);
+        pool.set_active_healthy(&id, true); // e.g. a passing health probe
+        assert!(
+            !pool.is_eligible(&id),
+            "drain was undone by a health report"
+        );
+        assert!(pool.is_manually_drained(&id));
+    }
+
+    #[test]
+    fn undraining_restores_eligibility() {
+        let pool = pool_of(&["b1"]);
+        let id = BackendId::new("b1");
+        pool.set_manually_drained(&id, true);
+        assert!(!pool.is_eligible(&id));
+        pool.set_manually_drained(&id, false);
+        assert!(pool.is_eligible(&id));
     }
 
     #[test]

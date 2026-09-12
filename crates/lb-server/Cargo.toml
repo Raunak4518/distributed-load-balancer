@@ -55,6 +55,15 @@ arc-swap = "1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 # Only `hyper_util::rt::*` is used here, all of it under "tokio".
 hyper-util = { version = "0.1", features = ["tokio"] }
+# For the admin backend-management extension (`admin_backends.rs`): its
+# response type matches `lb_metrics::admin`'s own `Response<Full<Bytes>>`,
+# and its `GET /backends` listing is JSON. Already in the lock via other
+# workspace members (lb-cluster for serde_json, lb-metrics's own admin
+# module for the other two) -- this just makes lb-server's own use of them
+# a direct dependency instead of an implicit transitive one.
+bytes = "1"
+http-body-util = "0.1"
+serde_json = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

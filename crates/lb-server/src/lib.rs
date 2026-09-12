@@ -1,3 +1,4 @@
+mod admin_backends;
 mod dns;
 mod first_byte;
 mod limits;
@@ -159,6 +160,7 @@ pub async fn run_and_report_reload_handle(
             Arc::clone(&metrics),
             admin_listener,
             readiness,
+            Some(admin_backends::extension(Arc::clone(&reload))),
         ));
     }
 
