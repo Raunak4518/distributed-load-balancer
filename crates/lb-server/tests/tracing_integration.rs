@@ -111,7 +111,7 @@ listen = "{listen}"
     .unwrap();
 
     let guard = lb_tracing::init(&config.logging, config.tracing.as_ref()).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     for _ in 0..5 {

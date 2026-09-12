@@ -40,6 +40,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   there, and `reqwest` pulls in `native-tls`/`openssl-sys` regardless of
   requested features, which this project's musl static release binaries
   have no reason to inherit for a telemetry side channel.
+- **Config hot-reload via `SIGHUP`** (`systemctl reload lb-server`, or
+  `kill -HUP <pid>`): a listener's `backends`, `dns_discovery`, `health_check`,
+  and `rate_limit` apply live, with no dropped connections — each newly
+  accepted connection reads whatever config is current, while one already in
+  flight keeps whichever snapshot it loaded (`ArcSwap`, the same pattern the
+  TLS cert reloader already used for its own seam). Adding, removing, or
+  re-addressing a listener; its `tls`/`backend_tls`/`http2`/connection-limit
+  settings; and anything under `[server]`/`[admin]`/`[cluster]`/`[logging]`/
+  `[tracing]` still require a restart — a reload that would need one is
+  refused outright, logged with the reason, and changes nothing.
 
 ## [0.2.0] - 2026-09-12
 

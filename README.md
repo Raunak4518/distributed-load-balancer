@@ -118,6 +118,8 @@ Prebuilt binaries and packages are published on each [GitHub Release](https://gi
 
 All configuration lives in a single TOML file. A bad config fails the process at startup — no partial or default-assumed settings are served.
 
+Send `SIGHUP` (`systemctl reload lb-server`, or `kill -HUP <pid>`) to reload without a restart: a listener's backends, `dns_discovery`, health checks, and rate limit apply live, with no dropped connections. Adding, removing, or re-addressing a listener, its TLS/HTTP2/connection-limit settings, and anything under `[server]`/`[admin]`/`[cluster]`/`[logging]`/`[tracing]` still need a restart — a reload that would require one is refused outright, logged with the reason, and changes nothing.
+
 **Pick your setup**: [`examples/`](examples/) has one minimal, runnable config per common deployment shape — plain HTTP reverse proxy, TCP passthrough, TLS termination with backend re-encryption, DNS-discovered backends, and a two-node cluster. Copy the one closest to your use case and adjust the addresses.
 
 See [`config.example.toml`](config.example.toml) for the authoritative reference with inline commentary. The major sections:

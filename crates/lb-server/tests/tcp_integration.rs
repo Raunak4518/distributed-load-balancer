@@ -23,7 +23,7 @@ async fn proxies_tcp_bytes_end_to_end() {
         1000,
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let echoed = tcp_roundtrip(listen, b"hello over tcp").await.unwrap();
@@ -47,7 +47,7 @@ async fn rate_limited_tcp_connection_is_closed_with_no_data() {
         3,
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     assert_eq!(tcp_roundtrip(listen, b"one").await.unwrap(), b"one");
@@ -83,7 +83,7 @@ async fn fails_over_to_a_healthy_tcp_backend() {
         1000,
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     for _ in 0..4 {
@@ -153,7 +153,7 @@ listen = "{tcp_listen}"
     );
 
     let config = Config::parse(&config_text).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     // Both listeners must be up before either side is exercised.
     support::wait_until_listening(http_listen).await;
     support::wait_until_listening(tcp_listen).await;

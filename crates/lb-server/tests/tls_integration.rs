@@ -105,7 +105,7 @@ async fn an_https_request_is_proxied_to_a_plaintext_backend() {
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 100)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // The certificate is self-signed, so the test client must be told to
@@ -130,7 +130,7 @@ async fn a_client_that_never_starts_the_handshake_is_dropped() {
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 300, 100)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let mut silent = TcpStream::connect(listen).await.unwrap();
@@ -156,7 +156,7 @@ async fn plaintext_on_a_tls_port_is_closed_not_hung() {
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 100)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let mut client = TcpStream::connect(listen).await.unwrap();
@@ -197,7 +197,7 @@ async fn a_certificate_that_cannot_be_loaded_fails_startup_with_an_error() {
     .unwrap();
 
     // Awaited, not spawned: the whole point is that the failure is returned.
-    let err = lb_server::run(config)
+    let err = lb_server::run(config, None)
         .await
         .expect_err("an unreadable certificate must fail startup");
 
@@ -224,7 +224,7 @@ async fn a_failed_handshake_releases_the_connection_budget() {
     let (_dir, cert, key) = cert_files(&["localhost"]);
     // Three per-IP slots, and a handshake that gives up after 300ms.
     let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 300, 3)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // Held open, saying nothing, for the whole test: if the guards leaked,
@@ -283,7 +283,7 @@ listen = "{listen}"
 "#
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let status = reqwest::get(format!("http://{listen}/"))
@@ -354,7 +354,7 @@ async fn hsts_header_is_added_when_configured_on_a_tls_listener() {
         listen, backend, &cert, &key, 31_536_000,
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::builder()
@@ -389,7 +389,7 @@ async fn hsts_header_is_absent_by_default_on_a_tls_listener() {
     // `tls_http_config` never sets hsts_max_age_secs, so this exercises the
     // config default of 0.
     let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 100)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::builder()
@@ -443,7 +443,7 @@ listen = "{listen}"
 "#
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let resp = reqwest::get(format!("http://{listen}/")).await.unwrap();
@@ -519,7 +519,7 @@ async fn a_certificate_rewritten_on_disk_is_reloaded_without_a_restart() {
         listen, admin, backend, &cert, &key, 1,
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
     support::wait_until_listening(admin).await;
 
@@ -713,7 +713,7 @@ async fn a_tls_tcp_listener_proxies_bytes_to_a_plaintext_backend() {
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config = Config::parse(&tls_tcp_config(listen, backend, &cert, &key)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let mut tls = tls_connect(listen).await;
@@ -952,7 +952,7 @@ async fn an_untrusted_backend_certificate_is_refused() {
         "localhost",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let status = trusting_client()
@@ -989,7 +989,7 @@ async fn a_listener_without_backend_tls_still_forwards_plaintext() {
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 100)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let resp = trusting_client()
@@ -1022,7 +1022,7 @@ async fn a_backend_trusted_via_ca_file_is_proxied_to() {
         "localhost",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let resp = trusting_client()
@@ -1065,7 +1065,7 @@ async fn a_backend_whose_server_name_does_not_resolve_via_dns_is_still_proxied_t
         "backend.invalid",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // Bounded explicitly: a real-DNS lookup on a `.invalid` name may hang
@@ -1115,7 +1115,7 @@ async fn the_danger_flag_forwards_to_an_unverifiable_backend_and_is_visible() {
         "localhost",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
     support::wait_until_listening(admin).await;
 
@@ -1161,7 +1161,7 @@ async fn an_unreadable_ca_file_fails_startup_with_an_error() {
     ))
     .unwrap();
 
-    let err = lb_server::run(config)
+    let err = lb_server::run(config, None)
         .await
         .expect_err("an unreadable ca_file must fail startup");
 
@@ -1290,7 +1290,7 @@ async fn a_tcp_listener_re_encrypts_to_a_tls_backend() {
     let listen = free_addr().await;
 
     let config = Config::parse(&reencrypting_tcp_config(listen, backend, &bcert, None)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let echoed = tokio::time::timeout(
@@ -1320,7 +1320,7 @@ async fn a_tcp_listener_refuses_an_untrusted_backend() {
     let (_odir, other, _okey) = cert_files(&["someone.else"]);
 
     let config = Config::parse(&reencrypting_tcp_config(listen, backend, &other, None)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let echoed = tokio::time::timeout(
@@ -1415,7 +1415,7 @@ async fn a_backend_we_cannot_verify_also_probes_unhealthy() {
         "localhost",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
     support::wait_until_listening(admin).await;
 
@@ -1491,7 +1491,7 @@ async fn a_backend_we_can_verify_probes_healthy() {
         "localhost",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
     support::wait_until_listening(admin).await;
 
@@ -1586,7 +1586,7 @@ listen = "{listen}"
     ))
     .unwrap();
 
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
     // dns_discovery polls every 1s; give it a couple of ticks to resolve
     // "localhost" and for the health checker to confirm both backends up.
@@ -1633,7 +1633,7 @@ async fn a_tcp_backend_we_cannot_verify_also_probes_unhealthy() {
         Some(admin),
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     // Deliberately *not* waiting on the traffic listener: connecting to it is
     // a client connection, and at L4 that would drive the data plane's own
     // outbound attempt and trip the circuit breaker -- which would take the
@@ -1680,7 +1680,7 @@ async fn a_tcp_backend_we_can_verify_probes_healthy() {
         Some(admin),
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     // Not waiting on the traffic listener, for the same reason as the test
     // above: a client connection would complete a handshake of its own, and
     // the handshake count below has to be the *probe*'s work alone.

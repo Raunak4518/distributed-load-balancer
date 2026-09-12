@@ -80,7 +80,7 @@ async fn main() -> std::io::Result<()> {
                     eprintln!("failed to initialize tracing: {err}");
                     std::process::exit(1);
                 });
-            let result = lb_server::run(config).await;
+            let result = lb_server::run(config, Some(std::path::PathBuf::from(&config_path))).await;
             tracing_guard.shutdown();
             result
         }

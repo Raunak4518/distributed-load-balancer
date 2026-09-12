@@ -6,7 +6,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -27,14 +27,14 @@ pub struct Config {
     pub tracing: Option<TracingConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct AdminConfig {
     /// Bind privately. This surface exposes internal topology (backend names,
     /// health, traffic volumes) and must never face the public internet.
     pub listen: SocketAddr,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TracingConfig {
     /// Where spans are exported to, over OTLP/HTTP. A local collector
     /// (`http://localhost:4318`) is the common case; a plain `http://`
@@ -52,7 +52,7 @@ fn default_sample_ratio() -> f64 {
     1.0
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub format: LogFormat,
@@ -86,7 +86,7 @@ pub enum LogFormat {
     Pretty,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ClusterConfig {
     pub node_id: String,
     pub listen: SocketAddr,
@@ -148,7 +148,7 @@ impl ClusterConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_drain_timeout_ms")]
     pub drain_timeout_ms: u64,
@@ -173,7 +173,7 @@ pub enum Protocol {
     Tcp,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ListenerConfig {
     pub name: String,
     pub protocol: Protocol,
@@ -261,7 +261,7 @@ impl ListenerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TlsConfig {
     pub certificates: Vec<CertificateConfig>,
     pub handshake_timeout_ms: Option<u64>,
@@ -293,7 +293,7 @@ impl TlsConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CertificateConfig {
     /// Appears in metrics. Operator-chosen, never client-controlled.
     pub name: String,
@@ -324,7 +324,7 @@ impl TryFrom<String> for TlsVersion {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BackendTlsConfig {
     /// Omit for the system trust store. Internal PKI is the common case on
     /// this path, which is why the file form exists at all.
@@ -333,7 +333,7 @@ pub struct BackendTlsConfig {
     pub danger_accept_invalid_certs: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BackendConfig {
     pub id: String,
     pub address: SocketAddr,
@@ -347,7 +347,7 @@ fn default_weight() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct HealthCheckConfig {
     /// Required for HTTP listeners, forbidden for TCP listeners (there is
     /// nothing to GET on a Postgres port).
@@ -358,7 +358,7 @@ pub struct HealthCheckConfig {
     pub cooldown_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RateLimitConfig {
     pub key: RateLimitKeySource,
     pub rate_per_sec: f64,
@@ -397,7 +397,7 @@ impl TryFrom<String> for RateLimitKeySource {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LoadBalancingConfig {
     pub strategy: LoadBalancingStrategy,
 }

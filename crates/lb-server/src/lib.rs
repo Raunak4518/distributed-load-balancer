@@ -1,11 +1,13 @@
 mod dns;
 mod first_byte;
 mod limits;
+pub mod reload;
 mod shutdown;
 mod wiring;
 
 pub use wiring::{
-    build_app, AppClusterNode, ClusterSetup, HttpContext, ListenerRuntime, TcpAppContext, WiredApp,
+    build_app, AppClusterNode, ClusterSetup, HttpContext, ListenerReloadHandle, ListenerRuntime,
+    ReloadState, TcpAppContext, WiredApp,
 };
 
 use hyper::server::conn::{http1, http2};
@@ -13,13 +15,38 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use lb_core::Config;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-pub async fn run(config: Config) -> std::io::Result<()> {
+/// `config_path`, when present, is what `reload::spawn_sighup_reloader`
+/// re-reads on SIGHUP — `None` (every existing test's inline-TOML config,
+/// which was never loaded from a file) means the reload task is not spawned
+/// at all, so SIGHUP does nothing, which is the only sound behavior for a
+/// config with nowhere to reload *from*.
+pub async fn run(config: Config, config_path: Option<PathBuf>) -> std::io::Result<()> {
+    run_and_report_reload_handle(config, config_path, None).await
+}
+
+/// Same as `run`, but sends the running app's `Arc<ReloadState>` through
+/// `report` (if given) once it exists — before entering the shutdown wait,
+/// so a test can call `reload::apply_reload` directly against a *real*
+/// running instance instead of only against a bare `WiredApp`. SIGHUP is
+/// Unix-only and untestable on this project's Windows dev environment (see
+/// `reload`'s module docs), so this is what closes the loop on the rest of
+/// the reload path elsewhere.
+///
+/// Not part of the public API surface `run` is: exists to be called from
+/// this crate's own `tests/`, not for embedders.
+#[doc(hidden)]
+pub async fn run_and_report_reload_handle(
+    config: Config,
+    config_path: Option<PathBuf>,
+    report: Option<tokio::sync::oneshot::Sender<Arc<ReloadState>>>,
+) -> std::io::Result<()> {
     // Must happen before any rustls type is constructed — `build_app` builds
     // the TLS acceptors. `ring`, matching what every TLS crate in the graph
     // selected; a provider mismatch surfaces at runtime, not compile time.
@@ -36,13 +63,18 @@ pub async fn run(config: Config) -> std::io::Result<()> {
 
     let WiredApp {
         listeners,
-        background_tasks,
+        tls_reload_tasks,
         drain_timeout,
         cluster,
         metrics,
         admin_listen,
         pools,
+        reload,
     } = build_app(&config, cluster_secret)?;
+
+    if let Some(report) = report {
+        let _ = report.send(Arc::clone(&reload));
+    }
 
     // Bind every listener before serving any of them, so a port conflict or
     // permission error fails startup outright instead of half-starting.
@@ -126,6 +158,14 @@ pub async fn run(config: Config) -> std::io::Result<()> {
         ));
     }
 
+    // Spawned only when this config came from a file at all — see `run`'s
+    // doc comment on `config_path`. Its own handle joins `cluster_tasks`:
+    // like the cluster/admin tasks, it carries no client-facing state, so
+    // an abort at shutdown (rather than a drain) is correct for it too.
+    if let Some(path) = config_path {
+        cluster_tasks.push(reload::spawn_sighup_reloader(path, Arc::clone(&reload)));
+    }
+
     // One shutdown signal fans out to every accept loop.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -146,7 +186,12 @@ pub async fn run(config: Config) -> std::io::Result<()> {
     for task in listener_tasks {
         let _ = task.await;
     }
-    for task in background_tasks.into_iter().chain(cluster_tasks) {
+    let reloadable_tasks = std::mem::take(&mut *reload.tasks.lock().await);
+    for task in tls_reload_tasks
+        .into_iter()
+        .chain(reloadable_tasks.into_values().flatten())
+        .chain(cluster_tasks)
+    {
         task.abort();
     }
     Ok(())
@@ -301,7 +346,13 @@ where
             http2,
             ..
         } => {
-            let ctx = Arc::clone(ctx);
+            // Loaded fresh here, not once at listener startup: this is what
+            // lets `reload::apply_reload` change a running listener's
+            // backends/rate limit/health checks without dropping a single
+            // connection — this one and every connection already in flight
+            // keep whichever snapshot they loaded, while the next one to
+            // reach this line sees whatever is current then.
+            let ctx = ctx.load_full();
             let peer_ip = peer.ip();
             let svc = service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
             if is_h2 {
@@ -374,7 +425,8 @@ where
             }
         }
         ListenerRuntime::Tcp { ctx, .. } => {
-            lb_tcp::handle_connection(stream, peer, Arc::clone(ctx)).await;
+            // Loaded fresh per connection, same reasoning as the HTTP arm.
+            lb_tcp::handle_connection(stream, peer, ctx.load_full()).await;
         }
     }
 }

@@ -59,8 +59,8 @@ async fn one_nodes_traffic_exhausts_the_budget_for_another() {
     ))
     .unwrap();
 
-    tokio::spawn(lb_server::run(config_a));
-    tokio::spawn(lb_server::run(config_b));
+    tokio::spawn(lb_server::run(config_a, None));
+    tokio::spawn(lb_server::run(config_b, None));
     support::wait_until_listening(traffic_a).await;
     support::wait_until_listening(traffic_b).await;
 
@@ -125,8 +125,8 @@ listen = "{listen}"
         )
     };
 
-    tokio::spawn(lb_server::run(Config::parse(&solo(traffic_a)).unwrap()));
-    tokio::spawn(lb_server::run(Config::parse(&solo(traffic_b)).unwrap()));
+    tokio::spawn(lb_server::run(Config::parse(&solo(traffic_a)).unwrap(), None));
+    tokio::spawn(lb_server::run(Config::parse(&solo(traffic_b)).unwrap(), None));
     support::wait_until_listening(traffic_a).await;
     support::wait_until_listening(traffic_b).await;
 
@@ -166,7 +166,7 @@ async fn three_nodes_hold_the_global_limit_within_the_documented_bound() {
             10,
         ))
         .unwrap();
-        tokio::spawn(lb_server::run(config));
+        tokio::spawn(lb_server::run(config, None));
     }
     for addr in &traffic {
         support::wait_until_listening(*addr).await;

@@ -423,7 +423,7 @@ async fn a_tls_backend_that_offers_h2_is_used_over_http2() {
         "backend.internal",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::builder()
@@ -465,7 +465,7 @@ async fn a_tls_backend_without_h2_is_still_served_over_http11() {
         "backend.internal",
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::builder()
@@ -499,7 +499,7 @@ async fn backend_h2c_talks_prior_knowledge_http2_to_a_plaintext_backend() {
     let mut toml = tls_http_config(listen, backend, &cert, &key, 5_000, 5_000);
     toml.push_str("\n  [listeners.http2]\n  backend_h2c = true\n");
     let config = Config::parse(&toml).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::builder()
@@ -526,7 +526,7 @@ async fn a_client_offering_h2_is_served_http2() {
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config =
         Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 5_000)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // No builder call enables h2: with `native-tls-alpn` on, reqwest offers
@@ -558,7 +558,7 @@ async fn a_client_offering_only_http11_still_gets_http11() {
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config =
         Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 5_000)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // Phases 1-6 regression guard: adding h2 must not take http/1.1 away.
@@ -584,7 +584,7 @@ async fn http2_disabled_means_h2_is_never_negotiated() {
     let mut toml = tls_http_config(listen, backend, &cert, &key, 5_000, 5_000);
     toml.push_str("\n  [listeners.http2]\n  enabled = false\n");
     let config = Config::parse(&toml).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let client = reqwest::Client::builder()
@@ -605,7 +605,7 @@ async fn a_plaintext_listener_refuses_http2() {
     let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
     let listen = free_addr().await;
     let config = Config::parse(&plaintext_http_config(listen, backend)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // Prior-knowledge h2c on an unencrypted edge port is surface nobody asked
@@ -648,7 +648,7 @@ async fn an_h2_client_that_never_sends_its_preface_is_timed_out() {
     let listen = free_addr().await;
     let (_dir, cert, key) = cert_files(&["localhost"]);
     let config = Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 300)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let mut tls = tls_connect_h2(listen).await;
@@ -793,7 +793,7 @@ async fn requests_are_counted_under_the_version_they_arrived_on() {
         &tls_http_config(listen, backend, &cert, &key, 5_000, 5_000),
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
     support::wait_until_listening(admin).await;
 
@@ -880,7 +880,7 @@ async fn http2_requests_are_rate_limited_per_request_not_per_connection() {
     // refused.
     let config =
         Config::parse(&tls_config_with_rate_limit(listen, backend, &cert, &key, 3)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let statuses = statuses_over_one_h2_connection(listen, 5).await;
@@ -1020,7 +1020,7 @@ async fn a_rapid_reset_flood_terminates_the_connection() {
     let mut toml = tls_http_config(listen, backend, &cert, &key, 5_000, 5_000);
     toml.push_str("\n  [listeners.http2]\n  max_pending_accept_reset_streams = 2\n");
     let config = Config::parse(&toml).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // Drive raw h2 so streams can be cancelled immediately after opening --
@@ -1169,7 +1169,7 @@ async fn max_concurrent_streams_is_enforced_on_the_wire() {
         "\n  [listeners.http2]\n  max_concurrent_streams = {LIMIT}\n"
     ));
     let config = Config::parse(&toml).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let tls = tls_connect_h2(listen).await;

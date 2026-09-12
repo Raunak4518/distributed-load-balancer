@@ -849,6 +849,7 @@ dependencies = [
 name = "lb-server"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "dashmap",
  "h2",

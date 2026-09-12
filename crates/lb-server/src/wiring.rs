@@ -1,7 +1,11 @@
+use arc_swap::ArcSwap;
 use lb_balancer::RoundRobin;
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::ClusterCoordinator;
-use lb_core::{Backend, BackendPool, Config, Http2Config, ListenerConfig, Protocol, SystemClock};
+use lb_core::{
+    Backend, BackendPool, ClusterConfig, Config, Http2Config, ListenerConfig, LoggingConfig,
+    Protocol, SystemClock,
+};
 use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
 };
@@ -21,11 +25,19 @@ pub type AppClusterNode = ClusterNode<SystemClock>;
 /// One configured listener, ready to accept. An enum rather than a trait:
 /// this is a genuinely closed set, and `serve_listener` must match on it
 /// exhaustively to know which protocol driver to run.
+///
+/// `ctx` is behind an `ArcSwap`, not a plain `Arc`, so that config hot-reload
+/// (`reload::apply_reload`) can replace it atomically while connections are
+/// in flight: each newly accepted connection reads whatever is current at
+/// the moment it starts (`drive`, in `lib.rs`, loads fresh per connection),
+/// while a connection already running keeps whichever snapshot it loaded.
+/// Nothing else on this enum is reloadable -- `tls`, `http2`, and `limits`
+/// require a restart to change; see `reload`'s module docs for why.
 pub enum ListenerRuntime {
     Http {
         name: String,
         listen: SocketAddr,
-        ctx: Arc<HttpContext>,
+        ctx: Arc<ArcSwap<HttpContext>>,
         limits: ConnectionLimits,
         metrics: Arc<lb_metrics::ListenerMetrics>,
         header_read_timeout: Duration,
@@ -44,7 +56,7 @@ pub enum ListenerRuntime {
     Tcp {
         name: String,
         listen: SocketAddr,
-        ctx: Arc<TcpAppContext>,
+        ctx: Arc<ArcSwap<TcpAppContext>>,
         limits: ConnectionLimits,
         metrics: Arc<lb_metrics::ListenerMetrics>,
         tls: Option<Arc<lb_tls::TlsAcceptor>>,
@@ -112,7 +124,11 @@ pub struct ConnectionLimits {
 
 pub struct WiredApp {
     pub listeners: Vec<ListenerRuntime>,
-    pub background_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// TLS cert-reload tasks only — see `WiredApp::reload` for why they are
+    /// kept apart from everything else: config hot-reload never touches
+    /// them, so they are never candidates for the abort-and-respawn dance
+    /// `reload::apply_reload` does to the tasks in `reload.tasks`.
+    pub tls_reload_tasks: Vec<tokio::task::JoinHandle<()>>,
     pub drain_timeout: Duration,
     /// Present only when `[cluster]` is configured.
     pub cluster: Option<ClusterSetup>,
@@ -121,6 +137,49 @@ pub struct WiredApp {
     pub admin_listen: Option<SocketAddr>,
     /// Every listener's pool, for the readiness check.
     pub pools: Vec<Arc<BackendPool>>,
+    /// Everything `reload::apply_reload` needs to reach a running listener's
+    /// swappable context and replace its health-checker/DNS-poller/sweeper
+    /// tasks. Kept on `WiredApp` (built once, alongside everything else)
+    /// rather than reconstructed later, so a listener's `ArcSwap` here is
+    /// *the same* `Arc` `ListenerRuntime::ctx` holds -- a store into one is
+    /// visible through the other, which is the entire mechanism. `Arc`-
+    /// wrapped so `run` can hand a clone to the SIGHUP task independently of
+    /// its own use of it (draining tasks at shutdown).
+    pub reload: Arc<ReloadState>,
+}
+
+/// The subset of build state a config reload needs, later, to touch a
+/// *running* listener without rebuilding everything from scratch. See
+/// `reload::apply_reload`.
+pub struct ReloadState {
+    pub metrics: Arc<Metrics>,
+    pub cluster_node: Option<Arc<AppClusterNode>>,
+    pub listeners: HashMap<String, ListenerReloadHandle>,
+    /// This listener's health checkers, DNS poller, and rate-limit sweeper —
+    /// the tasks a ctx rebuild makes stale, since they check/resolve/sweep
+    /// against the *old* pool and rate limiter. Replaced as a whole on
+    /// reload: the old set is aborted, a fresh set spawned against the new
+    /// ctx, under one lock so nothing observes a listener with neither set
+    /// running. Never contains the TLS cert-reload task -- see
+    /// `WiredApp::tls_reload_tasks`.
+    pub tasks: Arc<tokio::sync::Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
+    /// The config as of the last successful reload (or the one `build_app`
+    /// was called with, before the first). What the *next* reload diffs
+    /// against -- not the original startup config forever, and not
+    /// re-derived from `ListenerRuntime`, which no longer carries most of
+    /// a `ListenerConfig`'s fields once built.
+    pub config: tokio::sync::Mutex<Config>,
+}
+
+/// One listener's swappable context, keyed by name in `ReloadState.listeners`
+/// so the reload path can reach it without holding (or matching on) the
+/// whole `ListenerRuntime` enum. Always the *same* `Arc<ArcSwap<_>>` that
+/// listener's `ListenerRuntime::ctx` holds — cloned, not a second one — so a
+/// `store` here is a store there too.
+#[derive(Clone)]
+pub enum ListenerReloadHandle {
+    Http(Arc<ArcSwap<HttpContext>>),
+    Tcp(Arc<ArcSwap<TcpAppContext>>),
 }
 
 /// Everything `run` needs to start peer coordination, kept separate from the
@@ -148,8 +207,10 @@ pub fn build_app(
     cluster_secret: Option<Vec<u8>>,
 ) -> Result<WiredApp, std::io::Error> {
     let mut listeners = Vec::with_capacity(config.listeners.len());
-    let mut background_tasks = Vec::new();
+    let mut tls_reload_tasks = Vec::new();
     let mut pools = Vec::with_capacity(config.listeners.len());
+    let mut reload_listeners = HashMap::with_capacity(config.listeners.len());
+    let mut reload_tasks = HashMap::with_capacity(config.listeners.len());
 
     // Every acceptor is built before any background task is spawned,
     // mirroring how `run` binds every listener before serving any of them: a
@@ -174,7 +235,9 @@ pub fn build_app(
         backend_connectors.push(build_backend_connector(lc, &metrics)?);
     }
 
-    // One cluster node per process, shared by every listener.
+    // One cluster node per process, shared by every listener. Not reloadable
+    // (`reload::apply_reload` refuses a reload that would change `[cluster]`),
+    // so this is the one and only place it is ever constructed.
     let cluster_node = match (config.cluster.as_ref(), cluster_secret) {
         (Some(c), Some(secret)) => Some(Arc::new(ClusterNode::new(
             c.node_id.clone(),
@@ -191,38 +254,17 @@ pub fn build_app(
         .zip(tls_acceptors)
         .zip(backend_connectors)
     {
-        let backends: Vec<Backend> = lc
-            .backends
-            .iter()
-            .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
-            .collect();
-        let pool = Arc::new(BackendPool::new(backends.clone()));
-        pools.push(Arc::clone(&pool));
-
-        if let Some(dns) = &lc.dns_discovery {
-            background_tasks.push(crate::dns::spawn_dns_poller(
-                crate::dns::TokioResolver,
-                dns.clone(),
-                Arc::clone(&pool),
-                lc.name.clone(),
-            ));
-        }
-
-        // Pins the L7 forwarding client's TCP dial to each backend's
-        // configured `address`, even though the forwarding authority is that
-        // backend's `server_name` (chosen so SNI and hostname verification
-        // check the certificate's own name). Without this table, a
-        // `backend_tls` listener's connector would resolve `server_name` via
-        // real DNS to find something to dial -- silently reintroducing
-        // DNS-based backend resolution and letting traffic follow whatever
-        // that name resolves to instead of the pinned backend. Built for
-        // every listener, not only `backend_tls` ones: a plaintext listener's
-        // requests carry an IP-literal authority, so the table is simply
-        // never consulted there. See `lb_proxy::resolver::PinnedResolver`.
-        let server_name_addresses: HashMap<String, SocketAddr> = backends
-            .iter()
-            .filter_map(|b| b.server_name.clone().map(|name| (name, b.address)))
-            .collect();
+        let core = build_listener_core(
+            lc,
+            backend_tls,
+            cluster_node.as_ref(),
+            config.cluster.as_ref(),
+            &config.logging,
+            &metrics,
+        );
+        pools.push(Arc::clone(&core.pool));
+        let tasks = spawn_listener_tasks(lc, &core, &metrics);
+        reload_tasks.insert(lc.name.clone(), tasks);
 
         let listener_metrics = Arc::new(metrics.listener(&lc.name));
         let connection_limits = ConnectionLimits {
@@ -231,43 +273,14 @@ pub fn build_app(
                 lc.max_connections_per_ip(),
             )),
         };
-        let backend_metrics: HashMap<_, _> = backends
-            .iter()
-            .map(|b| (b.id.clone(), metrics.backend(&lc.name, &b.id.0)))
-            .collect();
-
-        let mut circuit_breakers = HashMap::new();
-        for b in &backends {
-            circuit_breakers.insert(
-                b.id.clone(),
-                CircuitBreaker::new(
-                    lc.health_check.failure_threshold,
-                    Duration::from_millis(lc.health_check.cooldown_ms),
-                    SystemClock,
-                ),
-            );
-        }
-
-        let rate_limiter = Arc::new(Gcra::new(
-            GcraConfig {
-                rate_per_sec: lc.rate_limit.rate_per_sec,
-                burst: lc.rate_limit.burst,
-                max_tracked_keys: lc.rate_limit.max_tracked_keys,
-            },
-            SystemClock,
-        ));
-        background_tasks.push(spawn_sweeper(
-            rate_limiter.clone(),
-            Duration::from_secs(30),
-            Duration::from_secs(60),
-        ));
 
         // Certificates expire on a fixed schedule (90 days under ACME), so a
         // TLS listener without a reload loop is an outage generator on a
-        // timer. Pushed onto the same list the health checkers use, so it is
-        // aborted on shutdown with everything else.
+        // timer. Kept apart from `reload_tasks`: config hot-reload never
+        // touches TLS (see `reload`'s module docs), so this must never be
+        // among the tasks a ctx reload aborts and respawns.
         if let (Some(acceptor), Some(tls_cfg)) = (tls.as_ref(), lc.tls.as_ref()) {
-            background_tasks.push(lb_tls::spawn_reloader(
+            tls_reload_tasks.push(lb_tls::spawn_reloader(
                 lc.name.clone(),
                 tls_cfg.certificates.clone(),
                 Arc::clone(acceptor.resolver()),
@@ -276,157 +289,37 @@ pub fn build_app(
             ));
         }
 
-        // The global cap is the sustained rate over the whole window; the
-        // local GCRA continues to shape bursts inside it.
-        let cluster_coordinator: Option<Arc<dyn ClusterCoordinator>> =
-            match (&cluster_node, &config.cluster) {
-                (Some(node), Some(cc)) => {
-                    let limit = (lc.rate_limit.rate_per_sec * cc.window_secs as f64).ceil() as u64;
-                    Some(Arc::new(ListenerCoordinator::new(
-                        Arc::clone(node),
-                        lc.name.clone(),
-                        limit.max(1),
-                    )))
-                }
-                _ => None,
-            };
-
-        let runtime = match lc.protocol {
-            Protocol::Http => {
-                // Built exactly once per HTTP listener, and handed to both
-                // consumers below. **This sharing is the whole mechanism**
-                // behind "a probe validates what traffic validates": the
-                // probe does not use a client like the data plane's, it uses
-                // this one -- same connection pool, same trust roots, same
-                // verification policy, same pinned resolver. A `Client` is an
-                // `Arc`-backed handle, so a clone is the same client, not a
-                // copy of one. Two `build_client` calls here would put two
-                // TLS stacks in one listener and let them disagree.
-                // Prior-knowledge h2c: plaintext backends only, and only
-                // when the operator has said so -- a TLS backend negotiates
-                // via ALPN regardless (see `lb_proxy::build_client`).
-                let backend_h2c = lc.http2.as_ref().map(|h| h.backend_h2c()).unwrap_or(false);
-                let client = lb_proxy::build_client(
-                    backend_tls.as_deref(),
-                    server_name_addresses,
-                    backend_h2c,
-                );
-                // A `dns_discovery` + `backend_tls` listener puts several
-                // backends behind one `server_name`, which `client` above
-                // cannot serve correctly -- see `lb_proxy::per_backend`.
-                // Each such backend gets its own client (and so its own
-                // connection pool) instead, built lazily as backends are
-                // first seen; `client` stays built but unused, its
-                // dial-pinning table simply empty.
-                let per_backend_client = match (&lc.dns_discovery, &backend_tls) {
-                    (Some(dns), Some(connector)) => Some(Arc::new(lb_proxy::PerBackendClients::new(
-                        dns.server_name
-                            .clone()
-                            .expect("validated: server_name is required when backend_tls is set"),
-                        Arc::clone(connector),
-                        backend_h2c,
-                    ))),
-                    _ => None,
-                };
-                let probe_client: Arc<dyn lb_core::ProbeClient> = match &per_backend_client {
-                    Some(per_backend) => Arc::clone(per_backend) as Arc<dyn lb_core::ProbeClient>,
-                    None => Arc::new(lb_proxy::ProbeCapableClient(client.clone())),
-                };
-                spawn_health_checkers(
-                    lc,
-                    &backends,
-                    &pool,
-                    &mut background_tasks,
-                    &metrics,
-                    ProbeTransport::Http {
-                        client: probe_client,
-                        backend_tls: backend_tls.is_some(),
-                    },
-                );
+        let runtime = match core.kind {
+            ListenerCoreKind::Http(ctx) => {
+                let ctx = Arc::new(ArcSwap::from_pointee(ctx));
+                reload_listeners.insert(lc.name.clone(), ListenerReloadHandle::Http(Arc::clone(&ctx)));
                 ListenerRuntime::Http {
                     name: lc.name.clone(),
                     listen: lc.listen,
-                    ctx: Arc::new(ProxyContext {
-                        rate_limiter,
-                        balancer: Arc::new(RoundRobin::new()),
-                        pool,
-                        circuit_breakers,
-                        client,
-                        per_backend_client,
-                        backend_tls: backend_tls.is_some(),
-                        rate_limit_key: lc.rate_limit.key.clone(),
-                        forward_timeout: lc.forward_timeout(),
-                        max_request_body_bytes: lc.max_request_body_bytes(),
-                        cluster: cluster_coordinator,
-                        metrics: Arc::clone(&listener_metrics),
-                        backend_metrics,
-                        access_log: lb_proxy::AccessLog::new(
-                            config.logging.log_requests,
-                            config.logging.sample_rate,
-                        ),
-                        body_read_timeout: lc.body_read_timeout(),
-                        // Both gating conditions collapse into this one
-                        // `Option` here, at the one place that knows both
-                        // facts: whether this listener terminates TLS at all
-                        // (`lc.tls`) and whether HSTS was actually turned on
-                        // (`hsts_max_age_secs() > 0`, since 0 is the default
-                        // and must stay a no-op, not `max-age=0`). `handle`
-                        // downstream cannot see either fact for itself.
-                        hsts_max_age_secs: lc
-                            .tls
-                            .as_ref()
-                            .map(|t| t.hsts_max_age_secs())
-                            .filter(|&v| v > 0),
-                    }),
+                    ctx,
                     limits: connection_limits,
                     metrics: Arc::clone(&listener_metrics),
                     header_read_timeout: lc.header_read_timeout(),
                     tls,
-                    // Built from the same `http2_enabled()` that chose the
-                    // ALPN list above, so the two cannot drift apart. The
-                    // `unwrap_or_default` is load-bearing rather than
-                    // defensive: `http2_enabled()` is true for a TLS
-                    // listener with no `[listeners.http2]` section at all --
-                    // the common case -- and that listener still advertises
-                    // `h2` and so still needs settings to serve it under.
+                    // Built from the same `http2_enabled()` the TLS acceptor's
+                    // ALPN list is chosen from, so the two cannot drift apart.
+                    // The `unwrap_or_default` is load-bearing rather than
+                    // defensive: `http2_enabled()` is true for a TLS listener
+                    // with no `[listeners.http2]` section at all -- the common
+                    // case -- and that listener still advertises `h2` and so
+                    // still needs settings to serve it under.
                     http2: lc
                         .http2_enabled()
                         .then(|| Arc::new(lc.http2.clone().unwrap_or_default())),
                 }
             }
-            Protocol::Tcp => {
-                // The one place the L4 data plane's re-encryption is chosen.
-                // `lb-tcp` sees a trait object and never learns which TLS
-                // implementation is behind it -- and, for the same reason as
-                // the HTTP client above, the probe is handed this same `Arc`
-                // rather than a second transport built from the same config.
-                let outbound: Option<Arc<dyn lb_core::OutboundTransport>> = backend_tls.map(|c| {
-                    Arc::new(lb_tls::BackendTlsTransport::new(&c))
-                        as Arc<dyn lb_core::OutboundTransport>
-                });
-                spawn_health_checkers(
-                    lc,
-                    &backends,
-                    &pool,
-                    &mut background_tasks,
-                    &metrics,
-                    ProbeTransport::Tcp(outbound.clone()),
-                );
+            ListenerCoreKind::Tcp(ctx) => {
+                let ctx = Arc::new(ArcSwap::from_pointee(ctx));
+                reload_listeners.insert(lc.name.clone(), ListenerReloadHandle::Tcp(Arc::clone(&ctx)));
                 ListenerRuntime::Tcp {
                     name: lc.name.clone(),
                     listen: lc.listen,
-                    ctx: Arc::new(TcpContext {
-                        rate_limiter,
-                        balancer: Arc::new(RoundRobin::new()),
-                        pool,
-                        circuit_breakers,
-                        connect_timeout: lc.connect_timeout(),
-                        idle_timeout: lc.idle_timeout(),
-                        backend_tls: outbound,
-                        cluster: cluster_coordinator,
-                        metrics: Arc::clone(&listener_metrics),
-                        backend_metrics,
-                    }),
+                    ctx,
                     limits: connection_limits,
                     metrics: Arc::clone(&listener_metrics),
                     tls,
@@ -436,9 +329,9 @@ pub fn build_app(
         listeners.push(runtime);
     }
 
-    let cluster = match (cluster_node, config.cluster.as_ref()) {
+    let cluster = match (&cluster_node, config.cluster.as_ref()) {
         (Some(node), Some(cc)) => Some(ClusterSetup {
-            node,
+            node: Arc::clone(node),
             listen: cc.listen,
             peers: cc.peers.clone(),
             sync_interval: cc.sync_interval(),
@@ -448,13 +341,272 @@ pub fn build_app(
 
     Ok(WiredApp {
         listeners,
-        background_tasks,
+        tls_reload_tasks,
         drain_timeout: Duration::from_millis(config.server.drain_timeout_ms),
         cluster,
-        metrics,
+        metrics: Arc::clone(&metrics),
         admin_listen: config.admin.as_ref().map(|a| a.listen),
         pools,
+        reload: Arc::new(ReloadState {
+            metrics,
+            cluster_node,
+            listeners: reload_listeners,
+            tasks: Arc::new(tokio::sync::Mutex::new(reload_tasks)),
+            config: tokio::sync::Mutex::new(config.clone()),
+        }),
     })
+}
+
+/// One listener's fully-built runtime pieces, minus everything that never
+/// changes on a config reload (`tls`, `http2`, `limits`, its name/address).
+/// Kept separate from `ListenerRuntime` so `reload::apply_reload` can build
+/// exactly this — and nothing else — for a listener whose config changed,
+/// without touching the parts that require a restart to change at all.
+pub(crate) struct ListenerCore {
+    pub(crate) backends: Vec<Backend>,
+    pub(crate) pool: Arc<BackendPool>,
+    pub(crate) kind: ListenerCoreKind,
+}
+
+pub(crate) enum ListenerCoreKind {
+    Http(HttpContext),
+    Tcp(TcpAppContext),
+}
+
+/// Builds one listener's pool, rate limiter, circuit breakers, and
+/// protocol-specific context. Infallible: the one fallible step for a
+/// listener (`build_backend_connector`, real file I/O) has already happened
+/// by the time this is called, both at startup (`build_app`, above) and on
+/// reload (`reload::apply_reload`, which must resolve every changed
+/// listener's connector *before* rebuilding or swapping in any of them — see
+/// its module docs for why that ordering is load-bearing).
+pub(crate) fn build_listener_core(
+    lc: &ListenerConfig,
+    backend_tls: Option<Arc<lb_tls::BackendConnector>>,
+    cluster_node: Option<&Arc<AppClusterNode>>,
+    cluster_cfg: Option<&ClusterConfig>,
+    logging: &LoggingConfig,
+    metrics: &Metrics,
+) -> ListenerCore {
+    let backends: Vec<Backend> = lc
+        .backends
+        .iter()
+        .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
+        .collect();
+    let pool = Arc::new(BackendPool::new(backends.clone()));
+
+    // Pins the L7 forwarding client's TCP dial to each backend's configured
+    // `address`, even though the forwarding authority is that backend's
+    // `server_name` (chosen so SNI and hostname verification check the
+    // certificate's own name). Without this table, a `backend_tls` listener's
+    // connector would resolve `server_name` via real DNS to find something to
+    // dial -- silently reintroducing DNS-based backend resolution and letting
+    // traffic follow whatever that name resolves to instead of the pinned
+    // backend. Built for every listener, not only `backend_tls` ones: a
+    // plaintext listener's requests carry an IP-literal authority, so the
+    // table is simply never consulted there. See
+    // `lb_proxy::resolver::PinnedResolver`.
+    let server_name_addresses: HashMap<String, SocketAddr> = backends
+        .iter()
+        .filter_map(|b| b.server_name.clone().map(|name| (name, b.address)))
+        .collect();
+
+    let listener_metrics = Arc::new(metrics.listener(&lc.name));
+    let backend_metrics: HashMap<_, _> = backends
+        .iter()
+        .map(|b| (b.id.clone(), metrics.backend(&lc.name, &b.id.0)))
+        .collect();
+
+    let mut circuit_breakers = HashMap::new();
+    for b in &backends {
+        circuit_breakers.insert(
+            b.id.clone(),
+            CircuitBreaker::new(
+                lc.health_check.failure_threshold,
+                Duration::from_millis(lc.health_check.cooldown_ms),
+                SystemClock,
+            ),
+        );
+    }
+
+    let rate_limiter = Arc::new(Gcra::new(
+        GcraConfig {
+            rate_per_sec: lc.rate_limit.rate_per_sec,
+            burst: lc.rate_limit.burst,
+            max_tracked_keys: lc.rate_limit.max_tracked_keys,
+        },
+        SystemClock,
+    ));
+
+    // The global cap is the sustained rate over the whole window; the local
+    // GCRA continues to shape bursts inside it.
+    let cluster_coordinator: Option<Arc<dyn ClusterCoordinator>> =
+        match (cluster_node, cluster_cfg) {
+            (Some(node), Some(cc)) => {
+                let limit = (lc.rate_limit.rate_per_sec * cc.window_secs as f64).ceil() as u64;
+                Some(Arc::new(ListenerCoordinator::new(
+                    Arc::clone(node),
+                    lc.name.clone(),
+                    limit.max(1),
+                )))
+            }
+            _ => None,
+        };
+
+    let kind = match lc.protocol {
+        Protocol::Http => {
+            // Built exactly once per HTTP listener, and handed to both
+            // consumers below (real traffic and its health probe) -- see
+            // `spawn_listener_tasks`. **This sharing is the whole mechanism**
+            // behind "a probe validates what traffic validates": the probe
+            // does not use a client like the data plane's, it uses this one --
+            // same connection pool, same trust roots, same verification
+            // policy, same pinned resolver. A `Client` is an `Arc`-backed
+            // handle, so a clone is the same client, not a copy of one. Two
+            // `build_client` calls here would put two TLS stacks in one
+            // listener and let them disagree.
+            // Prior-knowledge h2c: plaintext backends only, and only when the
+            // operator has said so -- a TLS backend negotiates via ALPN
+            // regardless (see `lb_proxy::build_client`).
+            let backend_h2c = lc.http2.as_ref().map(|h| h.backend_h2c()).unwrap_or(false);
+            let client = lb_proxy::build_client(
+                backend_tls.as_deref(),
+                server_name_addresses,
+                backend_h2c,
+            );
+            // A `dns_discovery` + `backend_tls` listener puts several backends
+            // behind one `server_name`, which `client` above cannot serve
+            // correctly -- see `lb_proxy::per_backend`. Each such backend gets
+            // its own client (and so its own connection pool) instead, built
+            // lazily as backends are first seen; `client` stays built but
+            // unused, its dial-pinning table simply empty.
+            let per_backend_client = match (&lc.dns_discovery, &backend_tls) {
+                (Some(dns), Some(connector)) => Some(Arc::new(lb_proxy::PerBackendClients::new(
+                    dns.server_name
+                        .clone()
+                        .expect("validated: server_name is required when backend_tls is set"),
+                    Arc::clone(connector),
+                    backend_h2c,
+                ))),
+                _ => None,
+            };
+            ListenerCoreKind::Http(ProxyContext {
+                rate_limiter,
+                balancer: Arc::new(RoundRobin::new()),
+                pool: Arc::clone(&pool),
+                circuit_breakers,
+                client,
+                per_backend_client,
+                backend_tls: backend_tls.is_some(),
+                rate_limit_key: lc.rate_limit.key.clone(),
+                forward_timeout: lc.forward_timeout(),
+                max_request_body_bytes: lc.max_request_body_bytes(),
+                cluster: cluster_coordinator,
+                metrics: listener_metrics,
+                backend_metrics,
+                access_log: lb_proxy::AccessLog::new(logging.log_requests, logging.sample_rate),
+                body_read_timeout: lc.body_read_timeout(),
+                // Both gating conditions collapse into this one `Option`
+                // here, at the one place that knows both facts: whether this
+                // listener terminates TLS at all (`lc.tls`) and whether HSTS
+                // was actually turned on (`hsts_max_age_secs() > 0`, since 0
+                // is the default and must stay a no-op, not `max-age=0`).
+                // `handle` downstream cannot see either fact for itself.
+                hsts_max_age_secs: lc
+                    .tls
+                    .as_ref()
+                    .map(|t| t.hsts_max_age_secs())
+                    .filter(|&v| v > 0),
+            })
+        }
+        Protocol::Tcp => {
+            // The one place the L4 data plane's re-encryption is chosen.
+            // `lb-tcp` sees a trait object and never learns which TLS
+            // implementation is behind it -- and, for the same reason as the
+            // HTTP client above, the probe is handed this same `Arc` rather
+            // than a second transport built from the same config.
+            let outbound: Option<Arc<dyn lb_core::OutboundTransport>> = backend_tls.map(|c| {
+                Arc::new(lb_tls::BackendTlsTransport::new(&c)) as Arc<dyn lb_core::OutboundTransport>
+            });
+            ListenerCoreKind::Tcp(TcpContext {
+                rate_limiter,
+                balancer: Arc::new(RoundRobin::new()),
+                pool: Arc::clone(&pool),
+                circuit_breakers,
+                connect_timeout: lc.connect_timeout(),
+                idle_timeout: lc.idle_timeout(),
+                backend_tls: outbound,
+                cluster: cluster_coordinator,
+                metrics: listener_metrics,
+                backend_metrics,
+            })
+        }
+    };
+
+    ListenerCore { backends, pool, kind }
+}
+
+/// Spawns one listener's health checkers, DNS poller (if `dns_discovery` is
+/// set), and rate-limit sweeper — everything a ctx rebuild makes stale,
+/// since they check/resolve/sweep against the *old* pool and rate limiter.
+/// Never the TLS cert-reload task; see `WiredApp::tls_reload_tasks`.
+pub(crate) fn spawn_listener_tasks(
+    lc: &ListenerConfig,
+    core: &ListenerCore,
+    metrics: &Metrics,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+
+    if let Some(dns) = &lc.dns_discovery {
+        tasks.push(crate::dns::spawn_dns_poller(
+            crate::dns::TokioResolver,
+            dns.clone(),
+            Arc::clone(&core.pool),
+            lc.name.clone(),
+        ));
+    }
+
+    match &core.kind {
+        ListenerCoreKind::Http(ctx) => {
+            tasks.push(spawn_sweeper(
+                ctx.rate_limiter.clone(),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            ));
+            let probe_client: Arc<dyn lb_core::ProbeClient> = match &ctx.per_backend_client {
+                Some(per_backend) => Arc::clone(per_backend) as Arc<dyn lb_core::ProbeClient>,
+                None => Arc::new(lb_proxy::ProbeCapableClient(ctx.client.clone())),
+            };
+            spawn_health_checkers(
+                lc,
+                &core.backends,
+                &core.pool,
+                &mut tasks,
+                metrics,
+                ProbeTransport::Http {
+                    client: probe_client,
+                    backend_tls: ctx.backend_tls,
+                },
+            );
+        }
+        ListenerCoreKind::Tcp(ctx) => {
+            tasks.push(spawn_sweeper(
+                ctx.rate_limiter.clone(),
+                Duration::from_secs(30),
+                Duration::from_secs(60),
+            ));
+            spawn_health_checkers(
+                lc,
+                &core.backends,
+                &core.pool,
+                &mut tasks,
+                metrics,
+                ProbeTransport::Tcp(ctx.backend_tls.clone()),
+            );
+        }
+    }
+
+    tasks
 }
 
 /// Builds one listener's TLS acceptor, if it has a `[listeners.tls]` section.
@@ -499,7 +651,7 @@ fn build_tls_acceptor(
 /// the threat encryption is there for -- so it says so at every startup and
 /// sets a series a dashboard can alert on, instead of living undiscovered in
 /// a config file for two years.
-fn build_backend_connector(
+pub(crate) fn build_backend_connector(
     lc: &ListenerConfig,
     metrics: &Metrics,
 ) -> Result<Option<Arc<lb_tls::BackendConnector>>, std::io::Error> {
@@ -618,6 +770,32 @@ mod tests {
     use super::*;
     use lb_core::BackendId;
 
+    /// TLS-reload tasks plus every listener's health-checker/DNS-poller/
+    /// sweeper tasks — the two buckets `background_tasks` used to be one
+    /// flat `Vec` of, before per-listener reload needed to tell them apart.
+    async fn total_task_count(app: &WiredApp) -> usize {
+        app.tls_reload_tasks.len()
+            + app
+                .reload
+                .tasks
+                .lock()
+                .await
+                .values()
+                .map(|tasks| tasks.len())
+                .sum::<usize>()
+    }
+
+    async fn abort_all_tasks(app: WiredApp) {
+        for task in app.tls_reload_tasks {
+            task.abort();
+        }
+        for (_, tasks) in app.reload.tasks.lock().await.drain() {
+            for task in tasks {
+                task.abort();
+            }
+        }
+    }
+
     const CONFIG: &str = r#"
         [[listeners]]
         name = "web"
@@ -684,19 +862,18 @@ mod tests {
         assert_eq!(app.listeners[1].protocol_name(), "tcp");
 
         // 2 sweepers (one per listener) + 3 health checkers (2 http + 1 tcp)
-        assert_eq!(app.background_tasks.len(), 5);
+        assert_eq!(total_task_count(&app).await, 5);
 
         match &app.listeners[0] {
             ListenerRuntime::Http { ctx, .. } => {
+                let ctx = ctx.load();
                 assert_eq!(ctx.pool.all_backend_ids().len(), 2);
                 assert!(ctx.pool.is_eligible(&BackendId::new("w1")));
             }
             _ => panic!("expected an http listener"),
         }
 
-        for task in app.background_tasks {
-            task.abort();
-        }
+        abort_all_tasks(app).await;
     }
 
     /// The half of the h2 invariant that needs no certificate: a listener
@@ -716,9 +893,7 @@ mod tests {
         // parses, whatever the config says.
         assert!(app.listeners[1].http2().is_none());
 
-        for task in app.background_tasks {
-            task.abort();
-        }
+        abort_all_tasks(app).await;
     }
 
     /// `dns_discovery` + `backend_tls` on an HTTP listener used to be
@@ -763,14 +938,12 @@ mod tests {
 
         match &app.listeners[0] {
             ListenerRuntime::Http { ctx, .. } => {
-                assert!(ctx.per_backend_client.is_some());
+                assert!(ctx.load().per_backend_client.is_some());
             }
             _ => panic!("expected an http listener"),
         }
 
-        for task in app.background_tasks {
-            task.abort();
-        }
+        abort_all_tasks(app).await;
     }
 
     /// A static `backend_tls` listener (no `dns_discovery`) already gives
@@ -813,14 +986,12 @@ mod tests {
 
         match &app.listeners[0] {
             ListenerRuntime::Http { ctx, .. } => {
-                assert!(ctx.per_backend_client.is_none());
+                assert!(ctx.load().per_backend_client.is_none());
             }
             _ => panic!("expected an http listener"),
         }
 
-        for task in app.background_tasks {
-            task.abort();
-        }
+        abort_all_tasks(app).await;
     }
 
     #[tokio::test]
@@ -828,8 +999,6 @@ mod tests {
         let config = Config::parse(CONFIG).unwrap();
         let app = build_app(&config, None).unwrap();
         assert_eq!(app.drain_timeout, Duration::from_millis(10_000));
-        for task in app.background_tasks {
-            task.abort();
-        }
+        abort_all_tasks(app).await;
     }
 }

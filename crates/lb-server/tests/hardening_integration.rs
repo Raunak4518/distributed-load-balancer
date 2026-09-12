@@ -65,7 +65,7 @@ async fn a_connection_dribbling_headers_is_closed() {
     let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
     let listen = free_addr().await;
     let config = Config::parse(&hardened_config(listen, backend, 100, 100, 300, 10_000)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let mut victim = TcpStream::connect(listen).await.unwrap();
@@ -98,7 +98,7 @@ async fn a_connection_dribbling_a_body_is_timed_out() {
     let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
     let listen = free_addr().await;
     let config = Config::parse(&hardened_config(listen, backend, 100, 100, 5_000, 300)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     let mut victim = TcpStream::connect(listen).await.unwrap();
@@ -138,7 +138,7 @@ async fn a_single_source_cannot_exceed_its_per_ip_budget() {
     let listen = free_addr().await;
     // Global 50, per-IP 3: the global cap is nowhere near binding.
     let config = Config::parse(&hardened_config(listen, backend, 50, 3, 5_000, 5_000)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     // Hold three idle connections open — all from 127.0.0.1.
@@ -192,7 +192,7 @@ async fn normal_requests_are_unaffected_by_the_limits() {
     let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
     let listen = free_addr().await;
     let config = Config::parse(&hardened_config(listen, backend, 100, 100, 5_000, 5_000)).unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
 
     for _ in 0..5 {

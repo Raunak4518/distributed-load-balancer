@@ -7,7 +7,7 @@ use std::time::Duration;
 /// unconfigured: an operator who never writes this section still gets the
 /// full set of protections. The defaults are not tuning knobs left at zero —
 /// they are the bounds that keep HTTP/2 survivable on a public port.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct Http2Config {
     pub enabled: Option<bool>,
     pub max_concurrent_streams: Option<u32>,

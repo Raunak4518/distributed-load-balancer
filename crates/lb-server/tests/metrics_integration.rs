@@ -35,7 +35,7 @@ async fn start(rate_per_sec: f64, burst: u32) -> (SocketAddr, SocketAddr) {
         burst,
     ))
     .unwrap();
-    tokio::spawn(lb_server::run(config));
+    tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(traffic).await;
 
     (traffic, admin)
