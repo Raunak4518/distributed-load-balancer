@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dual-licensed under MIT or Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`),
   required for both package formats and previously undeclared anywhere in
   the repository.
+- **OpenTelemetry trace export** (`lb-tracing`, new crate): one span per
+  HTTP request and per TCP session, exported over OTLP/HTTP when a new
+  `[tracing]` config section is present (absent means disabled — spans are
+  still created either way, at the negligible cost `tracing` is designed
+  for). The exporter uses a small custom blocking HTTP client rather than
+  `reqwest`: the batch span processor drives its exporter from its own OS
+  thread, not a Tokio task, so an async client has no reactor to run on
+  there, and `reqwest` pulls in `native-tls`/`openssl-sys` regardless of
+  requested features, which this project's musl static release binaries
+  have no reason to inherit for a telemetry side channel.
 
 ## [0.2.0] - 2026-09-12
 

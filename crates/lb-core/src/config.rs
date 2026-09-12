@@ -20,6 +20,11 @@ pub struct Config {
     pub admin: Option<AdminConfig>,
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// Absent disables OpenTelemetry trace export entirely. Spans are still
+    /// created (that cost is unconditional -- see `lb-tracing`) but nothing
+    /// ever reads them without this section.
+    #[serde(default)]
+    pub tracing: Option<TracingConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,6 +32,24 @@ pub struct AdminConfig {
     /// Bind privately. This surface exposes internal topology (backend names,
     /// health, traffic volumes) and must never face the public internet.
     pub listen: SocketAddr,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TracingConfig {
+    /// Where spans are exported to, over OTLP/HTTP. A local collector
+    /// (`http://localhost:4318`) is the common case; a plain `http://`
+    /// endpoint is deliberately supported, not just `https://` -- see
+    /// `lb-tracing`'s docs for why re-encrypting telemetry export isn't
+    /// this project's problem to solve.
+    pub otlp_endpoint: String,
+    #[serde(default)]
+    pub service_name: Option<String>,
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+fn default_sample_ratio() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -491,6 +514,19 @@ impl Config {
                 "logging.sample_rate must be between 0.0 and 1.0".into(),
             ));
         }
+
+        if let Some(t) = &self.tracing {
+            if t.otlp_endpoint.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "tracing.otlp_endpoint must not be empty".into(),
+                ));
+            }
+            if !(0.0..=1.0).contains(&t.sample_ratio) {
+                return Err(ConfigError::Invalid(
+                    "tracing.sample_ratio must be between 0.0 and 1.0".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -948,6 +984,40 @@ mod tests {
     fn rejects_out_of_range_sample_rate() {
         let text = format!("[logging]\nsample_rate = 1.5\n\n{VALID}");
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn tracing_is_optional_and_disabled_by_default() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert!(cfg.tracing.is_none());
+    }
+
+    #[test]
+    fn parses_tracing_section_with_defaults() {
+        let text = format!(
+            "[tracing]\notlp_endpoint = \"http://localhost:4318\"\n\n{VALID}"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let t = cfg.tracing.unwrap();
+        assert_eq!(t.otlp_endpoint, "http://localhost:4318");
+        assert_eq!(t.service_name, None);
+        assert_eq!(t.sample_ratio, 1.0);
+    }
+
+    #[test]
+    fn rejects_an_empty_otlp_endpoint() {
+        let text = format!("[tracing]\notlp_endpoint = \"\"\n\n{VALID}");
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("tracing.otlp_endpoint"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_tracing_sample_ratio() {
+        let text = format!(
+            "[tracing]\notlp_endpoint = \"http://localhost:4318\"\nsample_ratio = 1.5\n\n{VALID}"
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("tracing.sample_ratio"), "unhelpful error: {err}");
     }
 
     #[test]

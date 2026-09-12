@@ -46,11 +46,11 @@ lb-healthcheck = { path = "../lb-healthcheck" }
 lb-proxy = { path = "../lb-proxy" }
 lb-tcp = { path = "../lb-tcp" }
 lb-metrics = { path = "../lb-metrics" }
+lb-tracing = { path = "../lb-tracing" }
 lb-cluster = { path = "../lb-cluster" }
 lb-tls = { path = "../lb-tls" }
 dashmap = "6"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 # Only `hyper_util::rt::*` is used here, all of it under "tokio".
 hyper-util = { version = "0.1", features = ["tokio"] }

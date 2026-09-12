@@ -138,6 +138,13 @@ pub enum ConnectionOutcome {
 /// Generic over the inbound stream so the same code serves a plain
 /// `TcpStream` and a TLS stream: `pump` is already written against
 /// `AsyncRead`/`AsyncWrite`, so the L4 data plane never learns which it got.
+///
+/// `#[instrument]` gives this whole session one span -- the TCP counterpart
+/// of `lb_proxy::service::handle`'s per-request span (L4 has no per-request
+/// boundary, so the session is the natural unit). Unconditional and cheap
+/// when nothing is exporting, same as there: this code does not need to
+/// know whether OpenTelemetry export is turned on.
+#[tracing::instrument(name = "tcp_session", skip(inbound, ctx), fields(peer = %peer))]
 pub async fn handle_connection<S, R, L, C>(
     inbound: S,
     peer: SocketAddr,

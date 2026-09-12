@@ -9,6 +9,7 @@ lb-core = { path = "../lb-core" }
 lb-healthcheck = { path = "../lb-healthcheck" }
 lb-metrics = { path = "../lb-metrics" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
+tracing = "0.1"
 
 [dev-dependencies]
 lb-core = { path = "../lb-core", features = ["test-util"] }

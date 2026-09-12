@@ -1,4 +1,4 @@
-use lb_core::{Config, LogFormat, LoggingConfig};
+use lb_core::Config;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -75,24 +75,15 @@ async fn main() -> std::io::Result<()> {
             // stderr directly -- there is no subscriber yet to route it
             // through.
             let config = load_config_or_exit(&config_path);
-            init_logging(&config.logging);
-            lb_server::run(config).await
+            let tracing_guard =
+                lb_tracing::init(&config.logging, config.tracing.as_ref()).unwrap_or_else(|err| {
+                    eprintln!("failed to initialize tracing: {err}");
+                    std::process::exit(1);
+                });
+            let result = lb_server::run(config).await;
+            tracing_guard.shutdown();
+            result
         }
-    }
-}
-
-fn init_logging(cfg: &LoggingConfig) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    match cfg.format {
-        LogFormat::Json => tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init(),
-        LogFormat::Pretty => tracing_subscriber::fmt()
-            .pretty()
-            .with_env_filter(filter)
-            .init(),
     }
 }
 

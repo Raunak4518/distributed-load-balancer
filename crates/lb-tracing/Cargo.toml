@@ -1,0 +1,33 @@
+[package]
+name = "lb-tracing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lb-core = { path = "../lb-core" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "registry"] }
+tracing-opentelemetry = "0.31"
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-http = "0.30"
+# `http-proto` only -- no `reqwest-client`/`reqwest-blocking-client`/
+# `hyper-client` feature. Every one of those pulls in a full HTTP client
+# crate for what is, by design (see `TracingConfig::otlp_endpoint`), a
+# plaintext POST to a same-trust-domain collector; `reqwest` in particular
+# drags in `native-tls`/`openssl-sys` even with every TLS feature this
+# crate asks for turned off, which is exactly the OpenSSL-under-musl
+# cross-compilation risk this project's static release binaries have no
+# reason to inherit for a telemetry side channel. `http.rs` here supplies a
+# minimal blocking client instead, via the feature-independent
+# `WithHttpConfig::with_http_client` extension point -- confirmed empirically
+# to need no ambient Tokio runtime, unlike an async client (see its doc
+# comment for why that matters: the batch span processor drives its exporter
+# from its own dedicated OS thread, not a Tokio task).
+opentelemetry-otlp = { version = "0.30", default-features = false, features = [
+    "http-proto",
+] }
+async-trait = "0.1"
+http = "1"
+bytes = "1"

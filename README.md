@@ -186,6 +186,8 @@ Because an HTTP/1.1 backend's response can now land on an HTTP/2 client stream (
 
 The admin port (`/metrics`) exposes Prometheus counters and histograms: requests by status class, latency, active connections, rate-limit rejections (local vs. cluster), backend health, circuit state, TLS handshake outcomes, and certificate expiry.
 
+An optional `[tracing]` section exports one OpenTelemetry span per HTTP request and per TCP session over OTLP/HTTP to a collector — see the commented-out example in [`config.example.toml`](config.example.toml).
+
 `/healthz` is always 200 — liveness must not follow backend health, or a backend outage restarts the load balancer in a loop. `/ready` returns 503 when no backend in any pool is eligible.
 
 ## Documentation

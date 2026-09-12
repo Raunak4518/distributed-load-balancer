@@ -15,6 +15,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
@@ -276,7 +277,22 @@ where
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
-    let mut result = handle_inner(req, Arc::clone(&ctx), peer_ip).await;
+    // The root span for this request: everything `handle_inner` awaits
+    // (rate limiting, backend selection, the forward itself) nests under
+    // it, so an OpenTelemetry export (when configured -- see `lb-tracing`)
+    // sees one trace per request rather than a flat pile of sibling spans.
+    // Unconditional and cheap when nothing is exporting: that is the whole
+    // design point of `tracing` spans, which is why this code does not
+    // need to know whether OTel export is even turned on.
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = %method,
+        path = %path,
+    );
+    let mut result = handle_inner(req, Arc::clone(&ctx), peer_ip)
+        .instrument(span)
+        .await;
 
     // Recorded in exactly one place so no early return can forget to. The
     // inner function has six return sites; duplicating this at each of them
