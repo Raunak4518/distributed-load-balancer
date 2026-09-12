@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[cluster.tls]`: optional mutual TLS on the cluster peer channel.**
+  Previously the peer channel was HMAC-SHA256 *authenticated* but never
+  *encrypted* — the HMAC stopped a peer from forging counts, but anyone who
+  could observe the link read every node id and rate-limit count in the
+  clear. Every node presents the same cert/key to every peer (gossip is
+  symmetric — one node, one identity) and verifies peers by IP SAN against
+  a shared CA (`ca_file`), reusing rustls' own WebPKI verifiers rather than
+  a hand-rolled one. Omitting the section keeps today's HMAC-only behavior
+  unchanged — existing configs are unaffected.
 - **`write_timeout_ms` (HTTP listeners)**: caps how long a client may take to
   *read* the response, mirroring `header_read_timeout_ms`/`body_read_timeout_ms`
   on the send side. Without it, a client that stops draining its socket

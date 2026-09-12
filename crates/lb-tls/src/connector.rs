@@ -32,42 +32,20 @@ impl BackendConnector {
                 .with_custom_certificate_verifier(Arc::new(NoVerification))
                 .with_no_client_auth()
         } else {
-            let mut roots = rustls::RootCertStore::empty();
-            match &cfg.ca_file {
+            let roots = match &cfg.ca_file {
                 // Internal PKI is the common case on the backend path, which
                 // is the whole reason the file form exists.
-                Some(path) => {
-                    let bytes = std::fs::read(path).map_err(|source| TlsError::Io {
-                        path: path.display().to_string(),
-                        source,
-                    })?;
-                    let certs: Vec<_> = rustls_pemfile::certs(&mut bytes.as_slice())
-                        .collect::<Result<_, _>>()
-                        .map_err(|e| TlsError::Pem(format!("{}: {e}", path.display())))?;
-                    if certs.is_empty() {
-                        // A ca_file that loads to zero roots is exactly as
-                        // dangerous as one that failed to read: it leaves an
-                        // empty trust store that rejects every backend at
-                        // the first request. Fail startup instead.
-                        return Err(TlsError::Pem(format!(
-                            "{}: no certificates found",
-                            path.display()
-                        )));
-                    }
-                    for cert in certs {
-                        roots
-                            .add(cert)
-                            .map_err(|e| TlsError::Pem(format!("{}: {e}", path.display())))?;
-                    }
-                }
+                Some(path) => crate::certs::load_ca_roots(path)?,
                 None => {
                     // System trust store. Same discipline as the ca_file
                     // branch above: an empty result here is exactly as
                     // dangerous as a ca_file that loads to zero certificates,
                     // just reachable through the sibling code path.
+                    let mut roots = rustls::RootCertStore::empty();
                     apply_native_certs(&mut roots, rustls_native_certs::load_native_certs())?;
+                    roots
                 }
-            }
+            };
             rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth()

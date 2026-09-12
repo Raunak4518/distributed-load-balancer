@@ -14,7 +14,7 @@ Client → TLS termination → Rate limiter → Backend selection → Forward
 - **HTTP/1.1 and HTTP/2** (ALPN-negotiated over TLS), plus raw **TCP** proxying.
 - **TLS termination** at the edge via rustls. Optional **backend re-encryption** with certificate verification.
 - **GCRA rate limiting** per key, with bounded state. An overflow bucket prevents memory exhaustion under address-spray attacks.
-- **Cluster-wide rate limiting** via a G-Counter CRDT, synchronized over HMAC-authenticated gossip.
+- **Cluster-wide rate limiting** via a G-Counter CRDT, synchronized over HMAC-authenticated gossip, with optional mutual TLS on the peer channel.
 - **Active health checking**: HTTP probes (GET, 2xx = healthy) or TCP connect probes, using the *same* transport as real traffic.
 - **Circuit breaking** per backend: Closed → Open → HalfOpen, with configurable threshold and cooldown.
 - **Prometheus metrics** on a private admin port. Separate `/healthz` (liveness, always 200) and `/ready` (readiness, 503 when no backend is eligible).
@@ -35,7 +35,8 @@ lb-server          Binary. Config, binding, wiring, shutdown.
 │                  consistent hashing (all skip ineligible backends).
 ├── lb-ratelimit   GCRA with bounded key tracking and periodic sweep.
 ├── lb-healthcheck Active health checks, HTTP/TCP probes, circuit breaker.
-├── lb-cluster     G-Counter CRDT, HMAC-authenticated gossip, peer sync.
+├── lb-cluster     G-Counter CRDT, HMAC-authenticated gossip, peer sync,
+│                  optional mutual TLS on the peer channel.
 ├── lb-tls         TLS termination (rustls), backend connector, cert reloading.
 ├── lb-metrics     Prometheus registry, admin HTTP server (/metrics, /healthz, /ready).
 └── lb-bench       Micro-benchmarks for pool selection, GCRA, cluster admit, circuit refresh.
@@ -130,6 +131,7 @@ See [`config.example.toml`](config.example.toml) for the authoritative reference
 - **`[listeners.backend_tls]`** — re-encryption to backends. Custom CA or system roots. `danger_accept_invalid_certs` is logged as a warning and exported as a metric.
 - **`[listeners.http2]`** — per-listener HTTP/2 settings. Every field has a safe default; omitting the section still gets full protection.
 - **`[cluster]`** — distributed rate limiting. Node ID, peer addresses, sliding window, pre-shared key (mandatory).
+- **`[cluster.tls]`** — optional mutual TLS on the peer channel. Without it the peer port is authenticated but not encrypted; every node presents the same cert (signed by a shared CA) to every peer.
 - **`[admin]`** — private admin listener for metrics and health endpoints.
 
 Full field-by-field reference: [docs/configuration-reference.md](docs/configuration-reference.md)

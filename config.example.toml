@@ -13,6 +13,21 @@
 # sync_interval_ms  = 200
 # window_secs       = 10
 # shared_secret_env = "LB_CLUSTER_SECRET"    # names the env var holding it
+#
+#   # Mutual TLS on the peer channel (optional). Without this section the
+#   # peer port is authenticated but NOT encrypted -- HMAC-SHA256 stops a
+#   # peer from forging counts, but anyone who can observe the link still
+#   # reads every node id and rate-limit count in the clear. Every node
+#   # presents the same cert/key to every peer (gossip is symmetric: one
+#   # node, one identity), and every node's ca_file must point at the same
+#   # signing CA. Each node's certificate must carry its own gossip `listen`
+#   # IP as a Subject Alternative Name -- that IP is what the connecting
+#   # side verifies against, the same way a browser checks a hostname.
+#   [cluster.tls]
+#   cert_file            = "/etc/lb/peer-tls/lb-1.crt"
+#   key_file             = "/etc/lb/peer-tls/lb-1.key"
+#   ca_file              = "/etc/lb/peer-tls/ca.crt"
+#   handshake_timeout_ms = 5000
 
 # ── OpenTelemetry trace export (optional) ─────────────────────────────
 # Omit this whole section to skip export entirely. Spans are still created

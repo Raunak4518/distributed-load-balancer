@@ -14,4 +14,6 @@ pub enum TlsError {
     NoKey(String),
     #[error("could not read certificate validity: {0}")]
     Expiry(String),
+    #[error("tls configuration error: {0}")]
+    Config(String),
 }

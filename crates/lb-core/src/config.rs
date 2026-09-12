@@ -104,6 +104,36 @@ pub struct ClusterConfig {
     /// environment-variable form is preferred.
     #[serde(default)]
     pub shared_secret: Option<String>,
+    /// Absent means the peer channel stays HMAC-authenticated but
+    /// unencrypted, as it was before this existed -- every node id and
+    /// rate-limit count is readable to anyone who can observe the link.
+    #[serde(default)]
+    pub tls: Option<PeerTlsConfig>,
+}
+
+/// Mutual TLS for the cluster peer channel. Every node presents the same
+/// cert/key to every peer it talks to -- gossip is symmetric, one node has
+/// one identity for it, unlike a listener's per-hostname certificates.
+///
+/// Peer identity is verified by the standard WebPKI machinery (chain to
+/// `ca_file`, `ServerName`/client-cert checks), not a hand-rolled verifier:
+/// each node's certificate must carry its own gossip bind IP as a Subject
+/// Alternative Name, and every peer's `ca_file` must point at the same
+/// signing CA.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PeerTlsConfig {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    pub ca_file: PathBuf,
+    pub handshake_timeout_ms: Option<u64>,
+}
+
+impl PeerTlsConfig {
+    /// Same default as `TlsConfig::handshake_timeout` -- nothing about the
+    /// peer channel makes a slower client more tolerable than a listener's.
+    pub fn handshake_timeout(&self) -> Duration {
+        Duration::from_millis(self.handshake_timeout_ms.unwrap_or(5_000))
+    }
 }
 
 fn default_sync_interval_ms() -> u64 {
@@ -1014,6 +1044,36 @@ mod tests {
     #[test]
     fn cluster_is_optional() {
         assert!(Config::parse(VALID).unwrap().cluster.is_none());
+    }
+
+    #[test]
+    fn cluster_tls_is_optional_and_defaults_to_none() {
+        let text = format!("{CLUSTER}{VALID}");
+        let cfg = Config::parse(&text).unwrap();
+        assert!(cfg.cluster.unwrap().tls.is_none());
+    }
+
+    #[test]
+    fn parses_a_configured_cluster_tls_section() {
+        let text = format!(
+            "{CLUSTER}\n  [cluster.tls]\n  cert_file = \"node.crt\"\n  key_file = \"node.key\"\n  ca_file = \"ca.crt\"\n  handshake_timeout_ms = 2000\n{VALID}"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let tls = cfg.cluster.unwrap().tls.expect("cluster.tls should parse");
+        assert_eq!(tls.cert_file, std::path::PathBuf::from("node.crt"));
+        assert_eq!(tls.key_file, std::path::PathBuf::from("node.key"));
+        assert_eq!(tls.ca_file, std::path::PathBuf::from("ca.crt"));
+        assert_eq!(tls.handshake_timeout(), Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn cluster_tls_handshake_timeout_defaults_to_5_seconds() {
+        let text = format!(
+            "{CLUSTER}\n  [cluster.tls]\n  cert_file = \"node.crt\"\n  key_file = \"node.key\"\n  ca_file = \"ca.crt\"\n{VALID}"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let tls = cfg.cluster.unwrap().tls.unwrap();
+        assert_eq!(tls.handshake_timeout(), Duration::from_millis(5_000));
     }
 
     #[test]

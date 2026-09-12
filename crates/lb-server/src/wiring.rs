@@ -203,6 +203,9 @@ pub struct ClusterSetup {
     pub listen: SocketAddr,
     pub peers: Vec<SocketAddr>,
     pub sync_interval: Duration,
+    /// `None` keeps the peer channel HMAC-authenticated but unencrypted, as
+    /// it always was before `[cluster.tls]` existed.
+    pub peer_tls: Option<Arc<lb_tls::PeerTls>>,
 }
 
 /// Builds the runtime.
@@ -260,6 +263,19 @@ pub fn build_app(
             secret,
         ))),
         _ => None,
+    };
+
+    // Built alongside every other TLS acceptor/connector above, for the same
+    // reason: a bad peer certificate should fail startup outright, before
+    // anything binds, not surface once the sync loop is already running.
+    let peer_tls = match config.cluster.as_ref().and_then(|c| c.tls.as_ref()) {
+        Some(cfg) => Some(Arc::new(lb_tls::PeerTls::new(cfg).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("cluster could not load its peer TLS material: {err}"),
+            )
+        })?)),
+        None => None,
     };
 
     for ((lc, tls), backend_tls) in config
@@ -354,6 +370,7 @@ pub fn build_app(
             listen: cc.listen,
             peers: cc.peers.clone(),
             sync_interval: cc.sync_interval(),
+            peer_tls: peer_tls.clone(),
         }),
         _ => None,
     };

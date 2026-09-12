@@ -1,16 +1,24 @@
 use crate::coordinator::{ClusterNode, MergeOutcome};
 use crate::protocol::{encode, read_message};
 use lb_core::Clock;
+use lb_tls::PeerTls;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Accepts peer connections and merges the counters they push.
+///
+/// `tls` is `None` for the HMAC-only, unencrypted channel this always was;
+/// `Some` requires every peer to complete a mutual TLS handshake (see
+/// `lb_tls::PeerTls`) before anything is read from it at all -- a peer
+/// without a certificate the configured CA recognizes never reaches
+/// `read_message`, let alone the HMAC check inside it.
 pub fn spawn_peer_listener<C>(
     node: Arc<ClusterNode<C>>,
     listener: TcpListener,
+    tls: Option<Arc<PeerTls>>,
 ) -> tokio::task::JoinHandle<()>
 where
     C: Clock + 'static,
@@ -23,19 +31,31 @@ where
                 continue;
             };
             let node = Arc::clone(&node);
+            let tls = tls.clone();
             tokio::spawn(async move {
-                handle_peer_connection(node, stream, peer).await;
+                match tls {
+                    Some(tls) => match tls.accept(stream).await {
+                        Ok(tls_stream) => handle_peer_connection(node, tls_stream, peer).await,
+                        Err(err) => {
+                            // A bad or missing peer certificate closes only
+                            // this connection, same resilience posture as a
+                            // malformed frame below -- coordination for
+                            // every other peer must not depend on this one
+                            // behaving.
+                            tracing::warn!(peer = %peer, error = ?err, "peer tls handshake failed");
+                        }
+                    },
+                    None => handle_peer_connection(node, stream, peer).await,
+                }
             });
         }
     })
 }
 
-async fn handle_peer_connection<C>(
-    node: Arc<ClusterNode<C>>,
-    mut stream: TcpStream,
-    peer: SocketAddr,
-) where
+async fn handle_peer_connection<C, S>(node: Arc<ClusterNode<C>>, mut stream: S, peer: SocketAddr)
+where
     C: Clock,
+    S: AsyncRead + Unpin,
 {
     loop {
         match read_message(&mut stream, node.secret()).await {
@@ -73,6 +93,7 @@ pub fn spawn_sync_loop<C>(
     peers: Vec<SocketAddr>,
     interval: Duration,
     connect_timeout: Duration,
+    tls: Option<Arc<PeerTls>>,
 ) -> tokio::task::JoinHandle<()>
 where
     C: Clock + 'static,
@@ -90,7 +111,7 @@ where
                 for peer in &peers {
                     // A peer being down is normal, not an error: its counts
                     // age out of the window on their own.
-                    let _ = push_to_peer(*peer, &framed, connect_timeout).await;
+                    let _ = push_to_peer(*peer, &framed, connect_timeout, tls.as_deref()).await;
                 }
             }
 
@@ -103,10 +124,30 @@ async fn push_to_peer(
     peer: SocketAddr,
     framed: &[u8],
     connect_timeout: Duration,
+    tls: Option<&PeerTls>,
 ) -> std::io::Result<()> {
-    let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(peer))
+    let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(peer))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+
+    match tls {
+        Some(tls) => {
+            let mut tls_stream = tls.connect(peer.ip(), stream).await.map_err(|err| {
+                std::io::Error::other(format!("peer tls handshake failed: {err:?}"))
+            })?;
+            write_and_close(&mut tls_stream, framed).await
+        }
+        None => {
+            let mut stream = stream;
+            write_and_close(&mut stream, framed).await
+        }
+    }
+}
+
+async fn write_and_close<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    framed: &[u8],
+) -> std::io::Result<()> {
     stream.write_all(framed).await?;
     stream.shutdown().await?;
     Ok(())
@@ -127,6 +168,69 @@ mod tests {
         (listener, addr)
     }
 
+    // The clock alone is not unique: Windows' system time has ~15.6 ms
+    // granularity, so concurrent tests routinely read the same nanosecond
+    // value, land in the same directory, and overwrite each other's cert/key
+    // files. The counter makes collision impossible within this binary,
+    // which is where every concurrent caller lives.
+    fn tmpdir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "lbcluster-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A throwaway signing CA, so peer certificates chain to a shared trust
+    /// anchor -- `PeerTls`'s mutual-auth model, mirroring the same helper in
+    /// `lb-tls`'s own test suite (duplicated rather than shared across crates
+    /// to avoid turning a test-only convenience into a public feature of
+    /// `lb-tls`).
+    struct TestCa {
+        cert: rcgen::Certificate,
+        key: rcgen::KeyPair,
+    }
+
+    impl TestCa {
+        fn new() -> Self {
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = params.self_signed(&key).unwrap();
+            TestCa { cert, key }
+        }
+    }
+
+    /// Writes a CA-signed cert/key for `stem` (carrying `127.0.0.1` as its
+    /// IP SAN, since every test peer binds there) and a `PeerTlsConfig`
+    /// pointing at it plus `ca_cert_path`.
+    fn peer_tls_config(
+        dir: &std::path::Path,
+        stem: &str,
+        ca_cert_path: &std::path::Path,
+        ca: &TestCa,
+    ) -> lb_core::PeerTlsConfig {
+        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &ca.cert, &ca.key).unwrap();
+        let cert_path = dir.join(format!("{stem}.crt"));
+        let key_path = dir.join(format!("{stem}.key"));
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        lb_core::PeerTlsConfig {
+            cert_file: cert_path,
+            key_file: key_path,
+            ca_file: ca_cert_path.to_path_buf(),
+            handshake_timeout_ms: Some(500),
+        }
+    }
+
     #[tokio::test]
     async fn counters_propagate_from_one_node_to_another() {
         let clock = FakeClock::new();
@@ -144,7 +248,7 @@ mod tests {
         ));
 
         let (listener, addr) = bound_listener().await;
-        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
 
         // Sender consumes 4 of a budget of 5.
         let sender_coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 5);
@@ -157,6 +261,7 @@ mod tests {
             vec![addr],
             Duration::from_millis(20),
             Duration::from_millis(500),
+            None,
         );
 
         // Wait for the receiver to see the sender's counts.
@@ -178,6 +283,140 @@ mod tests {
         // The receiver now has only one slot left out of the shared budget.
         assert!(receiver_coord.try_admit("1.2.3.4"));
         assert!(!receiver_coord.try_admit("1.2.3.4"));
+    }
+
+    /// Same property as the plaintext test above, but over mutual TLS --
+    /// the transport swap must not change what the protocol already
+    /// guaranteed.
+    #[tokio::test]
+    async fn counters_propagate_over_mutual_tls() {
+        let clock = FakeClock::new();
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+
+        let dir = tmpdir();
+        let ca = TestCa::new();
+        let ca_cert_path = dir.join("ca.crt");
+        std::fs::write(&ca_cert_path, ca.cert.pem()).unwrap();
+        let receiver_tls = Arc::new(
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "recv", &ca_cert_path, &ca)).unwrap(),
+        );
+        let sender_tls = Arc::new(
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "send", &ca_cert_path, &ca)).unwrap(),
+        );
+
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, Some(receiver_tls));
+
+        let sender_coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 5);
+        for _ in 0..4 {
+            assert!(sender_coord.try_admit("1.2.3.4"));
+        }
+
+        let _sync = spawn_sync_loop(
+            Arc::clone(&sender),
+            vec![addr],
+            Duration::from_millis(20),
+            Duration::from_millis(500),
+            Some(sender_tls),
+        );
+
+        let mut converged = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if receiver
+                .store()
+                .total_in_window("web\u{1}1.2.3.4", clock.unix_secs())
+                == 4
+            {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "receiver never saw the sender's counters over TLS"
+        );
+    }
+
+    /// Defense in depth, layered *under* the HMAC check: a peer whose
+    /// certificate chains to a different CA must not even complete the
+    /// handshake, so it never reaches `read_message` at all -- unlike the
+    /// wrong-secret case, which does complete a (plaintext) connection and
+    /// is rejected only once the tag is checked.
+    #[tokio::test]
+    async fn a_peer_with_an_untrusted_certificate_cannot_influence_counters() {
+        let clock = FakeClock::new();
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+
+        let dir = tmpdir();
+        let ca = TestCa::new();
+        let ca_cert_path = dir.join("ca.crt");
+        std::fs::write(&ca_cert_path, ca.cert.pem()).unwrap();
+        let receiver_tls = Arc::new(
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "recv", &ca_cert_path, &ca)).unwrap(),
+        );
+
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, Some(receiver_tls));
+
+        // An impostor with a genuinely-signed cert, but from a CA the
+        // receiver does not trust, plus the *correct* HMAC secret -- proving
+        // TLS is what stops it, not the layer above.
+        let impostor_ca = TestCa::new();
+        let impostor_ca_cert_path = dir.join("impostor-ca.crt");
+        std::fs::write(&impostor_ca_cert_path, impostor_ca.cert.pem()).unwrap();
+        let impostor_tls = Arc::new(
+            lb_tls::PeerTls::new(&peer_tls_config(
+                &dir,
+                "impostor",
+                &impostor_ca_cert_path,
+                &impostor_ca,
+            ))
+            .unwrap(),
+        );
+
+        let impostor = Arc::new(ClusterNode::new(
+            "impostor",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let coord = ListenerCoordinator::new(Arc::clone(&impostor), "web", 1_000);
+        for _ in 0..50 {
+            assert!(coord.try_admit("victim"));
+        }
+        let framed = encode(&impostor.snapshot_message(), SECRET).unwrap();
+        // The handshake itself must fail -- if it somehow completed, that
+        // would defeat the point of this test regardless of what happens
+        // to the message afterwards.
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(impostor_tls.connect(addr.ip(), stream).await.is_err());
+        let _ = framed; // never sent: there is no connection to send it on.
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            receiver
+                .store()
+                .total_in_window("web\u{1}victim", clock.unix_secs()),
+            0,
+            "an untrusted peer certificate managed to inject counter values"
+        );
     }
 
     #[tokio::test]
@@ -203,7 +442,7 @@ mod tests {
             SECRET.to_vec(),
         ));
         let (listener, live) = bound_listener().await;
-        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
 
         let coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 10);
         assert!(coord.try_admit("k"));
@@ -213,6 +452,7 @@ mod tests {
             vec![dead, live],
             Duration::from_millis(20),
             Duration::from_millis(200),
+            None,
         );
 
         // The live peer still receives, despite the dead one in the list.
@@ -244,7 +484,7 @@ mod tests {
             SECRET.to_vec(),
         ));
         let (listener, addr) = bound_listener().await;
-        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
 
         // An impostor signs with a different key and pushes a large count.
         let impostor = Arc::new(ClusterNode::new(
@@ -314,7 +554,7 @@ mod tests {
             SECRET.to_vec(),
         ));
         let (listener, addr) = bound_listener().await;
-        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener);
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
 
         // Send junk that is not a valid frame.
         {

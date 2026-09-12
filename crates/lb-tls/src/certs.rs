@@ -15,23 +15,65 @@ pub struct LoadedCert {
     pub not_after_unix: i64,
 }
 
-pub fn load_certificate(cfg: &CertificateConfig) -> Result<LoadedCert, TlsError> {
-    let cert_bytes = read(&cfg.cert_file)?;
-    let key_bytes = read(&cfg.key_file)?;
+/// Reads and parses a cert chain + private key, before either is committed
+/// to any particular rustls use (a `CertifiedKey` for a resolver, or the raw
+/// `(chain, key)` pair `with_single_cert`/`with_client_auth_cert` want) --
+/// shared by `load_certificate` below and `peer::PeerTls`, which needs the
+/// raw pair directly and has no resolver of its own (one node, one gossip
+/// identity, no SNI to resolve against).
+pub(crate) fn load_chain_and_key(
+    cert_file: &std::path::Path,
+    key_file: &std::path::Path,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
+    let cert_bytes = read(cert_file)?;
+    let key_bytes = read(key_file)?;
 
     let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_bytes.as_slice())
         .collect::<Result<_, _>>()
-        .map_err(|e| TlsError::Pem(format!("{}: {e}", cfg.cert_file.display())))?;
+        .map_err(|e| TlsError::Pem(format!("{}: {e}", cert_file.display())))?;
     if chain.is_empty() {
         return Err(TlsError::Pem(format!(
             "{}: no certificates found",
-            cfg.cert_file.display()
+            cert_file.display()
         )));
     }
 
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_bytes.as_slice())
-        .map_err(|e| TlsError::Pem(format!("{}: {e}", cfg.key_file.display())))?
-        .ok_or_else(|| TlsError::NoKey(cfg.key_file.display().to_string()))?;
+        .map_err(|e| TlsError::Pem(format!("{}: {e}", key_file.display())))?
+        .ok_or_else(|| TlsError::NoKey(key_file.display().to_string()))?;
+
+    Ok((chain, key))
+}
+
+/// Loads every trust anchor in `ca_file` into a fresh `RootCertStore`.
+///
+/// Shared by `BackendConnector` (backend trust roots) and `peer::PeerTls`
+/// (mutual peer trust roots) -- same failure discipline in both: an empty
+/// result after loading (unreadable file, or a file with zero certificates
+/// in it) fails loudly rather than leaving an empty trust store that
+/// rejects everyone at the first connection.
+pub(crate) fn load_ca_roots(ca_file: &std::path::Path) -> Result<rustls::RootCertStore, TlsError> {
+    let bytes = read(ca_file)?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut bytes.as_slice())
+        .collect::<Result<_, _>>()
+        .map_err(|e| TlsError::Pem(format!("{}: {e}", ca_file.display())))?;
+    if certs.is_empty() {
+        return Err(TlsError::Pem(format!(
+            "{}: no certificates found",
+            ca_file.display()
+        )));
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in certs {
+        roots
+            .add(cert)
+            .map_err(|e| TlsError::Pem(format!("{}: {e}", ca_file.display())))?;
+    }
+    Ok(roots)
+}
+
+pub fn load_certificate(cfg: &CertificateConfig) -> Result<LoadedCert, TlsError> {
+    let (chain, key) = load_chain_and_key(&cfg.cert_file, &cfg.key_file)?;
 
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| TlsError::Pem(format!("{}: {e}", cfg.key_file.display())))?;

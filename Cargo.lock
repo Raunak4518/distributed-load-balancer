@@ -772,6 +772,8 @@ dependencies = [
  "dashmap",
  "hmac",
  "lb-core",
+ "lb-tls",
+ "rcgen",
  "serde",
  "serde_json",
  "sha2",

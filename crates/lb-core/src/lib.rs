@@ -21,8 +21,8 @@ pub use cluster::ClusterCoordinator;
 pub use config::{
     AdminConfig, BackendConfig, BackendTlsConfig, CertificateConfig, ClusterConfig, Config,
     HealthCheckConfig, ListenerConfig, LoadBalancingConfig, LoadBalancingStrategy, LogFormat,
-    LoggingConfig, Protocol, RateLimitConfig, RateLimitKeySource, ServerConfig, TlsConfig,
-    TlsVersion, TracingConfig,
+    LoggingConfig, PeerTlsConfig, Protocol, RateLimitConfig, RateLimitKeySource, ServerConfig,
+    TlsConfig, TlsVersion, TracingConfig,
 };
 pub use dns::DnsDiscoveryConfig;
 pub use error::ConfigError;

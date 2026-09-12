@@ -128,12 +128,14 @@ pub async fn run_and_report_reload_handle(
         cluster_tasks.push(lb_cluster::spawn_peer_listener(
             Arc::clone(&setup.node),
             peer_listener,
+            setup.peer_tls.clone(),
         ));
         cluster_tasks.push(lb_cluster::spawn_sync_loop(
             Arc::clone(&setup.node),
             setup.peers.clone(),
             setup.sync_interval,
             Duration::from_secs(2),
+            setup.peer_tls.clone(),
         ));
     }
 
