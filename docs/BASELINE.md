@@ -326,6 +326,49 @@ design. Target 2 (`eligible_backends()`/`all_backend_ids()` allocation) is
 the next item on this list, and — per the table above — is now also the
 dominant cost left in this specific bench.
 
+## Phase 7, target 2 delta: `BackendId` interned as `Arc<str>`
+
+`BackendId` was `String`; it is now `Arc<str>` (`crates/lb-core/src/backend.rs`).
+`PartialEq`/`Eq`/`Hash`/`Ord` on `Arc<str>` all compare the pointed-to string,
+not the pointer, so nothing about equality, hashing, or map/set behavior
+changed — every existing `.clone()` call site (`eligible_backends()`,
+`all_backend_ids()`, every balancer's pick path) got cheaper for free,
+without any of those call sites being touched. The only real casualty was
+one test double (`lb-healthcheck`'s `StubCall.backend_id: String`) that had
+been cloning `.0` directly; that became `.to_string()`. The whole workspace
+compiled clean on the first attempt otherwise — good confirmation that this
+id was already only ever used through `Clone`/`Hash`/`Eq`/`Display`, never
+as a `String` specifically.
+
+Re-measured on the same machine as the target-1 A/B above:
+
+| Operation (5 backends) | Before (String) | After (`Arc<str>`) | Change |
+|---|---:|---:|---:|
+| `eligible_backends()` | ~730–780 ns | ~382–401 ns | ~2x faster |
+| `RoundRobin::pick()` | ~800 ns | ~391–396 ns | ~2x faster |
+| Circuit-breaker refresh loop | ~790–840 ns | ~465–512 ns | ~1.7x faster |
+
+| Operation (20 backends) | Before (String) | After (`Arc<str>`) | Change |
+|---|---:|---:|---:|
+| `eligible_backends()` | ~2,880–3,000 ns | ~1,184–1,260 ns | ~2.3x faster |
+| Circuit-breaker refresh loop | ~2,980–3,100 ns | ~1,688–1,690 ns | ~1.8x faster |
+
+This is a real, load-bearing number, not a wash like target 1's — this bench
+is single-threaded and uncontended, exactly the case an allocation fix (as
+opposed to a lock removal) should show up in.
+
+**Deliberately not done in this pass:** target 2's other half, "returning an
+iterator or reusing a buffer removes the `Vec`." `eligible_backends()` still
+allocates one `Vec<BackendId>` per call — now a `Vec` of cheap `Arc` clones
+rather than heap-backed `String`s, which is most of the win above. Changing
+the return type to an iterator would touch every call site that currently
+holds the result as an owned `Vec` (indexing, re-iterating, `.len()`, sorting
+in `ConsistentHash`) across `lb-core`, every `lb-balancer` strategy, and both
+proxy crates — a much larger, riskier change for what the numbers above
+suggest is a small remaining slice of this cost, now that the per-element
+clone is nearly free. Worth revisiting only if a future measurement shows
+the `Vec` allocation itself, not its contents, is the binding cost.
+
 ## Phase 8 (HTTP/2)
 
 `lb-bench` needs no new benchmark for this phase. HTTP/2 does not add a new

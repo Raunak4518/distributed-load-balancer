@@ -53,7 +53,7 @@ impl ProbeClient for StubProbeClient {
         timeout: Duration,
     ) -> ProbeFuture<'_> {
         self.calls.lock().unwrap().push(StubCall {
-            backend_id: backend.id.0.clone(),
+            backend_id: backend.id.0.to_string(),
             path: path.to_string(),
             backend_tls,
             timeout,

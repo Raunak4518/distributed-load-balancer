@@ -1,10 +1,17 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+/// `Arc<str>` rather than `String`: this id is cloned on every backend
+/// selection (`BackendPool::eligible_backends()`/`all_backend_ids()` clone
+/// one per backend per request), and an `Arc` clone is a refcount bump
+/// rather than a heap allocation + copy. `PartialEq`/`Eq`/`Hash`/`Ord` on
+/// `Arc<str>` all compare the pointed-to string, not the pointer, so
+/// equality and map/set behavior are unchanged from the `String` version.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BackendId(pub String);
+pub struct BackendId(pub Arc<str>);
 
 impl BackendId {
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
         BackendId(id.into())
     }
 }
@@ -36,7 +43,7 @@ pub struct Backend {
 
 impl Backend {
     pub fn new(
-        id: impl Into<String>,
+        id: impl Into<Arc<str>>,
         address: SocketAddr,
         weight: u32,
         server_name: Option<String>,
