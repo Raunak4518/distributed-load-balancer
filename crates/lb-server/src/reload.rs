@@ -163,7 +163,7 @@ pub async fn apply_reload(
                 swap.store(Arc::new(*ctx));
             }
             (Some(ListenerReloadHandle::Tcp(swap)), ListenerCoreKind::Tcp(ctx)) => {
-                swap.store(Arc::new(ctx));
+                swap.store(Arc::new(*ctx));
             }
             _ => unreachable!(
                 "listener identity (name -> protocol) was already confirmed unchanged above"

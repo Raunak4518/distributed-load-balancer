@@ -48,6 +48,13 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # dependency (lb-cluster, lb-ratelimit) for the same "many readers/writers,
 # no coarse lock" shape.
 dashmap = "6"
+# For the WebSocket/Upgrade backend leg's TCP keepalive tuning
+# (`apply_tcp_keepalive` in upgrade.rs) -- see `lb-server`'s Cargo.toml
+# comment for why this is a direct dependency despite already being
+# transitively present, and why "all" is needed. The *ordinary* HTTP
+# backend leg needs none of this: `HttpConnector`'s own native setters
+# (`forward.rs::build_client`) cover it without touching socket2 directly.
+socket2 = { version = "0.6", features = ["all"] }
 # For `PinnedResolver` (resolver.rs): a custom `HttpConnector` resolver is a
 # `tower_service::Service<Name>` impl -- see hyper-util's `connect::dns`
 # module docs. Already resolved transitively via hyper-util itself, so this

@@ -88,6 +88,12 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
 ] }
+# For client-facing TCP keepalive tuning (`apply_tcp_keepalive` in lib.rs):
+# already transitively present (pulled in by tokio and hyper-util), added
+# directly here since this crate calls its API itself rather than only
+# through those. "all" is required for `TcpKeepalive::with_retries`
+# (`TCP_KEEPCNT`) to compile on both Linux and Windows.
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 # `native-tls-alpn` is what makes the test client offer `h2` at all: reqwest's

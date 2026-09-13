@@ -86,6 +86,23 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
 # treated as fatal (the connection is dropped), not a fallback to the raw
 # TCP peer: that's the whole trust boundary this option is enforcing.
 
+# TCP keepalive tuning (SO_KEEPALIVE / TCP_KEEPIDLE / TCP_KEEPINTVL /
+# TCP_KEEPCNT). Both sections are optional and independent -- the client
+# socket this listener accepts and the backend socket it dials can be tuned
+# separately, since they have different idle characteristics (a browser tab
+# left open vs. a backend behind a NAT/firewall that silently drops idle
+# connections). Omit either section (or both) to leave that socket at OS
+# defaults, exactly like today.
+# [listeners.client_tcp_keepalive]
+# time_secs     = 60   # idle time before the first probe (TCP_KEEPIDLE)
+# interval_secs = 10   # time between probes once they start (TCP_KEEPINTVL)
+# retries       = 6    # unanswered probes before the connection is dead (TCP_KEEPCNT)
+
+# [listeners.backend_tcp_keepalive]
+# time_secs     = 60
+# interval_secs = 10
+# retries       = 6
+
 # compression = false
 # Compresses responses (gzip/brotli/deflate/zstd, negotiated against the
 # client's Accept-Encoding) that aren't already encoded and pass a
@@ -395,6 +412,9 @@ max_connections_per_ip = 100
 # proxy_protocol = true
 # See the HTTP listener's comment above -- same option, same trust model,
 # applies identically to a TCP listener.
+
+# client_tcp_keepalive / backend_tcp_keepalive: see the HTTP listener's
+# comment above -- both apply identically here (not protocol-specific).
 
 # ── TLS termination (optional) ──────────────────────────────────────────
 # Same [listeners.tls] shape as the HTTP listener above — see its comments

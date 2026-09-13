@@ -73,6 +73,10 @@ pub enum ListenerRuntime {
         /// the same predicate makes "negotiated h2 without settings to serve
         /// it under" unrepresentable rather than merely unlikely.
         http2: Option<Arc<Http2Config>>,
+        /// See `lb_core::TcpKeepaliveConfig`. Restart-only, same as `tls`/
+        /// `http2` above -- applied once, in `spawn_connection`, to the
+        /// freshly accepted socket.
+        client_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     },
     Tcp {
         name: String,
@@ -82,6 +86,7 @@ pub enum ListenerRuntime {
         metrics: Arc<lb_metrics::ListenerMetrics>,
         proxy_protocol: bool,
         tls: Option<Arc<lb_tls::TlsAcceptor>>,
+        client_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     },
 }
 
@@ -114,6 +119,19 @@ impl ListenerRuntime {
         match self {
             ListenerRuntime::Http { proxy_protocol, .. }
             | ListenerRuntime::Tcp { proxy_protocol, .. } => *proxy_protocol,
+        }
+    }
+
+    pub fn client_tcp_keepalive(&self) -> Option<&lb_core::TcpKeepaliveConfig> {
+        match self {
+            ListenerRuntime::Http {
+                client_tcp_keepalive,
+                ..
+            }
+            | ListenerRuntime::Tcp {
+                client_tcp_keepalive,
+                ..
+            } => client_tcp_keepalive.as_ref(),
         }
     }
 
@@ -375,10 +393,11 @@ pub fn build_app(
                     http2: lc
                         .http2_enabled()
                         .then(|| Arc::new(lc.http2.clone().unwrap_or_default())),
+                    client_tcp_keepalive: lc.client_tcp_keepalive.clone(),
                 }
             }
             ListenerCoreKind::Tcp(ctx) => {
-                let ctx = Arc::new(ArcSwap::from_pointee(ctx));
+                let ctx = Arc::new(ArcSwap::from_pointee(*ctx));
                 reload_listeners
                     .insert(lc.name.clone(), ListenerReloadHandle::Tcp(Arc::clone(&ctx)));
                 ListenerRuntime::Tcp {
@@ -389,6 +408,7 @@ pub fn build_app(
                     metrics: Arc::clone(&listener_metrics),
                     proxy_protocol: lc.proxy_protocol,
                     tls,
+                    client_tcp_keepalive: lc.client_tcp_keepalive.clone(),
                 }
             }
         };
@@ -457,13 +477,10 @@ pub(crate) struct RoutePool {
 }
 
 pub(crate) enum ListenerCoreKind {
-    // Boxed: `HttpContext` runs ~3x larger than `TcpAppContext` (the extra
-    // client/per_backend_client/access_log fields), and clippy's
-    // `large_enum_variant` is right that leaving it unboxed would size every
-    // `ListenerCoreKind` -- including every `Tcp` one -- to the bigger of
-    // the two.
+    // Both boxed: clippy's `large_enum_variant` is right that leaving either
+    // unboxed would size every `ListenerCoreKind` to the bigger of the two.
     Http(Box<HttpContext>),
-    Tcp(TcpAppContext),
+    Tcp(Box<TcpAppContext>),
 }
 
 /// Builds one listener's pool, rate limiter, circuit breakers, and
@@ -599,8 +616,12 @@ pub(crate) fn build_listener_core(
             // operator has said so -- a TLS backend negotiates via ALPN
             // regardless (see `lb_proxy::build_client`).
             let backend_h2c = lc.http2.as_ref().map(|h| h.backend_h2c()).unwrap_or(false);
-            let client =
-                lb_proxy::build_client(backend_tls.as_deref(), server_name_addresses, backend_h2c);
+            let client = lb_proxy::build_client(
+                backend_tls.as_deref(),
+                server_name_addresses,
+                backend_h2c,
+                lc.backend_tcp_keepalive.as_ref(),
+            );
             // A `dns_discovery` + `backend_tls` listener puts several backends
             // behind one `server_name`, which `client` above cannot serve
             // correctly -- see `lb_proxy::per_backend`. Each such backend gets
@@ -614,6 +635,7 @@ pub(crate) fn build_listener_core(
                         .expect("validated: server_name is required when backend_tls is set"),
                     Arc::clone(connector),
                     backend_h2c,
+                    lc.backend_tcp_keepalive.clone(),
                 ))),
                 _ => None,
             };
@@ -661,6 +683,7 @@ pub(crate) fn build_listener_core(
                 forward_timeout: lc.forward_timeout(),
                 max_request_body_bytes: lc.max_request_body_bytes(),
                 websocket_idle_timeout: lc.websocket_idle_timeout(),
+                backend_tcp_keepalive: lc.backend_tcp_keepalive.clone(),
                 cluster: cluster_coordinator,
                 metrics: listener_metrics,
                 backend_metrics,
@@ -689,7 +712,7 @@ pub(crate) fn build_listener_core(
                 Arc::new(lb_tls::BackendTlsTransport::new(&c))
                     as Arc<dyn lb_core::OutboundTransport>
             });
-            ListenerCoreKind::Tcp(TcpContext {
+            ListenerCoreKind::Tcp(Box::new(TcpContext {
                 rate_limiter,
                 balancer: build_balancer(&lc.load_balancing.strategy),
                 pool: Arc::clone(&pool),
@@ -697,10 +720,11 @@ pub(crate) fn build_listener_core(
                 connect_timeout: lc.connect_timeout(),
                 idle_timeout: lc.idle_timeout(),
                 backend_tls: outbound,
+                backend_tcp_keepalive: lc.backend_tcp_keepalive.clone(),
                 cluster: cluster_coordinator,
                 metrics: listener_metrics,
                 backend_metrics,
-            })
+            }))
         }
     };
 

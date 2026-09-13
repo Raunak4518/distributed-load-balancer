@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[listeners.client_tcp_keepalive]` / `[listeners.backend_tcp_keepalive]`**
+  (either listener type): `SO_KEEPALIVE`/`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/
+  `TCP_KEEPCNT` tuning -- nginx's `so_keepalive`/`proxy_socket_keepalive`,
+  HAProxy's `clitcpka`/`srvtcpka`. The client-facing and backend-facing
+  socket are tuned independently and both are optional; omitting a section
+  leaves that socket at OS defaults, exactly as before this existed.
+  Applied to the client socket right at accept time (before PROXY protocol
+  or TLS touch it) and to every backend-dial path: the pooled HTTP client
+  (via `HttpConnector`'s own native setters), the per-route/per-backend
+  client pool, the raw TCP proxy's backend connection, and the WebSocket
+  upgrade path's dedicated connection. `time_secs`/`interval_secs`/`retries`
+  default to 60/10/6.
 - **`[listeners.waf]` (HTTP listeners)**: a WAF first slice -- blocks (or,
   in `mode = "log"`, just records) a request whose path or query string
   contains an obviously malicious pattern, checked before the request

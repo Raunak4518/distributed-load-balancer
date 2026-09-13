@@ -92,6 +92,13 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// connection may sit idle once the backend accepts the handshake.
     /// `forward_timeout`/`body_read_timeout` never apply past that point.
     pub websocket_idle_timeout: Duration,
+    /// See `lb_core::TcpKeepaliveConfig`. Applied to `client`'s pooled
+    /// connections via `HttpConnector`'s own native setters at wiring time
+    /// (`crate::forward::build_client`) -- this field exists on
+    /// `ProxyContext` only so `crate::upgrade`'s dedicated, non-pooled
+    /// backend connection (which bypasses `build_client` entirely) can
+    /// apply the same setting itself, at request time.
+    pub backend_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     /// Present only when `[cluster]` is configured; `None` means single-node.
     pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
     /// Always present, never optional: recording is a few atomic increments,
@@ -873,7 +880,7 @@ mod tests {
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
 
-        let client = build_client(None, HashMap::new(), false);
+        let client = build_client(None, HashMap::new(), false, None);
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
@@ -906,7 +913,7 @@ mod tests {
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
 
-        let client = build_client(None, HashMap::new(), false);
+        let client = build_client(None, HashMap::new(), false, None);
         let mut builder = Request::builder().uri(format!("http://{addr}{path}"));
         if let Some(host) = host {
             builder = builder.header(header::HOST, host);
@@ -938,7 +945,7 @@ mod tests {
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
 
-        let client = build_client(None, HashMap::new(), false);
+        let client = build_client(None, HashMap::new(), false, None);
         let mut builder = Request::builder().uri(format!("http://{addr}/"));
         if let Some(cookie) = cookie {
             builder = builder.header(header::COOKIE, cookie);
@@ -977,11 +984,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1007,11 +1015,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1046,11 +1055,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1080,11 +1090,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1120,11 +1131,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1168,11 +1180,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1220,11 +1233,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1272,11 +1286,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1424,11 +1439,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1520,11 +1536,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1564,11 +1581,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1689,7 +1707,7 @@ mod tests {
     }
 
     async fn get(addr: SocketAddr) -> Response<Bytes> {
-        let client = build_client(None, HashMap::new(), false);
+        let client = build_client(None, HashMap::new(), false, None);
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
@@ -1733,11 +1751,12 @@ mod tests {
             cache: Some(cache),
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1775,11 +1794,12 @@ mod tests {
             cache: Some(test_cache()),
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1813,11 +1833,12 @@ mod tests {
             cache: Some(test_cache()),
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1850,11 +1871,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1884,11 +1906,12 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Block),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1925,11 +1948,12 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Log),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1965,11 +1989,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -2085,11 +2110,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(5),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             max_request_body_bytes: 1024,
@@ -2144,11 +2170,12 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
-            client: build_client(None, HashMap::new(), false),
+            client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(5),
+            backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             max_request_body_bytes: 1024,

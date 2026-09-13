@@ -22,8 +22,8 @@ pub use config::{
     AdminConfig, BackendConfig, BackendTlsConfig, CacheConfig, CertificateConfig, ClusterConfig,
     Config, HealthCheckConfig, ListenerConfig, LoadBalancingConfig, LoadBalancingStrategy,
     LogFormat, LoggingConfig, PeerTlsConfig, Protocol, RateLimitConfig, RateLimitKeySource,
-    RouteConfig, ServerConfig, StickyConfig, TlsConfig, TlsVersion, TracingConfig, WafConfig,
-    WafMode,
+    RouteConfig, ServerConfig, StickyConfig, TcpKeepaliveConfig, TlsConfig, TlsVersion,
+    TracingConfig, WafConfig, WafMode,
 };
 pub use dns::DnsDiscoveryConfig;
 pub use error::ConfigError;

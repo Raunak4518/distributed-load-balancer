@@ -111,6 +111,9 @@ where
 
     let connect_and_handshake = async {
         let tcp = TcpStream::connect(backend.address).await?;
+        if let Some(keepalive) = &ctx.backend_tcp_keepalive {
+            apply_tcp_keepalive(&tcp, keepalive);
+        }
         let io: Box<dyn ProxyStream> = if let Some(connector) = &ctx.backend_tls_connector {
             let server_name = backend
                 .server_name
@@ -221,6 +224,22 @@ where
     Response::from_parts(parts, empty_body())
 }
 
+/// Fire-and-log, never fatal: a keepalive that fails to apply (an unusual
+/// platform/socket state) must not take this connection down over a purely
+/// advisory setting. Duplicated (not shared across a crate boundary) from
+/// `lb_tcp::session`'s own copy -- see `lb-core`'s `Cargo.toml` for why
+/// `lb-core` itself cannot host this. `set_tcp_keepalive` also turns on
+/// `SO_KEEPALIVE` itself, so no separate call is needed.
+fn apply_tcp_keepalive(stream: &TcpStream, cfg: &lb_core::TcpKeepaliveConfig) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(cfg.time_secs))
+        .with_interval(std::time::Duration::from_secs(cfg.interval_secs))
+        .with_retries(cfg.retries);
+    if let Err(err) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(error = %err, "failed to set websocket backend tcp keepalive");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +291,38 @@ mod tests {
     #[test]
     fn no_headers_at_all_is_not_an_upgrade_request() {
         assert!(!is_upgrade_request(&HeaderMap::new()));
+    }
+
+    /// There's no meaningful way to assert on `SO_KEEPALIVE`'s actual
+    /// *timing* behavior within a test's timescale -- this calls the real
+    /// `apply_tcp_keepalive` against a real connected socket and checks the
+    /// one directly observable effect: `SO_KEEPALIVE` itself gets turned on
+    /// (a side effect of `set_tcp_keepalive`), which it was not before.
+    #[tokio::test]
+    async fn applying_tcp_keepalive_turns_on_so_keepalive() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            !socket2::SockRef::from(&stream).keepalive().unwrap(),
+            "keepalive should be off by default"
+        );
+
+        apply_tcp_keepalive(
+            &stream,
+            &lb_core::TcpKeepaliveConfig {
+                time_secs: 60,
+                interval_secs: 10,
+                retries: 6,
+            },
+        );
+
+        assert!(
+            socket2::SockRef::from(&stream).keepalive().unwrap(),
+            "apply_tcp_keepalive should have turned SO_KEEPALIVE on"
+        );
     }
 }

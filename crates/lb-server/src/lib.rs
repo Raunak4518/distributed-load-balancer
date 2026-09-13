@@ -292,6 +292,9 @@ fn spawn_connection(
 
         let mut stream = stream;
         let mut peer = peer;
+        if let Some(keepalive) = runtime.client_tcp_keepalive() {
+            apply_tcp_keepalive(&stream, keepalive);
+        }
         if runtime.proxy_protocol() {
             // Read before anything else on the connection -- a trusted
             // front-end sends this first, ahead of a TLS ClientHello or a
@@ -353,6 +356,23 @@ fn spawn_connection(
             }
         }
     });
+}
+
+/// Fire-and-log, never fatal: a keepalive that fails to apply (an unusual
+/// platform/socket state) must not take a connection down over a purely
+/// advisory setting. Duplicated (not shared across a crate boundary) from
+/// `lb_tcp::session`'s and `lb_proxy::upgrade`'s own copies -- see
+/// `lb-core`'s `Cargo.toml` for why `lb-core` itself cannot host this.
+/// `set_tcp_keepalive` also turns on `SO_KEEPALIVE` itself, so no separate
+/// call is needed.
+fn apply_tcp_keepalive(stream: &TcpStream, cfg: &lb_core::TcpKeepaliveConfig) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(cfg.time_secs))
+        .with_interval(Duration::from_secs(cfg.interval_secs))
+        .with_retries(cfg.retries);
+    if let Err(err) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(error = %err, "failed to set client tcp keepalive");
+    }
 }
 
 /// Runs the protocol driver over whatever stream it is given.

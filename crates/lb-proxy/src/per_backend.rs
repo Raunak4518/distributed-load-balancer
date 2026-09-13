@@ -26,6 +26,7 @@ pub struct PerBackendClients {
     server_name: String,
     backend_tls: Arc<lb_tls::BackendConnector>,
     backend_h2c: bool,
+    backend_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     clients: RwLock<HashMap<BackendId, ProxyClient>>,
 }
 
@@ -34,11 +35,13 @@ impl PerBackendClients {
         server_name: String,
         backend_tls: Arc<lb_tls::BackendConnector>,
         backend_h2c: bool,
+        backend_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     ) -> Self {
         PerBackendClients {
             server_name,
             backend_tls,
             backend_h2c,
+            backend_tcp_keepalive,
             clients: RwLock::new(HashMap::new()),
         }
     }
@@ -49,7 +52,12 @@ impl PerBackendClients {
         }
         let mut table = HashMap::new();
         table.insert(self.server_name.clone(), backend.address);
-        let client = build_client(Some(&self.backend_tls), table, self.backend_h2c);
+        let client = build_client(
+            Some(&self.backend_tls),
+            table,
+            self.backend_h2c,
+            self.backend_tcp_keepalive.as_ref(),
+        );
         self.clients
             .write()
             .unwrap()
@@ -95,7 +103,7 @@ mod tests {
 
     #[test]
     fn distinct_backends_get_distinct_clients() {
-        let clients = PerBackendClients::new("svc.internal".into(), connector(), false);
+        let clients = PerBackendClients::new("svc.internal".into(), connector(), false, None);
         let b1 = Backend::new("b1", "127.0.0.1:9001".parse().unwrap(), 1, None);
         let b2 = Backend::new("b2", "127.0.0.1:9002".parse().unwrap(), 1, None);
 
@@ -110,7 +118,7 @@ mod tests {
 
     #[test]
     fn the_same_backend_id_reuses_its_client() {
-        let clients = PerBackendClients::new("svc.internal".into(), connector(), false);
+        let clients = PerBackendClients::new("svc.internal".into(), connector(), false, None);
         let b1 = Backend::new("b1", "127.0.0.1:9001".parse().unwrap(), 1, None);
 
         clients.get_or_build(&b1);

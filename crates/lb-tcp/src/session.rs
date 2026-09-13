@@ -26,6 +26,11 @@ pub struct TcpContext<R: RateLimiter, C: Clock> {
     /// asks for a connection to be wrapped and pumps whatever it gets back,
     /// exactly as it is already generic over the inbound stream.
     pub backend_tls: Option<Arc<dyn OutboundTransport>>,
+    /// See `lb_core::TcpKeepaliveConfig`. Applied to the raw `TcpStream` in
+    /// `establish`, before it's wrapped for TLS or boxed into
+    /// `Box<dyn ProxyStream>` (boxing erases the OS-handle traits `socket2`
+    /// needs).
+    pub backend_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     /// Present only when `[cluster]` is configured; `None` means single-node.
     pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
     /// Always present — see the note on `ProxyContext::metrics`.
@@ -88,6 +93,9 @@ where
         // did not answer.
         _ => return None,
     };
+    if let Some(keepalive) = &ctx.backend_tcp_keepalive {
+        apply_tcp_keepalive(&stream, keepalive);
+    }
     let stream: Box<dyn ProxyStream> = Box::new(stream);
 
     match (&ctx.backend_tls, &backend.server_name) {
@@ -105,6 +113,20 @@ where
         // defeat the encryption that was asked for.
         (Some(_), None) => None,
         (None, _) => Some(stream),
+    }
+}
+
+/// Fire-and-log, never fatal: a keepalive that fails to apply (an unusual
+/// platform/socket state) must not take a connection down over a purely
+/// advisory setting. `set_tcp_keepalive` also turns on `SO_KEEPALIVE`
+/// itself, so no separate call is needed.
+fn apply_tcp_keepalive(stream: &TcpStream, cfg: &lb_core::TcpKeepaliveConfig) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(cfg.time_secs))
+        .with_interval(Duration::from_secs(cfg.interval_secs))
+        .with_retries(cfg.retries);
+    if let Err(err) = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive) {
+        tracing::warn!(error = %err, "failed to set backend tcp keepalive");
     }
 }
 
@@ -334,6 +356,7 @@ mod tests {
             connect_timeout: Duration::from_millis(500),
             idle_timeout: Duration::from_secs(5),
             backend_tls: None,
+            backend_tcp_keepalive: None,
             cluster: None,
             metrics: {
                 let registry = lb_metrics::Metrics::new().expect("metrics registry");
@@ -655,6 +678,39 @@ mod tests {
         assert!(
             calls.lock().unwrap().is_empty(),
             "a nameless backend must not reach the transport at all"
+        );
+    }
+
+    /// There's no meaningful way to assert on `SO_KEEPALIVE`'s actual
+    /// *timing* behavior within a test's timescale -- this calls the real
+    /// `apply_tcp_keepalive` against a real connected socket and checks the
+    /// one directly observable effect: `SO_KEEPALIVE` itself gets turned on
+    /// (a side effect of `set_tcp_keepalive`), which it was not before.
+    #[tokio::test]
+    async fn applying_tcp_keepalive_turns_on_so_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        assert!(
+            !socket2::SockRef::from(&stream).keepalive().unwrap(),
+            "keepalive should be off by default"
+        );
+
+        apply_tcp_keepalive(
+            &stream,
+            &lb_core::TcpKeepaliveConfig {
+                time_secs: 60,
+                interval_secs: 10,
+                retries: 6,
+            },
+        );
+
+        assert!(
+            socket2::SockRef::from(&stream).keepalive().unwrap(),
+            "apply_tcp_keepalive should have turned SO_KEEPALIVE on"
         );
     }
 }

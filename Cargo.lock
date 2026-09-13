@@ -940,6 +940,7 @@ dependencies = [
  "lb-tcp",
  "lb-tls",
  "rustls",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tower-service",
@@ -983,6 +984,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde_json",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tower",
@@ -997,6 +999,7 @@ dependencies = [
  "lb-core",
  "lb-healthcheck",
  "lb-metrics",
+ "socket2",
  "tokio",
  "tracing",
 ]

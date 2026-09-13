@@ -250,6 +250,20 @@ pub struct ListenerConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
 
+    /// Applies to both protocols and both directions independently -- the
+    /// socket this listener accepts from clients. `None` (the default)
+    /// means exactly what it always meant: no keepalive tuning, OS
+    /// defaults, `SO_KEEPALIVE` never explicitly touched.
+    #[serde(default)]
+    pub client_tcp_keepalive: Option<TcpKeepaliveConfig>,
+    /// The socket this listener dials to a backend -- independent of
+    /// `client_tcp_keepalive` above, since a client connection and its
+    /// backend connection are different sockets with potentially different
+    /// idle characteristics worth tuning separately (nginx's `so_keepalive`
+    /// vs `proxy_socket_keepalive`, HAProxy's `clitcpka`/`srvtcpka`).
+    #[serde(default)]
+    pub backend_tcp_keepalive: Option<TcpKeepaliveConfig>,
+
     #[serde(default)]
     pub tls: Option<TlsConfig>,
     #[serde(default)]
@@ -367,6 +381,34 @@ fn default_cache_max_total_bytes() -> usize {
 
 fn default_cache_default_ttl_secs() -> u64 {
     60
+}
+
+/// See `ListenerConfig::client_tcp_keepalive`/`backend_tcp_keepalive`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TcpKeepaliveConfig {
+    /// How long the connection may sit idle before the first probe
+    /// (`TCP_KEEPIDLE`/`TCP_KEEPALIVE`).
+    #[serde(default = "default_tcp_keepalive_time_secs")]
+    pub time_secs: u64,
+    /// How long between probes once they start (`TCP_KEEPINTVL`).
+    #[serde(default = "default_tcp_keepalive_interval_secs")]
+    pub interval_secs: u64,
+    /// How many unanswered probes before the connection is considered dead
+    /// (`TCP_KEEPCNT`).
+    #[serde(default = "default_tcp_keepalive_retries")]
+    pub retries: u32,
+}
+
+fn default_tcp_keepalive_time_secs() -> u64 {
+    60
+}
+
+fn default_tcp_keepalive_interval_secs() -> u64 {
+    10
+}
+
+fn default_tcp_keepalive_retries() -> u32 {
+    6
 }
 
 /// See `ListenerConfig::sticky`.
@@ -1500,6 +1542,59 @@ mod tests {
             format!("{err}").contains("waf"),
             "error should name waf, got: {err}"
         );
+    }
+
+    #[test]
+    fn tcp_keepalive_defaults_to_none_on_both_directions() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(cfg.listeners[0].client_tcp_keepalive.is_none());
+        assert!(cfg.listeners[0].backend_tcp_keepalive.is_none());
+    }
+
+    #[test]
+    fn parses_client_tcp_keepalive_with_defaults() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.client_tcp_keepalive]",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let ka = cfg.listeners[0]
+            .client_tcp_keepalive
+            .as_ref()
+            .expect("client_tcp_keepalive should parse");
+        assert_eq!(ka.time_secs, 60);
+        assert_eq!(ka.interval_secs, 10);
+        assert_eq!(ka.retries, 6);
+    }
+
+    #[test]
+    fn parses_a_configured_backend_tcp_keepalive() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.backend_tcp_keepalive]\n          time_secs = 30\n          interval_secs = 5\n          retries = 3",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let ka = cfg.listeners[0]
+            .backend_tcp_keepalive
+            .as_ref()
+            .expect("backend_tcp_keepalive should parse");
+        assert_eq!(ka.time_secs, 30);
+        assert_eq!(ka.interval_secs, 5);
+        assert_eq!(ka.retries, 3);
+    }
+
+    #[test]
+    fn tcp_keepalive_is_valid_on_a_tcp_listener() {
+        // Unlike sticky/cache/waf/routes, keepalive applies to both
+        // protocols -- both directions must parse on a TCP listener with no
+        // rejection.
+        let anchor = "          [listeners.load_balancing]\n          strategy = \"round_robin\"";
+        let insert_at = VALID.rfind(anchor).unwrap() + anchor.len();
+        let mut text = String::from(&VALID[..insert_at]);
+        text.push_str("\n\n          [listeners.client_tcp_keepalive]\n\n          [listeners.backend_tcp_keepalive]");
+        text.push_str(&VALID[insert_at..]);
+
+        Config::parse(&text).expect("keepalive should be valid on a tcp listener");
     }
 
     #[test]

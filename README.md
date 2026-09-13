@@ -18,6 +18,7 @@ Client → TLS termination → Rate limiter → Backend selection → Forward
 - **Active health checking**: HTTP probes (GET, 2xx = healthy) or TCP connect probes, using the *same* transport as real traffic.
 - **Circuit breaking** per backend: Closed → Open → HalfOpen, with configurable threshold and cooldown.
 - **PROXY protocol** (v1 and v2, auto-detected) on either listener type, for sitting behind another proxy/ELB/CDN while still seeing the real client IP.
+- **TCP keepalive tuning** (`SO_KEEPALIVE`/`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`), independently configurable for the client-facing and backend-facing socket, on either listener type.
 - **Response compression** (gzip/brotli/deflate/zstd), negotiated against the client's `Accept-Encoding`, off by default.
 - **Prometheus metrics** on a private admin port. Separate `/healthz` (liveness, always 200) and `/ready` (readiness, 503 when no backend is eligible).
 - **Connection hardening**: global + per-IP caps, slowloris timeout (both directions — sending and reading the response), HTTP/2 Rapid Reset mitigation, body size and read-time limits.
@@ -134,6 +135,7 @@ See [`config.example.toml`](config.example.toml) for the authoritative reference
 - **`[listeners.cache]`** — HTTP-only, optional. Answers a repeated `GET` straight from memory instead of forwarding it to a backend — nginx's `proxy_cache`, Varnish. Only a `GET` request, a `200` response with a `Content-Length` inside `max_entry_bytes` is ever cached; everything else is proxied exactly as it is with the section absent.
 - **`[listeners.waf]`** — HTTP-only, optional. A WAF first slice: blocks (or, in `log` mode, records) a request whose path or query string matches a small, fixed, built-in set of SQL-injection/XSS/path-traversal tokens, before it reaches a route, the cache, or a backend.
 - **WebSocket / `Upgrade` proxying** — no config section, no toggle: any HTTP/1.1 request carrying `Connection: Upgrade` + `Upgrade: websocket` is proxied correctly on every HTTP listener, dialed to the backend over its own dedicated connection and relayed byte-for-byte once the backend answers `101`. `websocket_idle_timeout_ms` (a flat field alongside `write_timeout_ms`, default 300s) is the only knob, governing how long the connection may sit idle post-handshake.
+- **`[listeners.client_tcp_keepalive]` / `[listeners.backend_tcp_keepalive]`** — optional, independent, valid on either listener type. `SO_KEEPALIVE`/`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` tuning for the client-facing and backend-facing socket respectively (`time_secs`/`interval_secs`/`retries`, defaults 60/10/6). Omitting either leaves that socket at OS defaults, exactly as before this existed.
 - **`[listeners.tls]`** — edge TLS termination. ALPN, handshake timeout, HSTS, cert reload interval.
 - **`[listeners.backend_tls]`** — re-encryption to backends. Custom CA or system roots. `danger_accept_invalid_certs` is logged as a warning and exported as a metric.
 - **`[listeners.http2]`** — per-listener HTTP/2 settings. Every field has a safe default; omitting the section still gets full protection.
@@ -148,7 +150,7 @@ Full field-by-field reference: [docs/configuration-reference.md](docs/configurat
 ### HTTP
 
 1. Accept loop acquires a global semaphore *before* `accept()`. At capacity, the kernel refuses for us.
-2. Per-IP slot checked after accept. Rejection drops the socket.
+2. Per-IP slot checked after accept. Rejection drops the socket. If `client_tcp_keepalive` is configured, it's applied to the raw socket here too, before anything else touches it (PROXY protocol included).
 3. TLS handshake runs in the spawned task, not the accept loop. Both limit guards held across it.
 4. ALPN result dispatches to HTTP/1.1 (`header_read_timeout`) or HTTP/2 (stream limits, PING keep-alive, `FirstByteDeadline`). Both are additionally wrapped in `write_timeout` — the read-side timeouts bound how long a client may take to *send*; this bounds how long it may take to *read the response*, so a client that stops draining its socket can't hold the connection open forever either.
 5. Local GCRA check — free, in-process.

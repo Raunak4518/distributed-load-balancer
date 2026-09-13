@@ -10,6 +10,11 @@ lb-healthcheck = { path = "../lb-healthcheck" }
 lb-metrics = { path = "../lb-metrics" }
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 tracing = "0.1"
+# For backend-facing TCP keepalive tuning (`apply_tcp_keepalive` in
+# session.rs) -- see `lb-server`'s Cargo.toml comment for why this is a
+# direct dependency despite already being transitively present, and why
+# "all" is needed.
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 lb-core = { path = "../lb-core", features = ["test-util"] }
