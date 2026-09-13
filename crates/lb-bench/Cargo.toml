@@ -14,7 +14,16 @@ lb-cluster = { path = "../lb-cluster" }
 # defaults to aws-lc-rs, which needs cmake and a C toolchain.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "sync", "io-util"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [[bin]]
 name = "lb-bench"
 path = "src/main.rs"
+
+[[bin]]
+name = "lb-bench-e2e"
+path = "src/e2e_main.rs"
