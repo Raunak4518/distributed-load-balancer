@@ -113,6 +113,49 @@ pub struct ListenerMetrics {
     /// feature-gated counter above.
     pub cache_hit: IntCounter,
     pub cache_miss: IntCounter,
+
+    /// WAF first-slice. One fixed handle per built-in rule -- the rule set
+    /// is closed and known at compile time, so this is pre-resolved like
+    /// every other fixed-outcome-set counter above rather than a
+    /// per-request `with_label_values` lookup.
+    pub waf_blocked_sql_injection: IntCounter,
+    pub waf_blocked_xss: IntCounter,
+    pub waf_blocked_path_traversal: IntCounter,
+}
+
+/// The built-in WAF rule that matched a request -- see `lb_proxy::waf`.
+/// Lives here, not in `lb-proxy`, for the same reason `StatusClass` does:
+/// `lb-proxy` depends on `lb-metrics`, not the other way around, and every
+/// metric label value in this codebase must come from a fixed, code-known
+/// set (`Metrics::no_unbounded_label_names_are_exposed` enforces this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WafRule {
+    SqlInjection,
+    Xss,
+    PathTraversal,
+}
+
+impl WafRule {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            WafRule::SqlInjection => "sql_injection",
+            WafRule::Xss => "xss",
+            WafRule::PathTraversal => "path_traversal",
+        }
+    }
+}
+
+impl ListenerMetrics {
+    /// Increments this listener's counter for whichever built-in rule
+    /// matched. A plain dispatch, not a label lookup -- every handle is
+    /// already resolved at listener-build time.
+    pub fn record_waf_block(&self, rule: WafRule) {
+        match rule {
+            WafRule::SqlInjection => self.waf_blocked_sql_injection.inc(),
+            WafRule::Xss => self.waf_blocked_xss.inc(),
+            WafRule::PathTraversal => self.waf_blocked_path_traversal.inc(),
+        }
+    }
 }
 
 impl ListenerMetrics {

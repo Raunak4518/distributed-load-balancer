@@ -348,6 +348,23 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
 # listener's context) -- the deliberately simplest invalidation story, with
 # no purge-by-pattern API.
 
+# ── WAF first slice (optional, HTTP-only) ───────────────────────────────
+# Blocks (or, in log mode, just records) a request whose path or query
+# string contains an obviously malicious pattern -- a small, fixed,
+# built-in set of SQL-injection/XSS/path-traversal tokens, checked before
+# the request reaches a route, the cache, or a backend. Deliberately not a
+# rule engine: no percent-decoding/canonicalization, no header inspection,
+# and no operator-supplied patterns -- each a real capability, each
+# deliberately deferred to keep this first slice small and auditable
+# rather than accidentally missing.
+#
+# [listeners.waf]
+#   # "block" refuses a matching request outright (403). "log" records the
+#   # match (metric + a warning log line) and forwards the request exactly
+#   # as if this section weren't configured -- useful for seeing what the
+#   # built-in rules would have caught before enforcing them.
+#   mode = "block"
+
 # ── TCP (L4) listener ─────────────────────────────────────────────────
 [[listeners]]
 name     = "postgres"

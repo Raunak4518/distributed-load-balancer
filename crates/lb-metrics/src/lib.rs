@@ -2,7 +2,7 @@ mod admin;
 mod handles;
 
 pub use admin::{spawn_admin_server, AdminExtension, ReadinessCheck};
-pub use handles::{BackendMetrics, ListenerMetrics, RequestCounters, StatusClass};
+pub use handles::{BackendMetrics, ListenerMetrics, RequestCounters, StatusClass, WafRule};
 
 /// Re-exported so consumer crates can hold metric handles without taking a
 /// direct dependency on the metrics backend.
@@ -48,6 +48,9 @@ pub struct Metrics {
 
     // Response caching.
     cache_result: IntCounterVec,
+
+    // WAF first slice.
+    waf_blocked: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -211,6 +214,13 @@ impl Metrics {
             ),
             &["listener", "result"],
         )?;
+        let waf_blocked = IntCounterVec::new(
+            Opts::new(
+                "lb_waf_blocked_total",
+                "Requests blocked or flagged by the built-in WAF rules, by rule",
+            ),
+            &["listener", "rule"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -233,6 +243,7 @@ impl Metrics {
         registry.register(Box::new(tls_certificate_expiry_timestamp_seconds.clone()))?;
         registry.register(Box::new(backend_tls_verification_disabled.clone()))?;
         registry.register(Box::new(cache_result.clone()))?;
+        registry.register(Box::new(waf_blocked.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -257,6 +268,7 @@ impl Metrics {
             tls_certificate_expiry_timestamp_seconds,
             backend_tls_verification_disabled,
             cache_result,
+            waf_blocked,
         })
     }
 
@@ -331,6 +343,15 @@ impl Metrics {
                 .clone(),
             cache_hit: self.cache_result.with_label_values(&[name, "hit"]),
             cache_miss: self.cache_result.with_label_values(&[name, "miss"]),
+            waf_blocked_sql_injection: self
+                .waf_blocked
+                .with_label_values(&[name, WafRule::SqlInjection.as_label()]),
+            waf_blocked_xss: self
+                .waf_blocked
+                .with_label_values(&[name, WafRule::Xss.as_label()]),
+            waf_blocked_path_traversal: self
+                .waf_blocked
+                .with_label_values(&[name, WafRule::PathTraversal.as_label()]),
         }
     }
 
@@ -413,6 +434,30 @@ mod tests {
         assert!(
             text.contains(r#"lb_ratelimit_rejected_total{layer="cluster",listener="web"} 2"#),
             "expected cluster=2 in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn waf_rules_are_counted_separately() {
+        let metrics = Metrics::new().unwrap();
+        let listener = metrics.listener("web");
+        listener.record_waf_block(WafRule::SqlInjection);
+        listener.record_waf_block(WafRule::Xss);
+        listener.record_waf_block(WafRule::Xss);
+        listener.record_waf_block(WafRule::PathTraversal);
+
+        let text = metrics.gather_text();
+        assert!(
+            text.contains(r#"lb_waf_blocked_total{listener="web",rule="sql_injection"} 1"#),
+            "expected sql_injection=1 in:\n{text}"
+        );
+        assert!(
+            text.contains(r#"lb_waf_blocked_total{listener="web",rule="xss"} 2"#),
+            "expected xss=2 in:\n{text}"
+        );
+        assert!(
+            text.contains(r#"lb_waf_blocked_total{listener="web",rule="path_traversal"} 1"#),
+            "expected path_traversal=1 in:\n{text}"
         );
     }
 
@@ -657,7 +702,7 @@ mod tests {
             .set(1);
         let text = metrics.gather_text();
 
-        const ALLOWED: [&str; 12] = [
+        const ALLOWED: [&str; 13] = [
             "listener", "protocol", "status", "backend", "outcome", "layer", "peer",
             // Phase 5: both drawn from fixed sets in the code, never input.
             "reason", "phase",
@@ -671,6 +716,9 @@ mod tests {
             // Response caching: always exactly "hit" or "miss", drawn from
             // the code, never from a cached key or client-supplied header.
             "result",
+            // WAF first slice: always one of a fixed, built-in rule set
+            // (`WafRule::as_label`), never the matched text or client input.
+            "rule",
         ];
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let Some(start) = line.find('{') else {

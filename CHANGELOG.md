@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[listeners.waf]` (HTTP listeners)**: a WAF first slice -- blocks (or,
+  in `mode = "log"`, just records) a request whose path or query string
+  contains an obviously malicious pattern, checked before the request
+  reaches a route, the response cache, or a backend. A small, fixed,
+  built-in set of SQL-injection/XSS/path-traversal substring checks, not a
+  rule engine: no percent-decoding/canonicalization, no header inspection,
+  and no operator-supplied patterns (a regex dependency and the ReDoS
+  question it raises for operator-authored patterns are a deliberately
+  separate decision, not smuggled into this slice). `mode = "log"` records
+  the match and still forwards the request, for rolling the rule set out in
+  detection mode before enforcing it. New
+  `lb_waf_blocked_total{listener,rule}` metric.
 - **`[listeners.cache]` (HTTP listeners)**: answers a repeated `GET`
   straight from memory instead of forwarding it to a backend at all --
   nginx's `proxy_cache`, Varnish. Deliberately narrow for v1: only a `GET`

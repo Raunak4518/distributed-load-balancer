@@ -1,6 +1,7 @@
 use crate::cache::{self, ResponseCache};
 use crate::forward::{backend_scheme_and_authority, forward, ForwardError, ProxyClient};
 use crate::sticky::{self, StickyRuntime};
+use crate::waf;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
@@ -8,7 +9,7 @@ use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use lb_core::{
-    BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimitKeySource, RateLimiter,
+    BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimitKeySource, RateLimiter, WafMode,
 };
 use lb_healthcheck::CircuitBreaker;
 use lb_metrics::{BackendMetrics, ListenerMetrics, StatusClass};
@@ -50,6 +51,13 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// one cache per listener is already correctly partitioned between
     /// routes without a separate per-route toggle.
     pub cache: Option<Arc<ResponseCache<C>>>,
+    /// Blocks (or, in `Log` mode, just records) a request matching one of
+    /// the built-in WAF rules -- see `crate::waf`'s module docs. A direct
+    /// passthrough of the config enum, not a wrapper struct: unlike
+    /// `sticky`'s `secure` flag, nothing here needs deriving from another
+    /// listener fact at wiring time (`RateLimitKeySource` is stored the
+    /// same way, for the same reason).
+    pub waf: Option<WafMode>,
     /// Flat, not scoped per pool: correct because `Config::validate()`
     /// requires every backend id to be unique across the default backends
     /// *and every route's* within one listener, so a `BackendId` here
@@ -425,6 +433,26 @@ where
             resp.headers_mut().insert(header::RETRY_AFTER, value);
         }
         return Ok(resp);
+    }
+
+    // Checked here -- after the free, local rate limiter, but before the
+    // cluster budget below and everything else that follows -- so a request
+    // this blocks never consumes shared cluster-rate-limit state, never
+    // counts as a cache miss, and never triggers a route lookup.
+    if let Some(mode) = ctx.waf {
+        let target = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or_else(|| req.uri().path());
+        if let Some(rule) = waf::matched_rule(target) {
+            ctx.metrics.record_waf_block(rule);
+            tracing::warn!(rule = rule.as_label(), mode = ?mode, "waf rule matched");
+            if mode == WafMode::Block {
+                return Ok(simple_response(StatusCode::FORBIDDEN, "request blocked"));
+            }
+            // Log mode: recorded above, falls through to normal handling.
+        }
     }
 
     // The cluster budget is consulted only after the local limiter allowed
@@ -926,6 +954,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -953,6 +982,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -989,6 +1019,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1020,6 +1051,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1057,6 +1089,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1102,6 +1135,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1151,6 +1185,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1200,6 +1235,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1349,6 +1385,7 @@ mod tests {
             }],
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1442,6 +1479,7 @@ mod tests {
             ],
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1483,6 +1521,7 @@ mod tests {
             routes: Vec::new(),
             sticky,
             cache: None,
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1642,6 +1681,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: Some(cache),
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1681,6 +1721,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: Some(test_cache()),
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1716,6 +1757,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: Some(test_cache()),
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1750,6 +1792,7 @@ mod tests {
             routes: Vec::new(),
             sticky: None,
             cache: None,
+            waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1769,5 +1812,113 @@ mod tests {
         get(addr).await;
         get(addr).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn waf_block_mode_returns_403_and_never_reaches_the_backend() {
+        let metrics = test_metrics();
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(PanicIfPicked),
+            pool: empty_pool(),
+            routes: Vec::new(),
+            sticky: None,
+            cache: None,
+            waf: Some(WafMode::Block),
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: metrics.clone(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        // `xp_cmdshell` rather than a token with a space: this exercises
+        // the check through a real, valid `http::Uri`, and a raw space is
+        // not a legal URI character without percent-encoding (which the
+        // matcher deliberately does not decode -- see the module docs).
+        let resp = run_through_proxy_at(ctx, "/exec?cmd=xp_cmdshell", None).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(metrics.waf_blocked_sql_injection.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn waf_log_mode_still_reaches_the_backend() {
+        let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let metrics = test_metrics();
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky: None,
+            cache: None,
+            waf: Some(WafMode::Log),
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: metrics.clone(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        // `javascript:` rather than `<script>`: `<`/`>` are not legal raw
+        // URI characters either, same reasoning as the block-mode test above.
+        let resp = run_through_proxy_at(ctx, "/redirect?url=javascript:alert(1)", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), "hello");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(metrics.waf_blocked_xss.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_waf_config_means_malicious_looking_paths_still_reach_the_backend() {
+        let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky: None,
+            cache: None,
+            waf: None,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let resp = run_through_proxy_at(ctx, "/files/../../etc/passwd", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -132,6 +132,7 @@ See [`config.example.toml`](config.example.toml) for the authoritative reference
 - **`[[listeners.routes]]`** — HTTP-only, optional. Routes a request to a different backend set by path prefix and/or `Host` header, first match wins — nginx's `location` blocks, HAProxy's ACL-based backend selection. A listener with none behaves exactly as it did before routes existed.
 - **`[listeners.sticky]`** — HTTP-only, optional. Sticky-cookie session affinity: once a client lands on a backend, prefers that backend on their next request, falling back to the underlying `load_balancing.strategy` when the cookie is absent, invalid, or names an ineligible backend.
 - **`[listeners.cache]`** — HTTP-only, optional. Answers a repeated `GET` straight from memory instead of forwarding it to a backend — nginx's `proxy_cache`, Varnish. Only a `GET` request, a `200` response with a `Content-Length` inside `max_entry_bytes` is ever cached; everything else is proxied exactly as it is with the section absent.
+- **`[listeners.waf]`** — HTTP-only, optional. A WAF first slice: blocks (or, in `log` mode, records) a request whose path or query string matches a small, fixed, built-in set of SQL-injection/XSS/path-traversal tokens, before it reaches a route, the cache, or a backend.
 - **`[listeners.tls]`** — edge TLS termination. ALPN, handshake timeout, HSTS, cert reload interval.
 - **`[listeners.backend_tls]`** — re-encryption to backends. Custom CA or system roots. `danger_accept_invalid_certs` is logged as a warning and exported as a metric.
 - **`[listeners.http2]`** — per-listener HTTP/2 settings. Every field has a safe default; omitting the section still gets full protection.
@@ -149,13 +150,15 @@ Full field-by-field reference: [docs/configuration-reference.md](docs/configurat
 2. Per-IP slot checked after accept. Rejection drops the socket.
 3. TLS handshake runs in the spawned task, not the accept loop. Both limit guards held across it.
 4. ALPN result dispatches to HTTP/1.1 (`header_read_timeout`) or HTTP/2 (stream limits, PING keep-alive, `FirstByteDeadline`). Both are additionally wrapped in `write_timeout` — the read-side timeouts bound how long a client may take to *send*; this bounds how long it may take to *read the response*, so a client that stops draining its socket can't hold the connection open forever either.
-5. Local GCRA check — free, in-process. Then cluster budget if configured.
-6. If `[listeners.cache]` is configured and this is a `GET`, the cache is checked for a still-fresh entry keyed on method/Host/path+query; a hit returns immediately, skipping everything below — no route resolution, no backend, no retry loop.
-7. If `[[listeners.routes]]` is configured, the request's path/Host is matched against each rule in order; the first match's backend pool and strategy are used for everything below, falling through to the listener's default pool when nothing matches.
-8. Circuit-breaker states refreshed from the breakers to the (matched or default) pool.
-9. Body read with size cap and timeout.
-10. If `[listeners.sticky]` is configured and the request carries a cookie naming a still-eligible backend, that backend is used on the first attempt instead of asking the strategy; otherwise (or on the retry) the configured strategy (`round_robin`, `least_connections`, `weighted_round_robin`, or `consistent_hash`) picks an eligible backend. Request forwarded through a `hyper_util::Client` with connection pooling.
-11. On backend failure, one retry to a different backend. On success, hop-by-hop headers stripped, `X-Request-Id` added, HSTS injected if configured, `Set-Cookie` naming whichever backend served it (if sticky), and (if the response is `GET`+`200`+cacheable) stored in the cache before returning.
+5. Local GCRA check — free, in-process.
+6. If `[listeners.waf]` is configured, the request's path+query is checked against the built-in rule set; a match in `block` mode returns `403` immediately, skipping everything below (cluster budget, cache, route resolution, the backend) — a match in `log` mode is recorded and falls through.
+7. Cluster budget checked next, if configured.
+8. If `[listeners.cache]` is configured and this is a `GET`, the cache is checked for a still-fresh entry keyed on method/Host/path+query; a hit returns immediately, skipping everything below — no route resolution, no backend, no retry loop.
+9. If `[[listeners.routes]]` is configured, the request's path/Host is matched against each rule in order; the first match's backend pool and strategy are used for everything below, falling through to the listener's default pool when nothing matches.
+10. Circuit-breaker states refreshed from the breakers to the (matched or default) pool.
+11. Body read with size cap and timeout.
+12. If `[listeners.sticky]` is configured and the request carries a cookie naming a still-eligible backend, that backend is used on the first attempt instead of asking the strategy; otherwise (or on the retry) the configured strategy (`round_robin`, `least_connections`, `weighted_round_robin`, or `consistent_hash`) picks an eligible backend. Request forwarded through a `hyper_util::Client` with connection pooling.
+13. On backend failure, one retry to a different backend. On success, hop-by-hop headers stripped, `X-Request-Id` added, HSTS injected if configured, `Set-Cookie` naming whichever backend served it (if sticky), and (if the response is `GET`+`200`+cacheable) stored in the cache before returning.
 
 ### TCP
 

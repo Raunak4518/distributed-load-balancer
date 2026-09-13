@@ -4,6 +4,7 @@ pub mod per_backend;
 pub mod resolver;
 pub mod service;
 pub mod sticky;
+pub mod waf;
 
 pub use cache::{spawn_cache_sweeper, ResponseCache};
 pub use forward::{build_client, forward, ForwardError, ProbeCapableClient, ProxyClient};

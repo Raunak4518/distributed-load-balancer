@@ -651,6 +651,7 @@ pub(crate) fn build_listener_core(
                         SystemClock,
                     ))
                 }),
+                waf: lc.waf.as_ref().map(|w| w.mode),
                 circuit_breakers,
                 client,
                 per_backend_client,

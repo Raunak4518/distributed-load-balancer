@@ -299,6 +299,35 @@ pub struct ListenerConfig {
     /// partitioned between routes without a separate per-route toggle.
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+
+    /// HTTP-only. Blocks (or, in `log` mode, just records) a request whose
+    /// path or query string contains an obviously malicious pattern --
+    /// SQL-injection, XSS, or path-traversal tokens -- before it reaches a
+    /// route, the cache, or a backend. Deliberately a small, fixed,
+    /// built-in check for v1, not an operator-configurable rule engine: see
+    /// `lb_proxy::waf`'s module docs for the exact scope and why.
+    #[serde(default)]
+    pub waf: Option<WafConfig>,
+}
+
+/// See `ListenerConfig::waf`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WafConfig {
+    /// `block` refuses the request outright (`403`); `log` records the
+    /// match (metric + a warning log line) and forwards it exactly as if
+    /// this section weren't configured -- the naxsi-style "roll out in
+    /// detection mode first" path, useful for an operator who wants to see
+    /// what the built-in rules would have caught before enforcing them.
+    #[serde(default)]
+    pub mode: WafMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WafMode {
+    #[default]
+    Block,
+    Log,
 }
 
 /// See `ListenerConfig::cache`.
@@ -869,6 +898,12 @@ impl ListenerConfig {
                             .into(),
                     ));
                 }
+                if self.waf.is_some() {
+                    return Err(invalid(
+                        "waf is an http-only setting -- a tcp listener has no path or query to inspect"
+                            .into(),
+                    ));
+                }
                 if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
                     return Err(invalid(format!(
                         "rate_limit.key 'header:{name}' is http-only — a tcp listener has no headers to read, use 'source_ip'"
@@ -1405,6 +1440,51 @@ mod tests {
         assert!(
             format!("{err}").contains("cache"),
             "error should name cache, got: {err}"
+        );
+    }
+
+    #[test]
+    fn waf_defaults_to_none() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(cfg.listeners[0].waf.is_none());
+    }
+
+    #[test]
+    fn parses_waf_with_default_mode() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.waf]",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let waf = cfg.listeners[0].waf.as_ref().expect("waf should parse");
+        assert_eq!(waf.mode, WafMode::Block);
+    }
+
+    #[test]
+    fn parses_waf_log_mode() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.waf]\n          mode = \"log\"",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let waf = cfg.listeners[0].waf.as_ref().expect("waf should parse");
+        assert_eq!(waf.mode, WafMode::Log);
+    }
+
+    #[test]
+    fn rejects_waf_on_tcp_listener() {
+        // Same `rfind`-the-last-occurrence trick as `rejects_cache_on_tcp_listener`
+        // above -- both listener blocks share identical trailing lines.
+        let anchor = "          [listeners.load_balancing]\n          strategy = \"round_robin\"";
+        let insert_at = VALID.rfind(anchor).unwrap() + anchor.len();
+        let mut text = String::from(&VALID[..insert_at]);
+        text.push_str("\n\n          [listeners.waf]");
+        text.push_str(&VALID[insert_at..]);
+
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("waf"),
+            "error should name waf, got: {err}"
         );
     }
 
