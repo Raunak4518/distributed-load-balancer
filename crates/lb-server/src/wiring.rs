@@ -3,8 +3,8 @@ use lb_balancer::{ConsistentHash, LeastConnections, RoundRobin, WeightedRoundRob
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::ClusterCoordinator;
 use lb_core::{
-    Backend, BackendPool, ClusterConfig, Config, HealthCheckConfig, Http2Config, ListenerConfig,
-    LoadBalancer, LoadBalancingStrategy, LoggingConfig, Protocol, SystemClock,
+    Backend, BackendId, BackendPool, ClusterConfig, Config, HealthCheckConfig, Http2Config,
+    ListenerConfig, LoadBalancer, LoadBalancingStrategy, LoggingConfig, Protocol, SystemClock,
 };
 use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
@@ -13,7 +13,7 @@ use lb_metrics::Metrics;
 use lb_proxy::{spawn_cache_sweeper, CompiledRoute, ProxyContext, ResponseCache, StickyRuntime};
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
 use lb_tcp::TcpContext;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -334,6 +334,7 @@ pub fn build_app(
             config.cluster.as_ref(),
             &config.logging,
             &metrics,
+            None,
         );
         pools.push(Arc::clone(&core.pool));
         for route in &core.routes {
@@ -505,6 +506,96 @@ pub(crate) enum ListenerCoreKind {
     Tcp(Box<TcpAppContext>),
 }
 
+/// A running listener's live, non-config-derived state, carried across a
+/// config reload so that changing one field (a rate limit, a WAF mode) does
+/// not also hand every backend a clean bill of health -- an operator's
+/// manual drain and a breaker mid-cooldown are not things `build_app`'s
+/// startup path has any state for, but `apply_reload` does.
+pub(crate) struct PreviousListenerState {
+    manually_drained: HashSet<BackendId>,
+    circuit_breakers: HashMap<BackendId, lb_healthcheck::CircuitBreakerSnapshot>,
+}
+
+impl PreviousListenerState {
+    pub(crate) fn from_http(ctx: &HttpContext) -> Self {
+        let mut manually_drained = HashSet::new();
+        Self::collect_drained(&ctx.pool, &mut manually_drained);
+        for route in &ctx.routes {
+            Self::collect_drained(&route.pool, &mut manually_drained);
+        }
+        for canary in &ctx.canary {
+            Self::collect_drained(&canary.pool, &mut manually_drained);
+        }
+        PreviousListenerState {
+            manually_drained,
+            circuit_breakers: Self::snapshot_breakers(&ctx.circuit_breakers),
+        }
+    }
+
+    pub(crate) fn from_tcp(ctx: &TcpAppContext) -> Self {
+        let mut manually_drained = HashSet::new();
+        Self::collect_drained(&ctx.pool, &mut manually_drained);
+        PreviousListenerState {
+            manually_drained,
+            circuit_breakers: Self::snapshot_breakers(&ctx.circuit_breakers),
+        }
+    }
+
+    fn collect_drained(pool: &BackendPool, into: &mut HashSet<BackendId>) {
+        for id in pool.all_backend_ids() {
+            if pool.is_manually_drained(&id) {
+                into.insert(id);
+            }
+        }
+    }
+
+    fn snapshot_breakers(
+        breakers: &HashMap<BackendId, CircuitBreaker<SystemClock>>,
+    ) -> HashMap<BackendId, lb_healthcheck::CircuitBreakerSnapshot> {
+        breakers
+            .iter()
+            .map(|(id, cb)| (id.clone(), cb.snapshot()))
+            .collect()
+    }
+
+    fn is_drained(&self, id: &BackendId) -> bool {
+        self.manually_drained.contains(id)
+    }
+
+    fn breaker_snapshot(&self, id: &BackendId) -> Option<lb_healthcheck::CircuitBreakerSnapshot> {
+        self.circuit_breakers.get(id).copied()
+    }
+}
+
+fn seed_drained(
+    pool: &BackendPool,
+    backends: &[Backend],
+    previous: Option<&PreviousListenerState>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    for b in backends {
+        if previous.is_drained(&b.id) {
+            pool.set_manually_drained(&b.id, true);
+        }
+    }
+}
+
+fn new_or_migrated_breaker(
+    previous: Option<&PreviousListenerState>,
+    id: &BackendId,
+    failure_threshold: u32,
+    cooldown: Duration,
+) -> CircuitBreaker<SystemClock> {
+    match previous.and_then(|p| p.breaker_snapshot(id)) {
+        Some(snapshot) => {
+            CircuitBreaker::from_snapshot(failure_threshold, cooldown, SystemClock, snapshot)
+        }
+        None => CircuitBreaker::new(failure_threshold, cooldown, SystemClock),
+    }
+}
+
 /// Builds one listener's pool, rate limiter, circuit breakers, and
 /// protocol-specific context. Infallible: the one fallible step for a
 /// listener (`build_backend_connector`, real file I/O) has already happened
@@ -519,6 +610,7 @@ pub(crate) fn build_listener_core(
     cluster_cfg: Option<&ClusterConfig>,
     logging: &LoggingConfig,
     metrics: &Metrics,
+    previous: Option<&PreviousListenerState>,
 ) -> ListenerCore {
     let backends: Vec<Backend> = lc
         .backends
@@ -526,6 +618,7 @@ pub(crate) fn build_listener_core(
         .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
         .collect();
     let pool = Arc::new(BackendPool::new(backends.clone()));
+    seed_drained(&pool, &backends, previous);
 
     // Built once per route, the same way the default `backends`/`pool` above
     // are -- `Config::validate()` already guarantees every id here is unique
@@ -542,6 +635,7 @@ pub(crate) fn build_listener_core(
                 .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
                 .collect();
             let route_pool = Arc::new(BackendPool::new(route_backends.clone()));
+            seed_drained(&route_pool, &route_backends, previous);
             (r, route_backends, route_pool)
         })
         .collect();
@@ -556,6 +650,7 @@ pub(crate) fn build_listener_core(
                 .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
                 .collect();
             let canary_pool = Arc::new(BackendPool::new(canary_backends.clone()));
+            seed_drained(&canary_pool, &canary_backends, previous);
             (c, canary_backends, canary_pool)
         })
         .collect();
@@ -593,10 +688,11 @@ pub(crate) fn build_listener_core(
     for b in &backends {
         circuit_breakers.insert(
             b.id.clone(),
-            CircuitBreaker::new(
+            new_or_migrated_breaker(
+                previous,
+                &b.id,
                 lc.health_check.failure_threshold,
                 Duration::from_millis(lc.health_check.cooldown_ms),
-                SystemClock,
             ),
         );
     }
@@ -604,10 +700,11 @@ pub(crate) fn build_listener_core(
         for b in route_backends {
             circuit_breakers.insert(
                 b.id.clone(),
-                CircuitBreaker::new(
+                new_or_migrated_breaker(
+                    previous,
+                    &b.id,
                     route.health_check.failure_threshold,
                     Duration::from_millis(route.health_check.cooldown_ms),
-                    SystemClock,
                 ),
             );
         }
@@ -616,10 +713,11 @@ pub(crate) fn build_listener_core(
         for b in canary_backends {
             circuit_breakers.insert(
                 b.id.clone(),
-                CircuitBreaker::new(
+                new_or_migrated_breaker(
+                    previous,
+                    &b.id,
                     canary.health_check.failure_threshold,
                     Duration::from_millis(canary.health_check.cooldown_ms),
-                    SystemClock,
                 ),
             );
         }
@@ -823,23 +921,9 @@ pub(crate) fn build_listener_core(
 pub(crate) fn spawn_listener_tasks(
     lc: &ListenerConfig,
     core: &ListenerCore,
-    metrics: &Metrics,
+    metrics: &Arc<Metrics>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let mut tasks = Vec::new();
-
-    if let Some(dns) = &lc.dns_discovery {
-        let per_backend_client = match &core.kind {
-            ListenerCoreKind::Http(ctx) => ctx.per_backend_client.clone(),
-            ListenerCoreKind::Tcp(_) => None,
-        };
-        tasks.push(crate::dns::spawn_dns_poller(
-            crate::dns::TokioResolver,
-            dns.clone(),
-            Arc::clone(&core.pool),
-            lc.name.clone(),
-            per_backend_client,
-        ));
-    }
 
     match &core.kind {
         ListenerCoreKind::Http(ctx) => {
@@ -862,6 +946,18 @@ pub(crate) fn spawn_listener_tasks(
                 client: probe_client,
                 backend_tls: ctx.backend_tls,
             };
+            if let Some(dns) = &lc.dns_discovery {
+                tasks.push(crate::dns::spawn_dns_poller(
+                    crate::dns::TokioResolver,
+                    dns.clone(),
+                    Arc::clone(&core.pool),
+                    lc.name.clone(),
+                    ctx.per_backend_client.clone(),
+                    lc.health_check.clone(),
+                    transport.clone(),
+                    Arc::clone(metrics),
+                ));
+            }
             spawn_health_checkers(
                 &lc.name,
                 &lc.health_check,
@@ -905,6 +1001,19 @@ pub(crate) fn spawn_listener_tasks(
                 Duration::from_secs(30),
                 Duration::from_secs(60),
             ));
+            let transport = ProbeTransport::Tcp(ctx.backend_tls.clone());
+            if let Some(dns) = &lc.dns_discovery {
+                tasks.push(crate::dns::spawn_dns_poller(
+                    crate::dns::TokioResolver,
+                    dns.clone(),
+                    Arc::clone(&core.pool),
+                    lc.name.clone(),
+                    None,
+                    lc.health_check.clone(),
+                    transport.clone(),
+                    Arc::clone(metrics),
+                ));
+            }
             spawn_health_checkers(
                 &lc.name,
                 &lc.health_check,
@@ -912,7 +1021,7 @@ pub(crate) fn spawn_listener_tasks(
                 &core.pool,
                 &mut tasks,
                 metrics,
-                &ProbeTransport::Tcp(ctx.backend_tls.clone()),
+                &transport,
             );
         }
     }
@@ -1004,7 +1113,8 @@ pub(crate) fn build_backend_connector(
 /// exclusive by protocol, and because it is built at the one site that also
 /// builds the data plane's copy -- which makes the sharing visible in the
 /// wiring instead of being a convention someone has to remember.
-enum ProbeTransport {
+#[derive(Clone)]
+pub(crate) enum ProbeTransport {
     Http {
         client: Arc<dyn lb_core::ProbeClient>,
         /// Whether this listener re-encrypts, exactly as `ProxyContext`

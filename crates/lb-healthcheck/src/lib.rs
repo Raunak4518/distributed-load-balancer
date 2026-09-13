@@ -8,5 +8,5 @@ mod probe;
 mod test_support;
 
 pub use active::{spawn_active_checker, ActiveCheckConfig};
-pub use circuit_breaker::{CircuitBreaker, CircuitState};
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerSnapshot, CircuitState};
 pub use probe::{HttpProbe, TcpConnectProbe};

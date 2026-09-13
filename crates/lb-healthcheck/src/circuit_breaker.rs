@@ -33,6 +33,15 @@ impl CircuitState {
 /// for tens of thousands of years of process uptime.
 const NOT_OPENED: u64 = u64::MAX;
 
+/// See `CircuitBreaker::snapshot`/`from_snapshot`.
+#[derive(Debug, Clone, Copy)]
+pub struct CircuitBreakerSnapshot {
+    creation: Instant,
+    consecutive_failures: u32,
+    state: u8,
+    opened_at_nanos: u64,
+}
+
 /// No mutex anywhere in here: `state()` runs once per backend on every
 /// proxied request (see `service.rs`'s per-request circuit refresh), so a
 /// lock would serialize otherwise-independent worker threads across every
@@ -60,6 +69,41 @@ impl<C: Clock> CircuitBreaker<C> {
             consecutive_failures: AtomicU32::new(0),
             state: AtomicU8::new(CircuitState::Closed.as_u8()),
             opened_at_nanos: AtomicU64::new(NOT_OPENED),
+        }
+    }
+
+    /// Rebuilds a breaker for the same backend with `failure_threshold`/
+    /// `cooldown` taken fresh (an operator may have just changed either in
+    /// the same config edit that's carrying this state forward) but its live
+    /// state -- Open/HalfOpen/Closed, the failure count, and the cooldown
+    /// clock -- taken from `snapshot`. Used by config reload, so a backend
+    /// mid-cooldown when an unrelated field on its listener changes does not
+    /// get a clean slate and go straight back into rotation.
+    pub fn from_snapshot(
+        failure_threshold: u32,
+        cooldown: Duration,
+        clock: C,
+        snapshot: CircuitBreakerSnapshot,
+    ) -> Self {
+        CircuitBreaker {
+            clock,
+            creation: snapshot.creation,
+            failure_threshold,
+            cooldown,
+            consecutive_failures: AtomicU32::new(snapshot.consecutive_failures),
+            state: AtomicU8::new(snapshot.state),
+            opened_at_nanos: AtomicU64::new(snapshot.opened_at_nanos),
+        }
+    }
+
+    /// A `Copy`able capture of this breaker's live state, for `from_snapshot`
+    /// to rebuild an equivalent breaker elsewhere -- see its own docs.
+    pub fn snapshot(&self) -> CircuitBreakerSnapshot {
+        CircuitBreakerSnapshot {
+            creation: self.creation,
+            consecutive_failures: self.consecutive_failures.load(Ordering::SeqCst),
+            state: self.state.load(Ordering::SeqCst),
+            opened_at_nanos: self.opened_at_nanos.load(Ordering::SeqCst),
         }
     }
 
@@ -251,5 +295,42 @@ mod tests {
         }
         // 8 threads * 20 failures each = 160, well past the threshold of 50.
         assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn from_snapshot_preserves_open_state_and_cooldown_progress() {
+        let (cb, clock) = breaker(1, Duration::from_secs(10));
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(4));
+
+        let migrated =
+            CircuitBreaker::from_snapshot(1, Duration::from_secs(10), clock.clone(), cb.snapshot());
+        assert_eq!(migrated.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            migrated.state(),
+            CircuitState::Open,
+            "only 9 of the original 10s cooldown have elapsed"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(migrated.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn from_snapshot_preserves_a_closed_breakers_failure_count() {
+        let (cb, clock) = breaker(3, Duration::from_secs(5));
+        cb.record_failure();
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        let migrated =
+            CircuitBreaker::from_snapshot(3, Duration::from_secs(5), clock, cb.snapshot());
+        migrated.record_failure();
+        assert_eq!(
+            migrated.state(),
+            CircuitState::Open,
+            "the third failure should trip it, since 2 were already carried over"
+        );
     }
 }

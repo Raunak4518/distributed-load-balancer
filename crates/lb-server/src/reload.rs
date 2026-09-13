@@ -147,6 +147,15 @@ pub async fn apply_reload(
     // cannot leave some listeners swapped and others not.
     let mut prepared = Vec::with_capacity(resolved.len());
     for (lc, backend_tls) in resolved {
+        let previous = match reload.listeners.get(&lc.name) {
+            Some(ListenerReloadHandle::Http(swap)) => {
+                Some(wiring::PreviousListenerState::from_http(&swap.load()))
+            }
+            Some(ListenerReloadHandle::Tcp(swap)) => {
+                Some(wiring::PreviousListenerState::from_tcp(&swap.load()))
+            }
+            None => None,
+        };
         let core = wiring::build_listener_core(
             lc,
             backend_tls,
@@ -154,6 +163,7 @@ pub async fn apply_reload(
             new_config.cluster.as_ref(),
             &new_config.logging,
             &reload.metrics,
+            previous.as_ref(),
         );
         let tasks = wiring::spawn_listener_tasks(lc, &core, &reload.metrics);
         prepared.push((lc.name.clone(), core.kind, tasks));
@@ -469,6 +479,71 @@ mod tests {
 
         let a_after = http_ctx_arc(&app.reload, "a");
         assert_eq!(a_after.pool.all_backend_ids().len(), 2);
+
+        abort_everything(app).await;
+    }
+
+    #[tokio::test]
+    async fn a_manual_drain_survives_an_unrelated_reload() {
+        let old = Config::parse(TWO_LISTENERS).unwrap();
+        let app = build_app(&old, None).unwrap();
+        let a_before = http_ctx_arc(&app.reload, "a");
+        a_before
+            .pool
+            .set_manually_drained(&lb_core::BackendId::new("a1"), true);
+
+        let new =
+            Config::parse(&TWO_LISTENERS.replacen("rate_per_sec = 50", "rate_per_sec = 999", 1))
+                .unwrap();
+        let outcome = apply_reload(&new, &old, &app.reload).await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Applied {
+                changed: vec!["a".to_string()]
+            }
+        );
+
+        let a_after = http_ctx_arc(&app.reload, "a");
+        assert!(
+            a_after
+                .pool
+                .is_manually_drained(&lb_core::BackendId::new("a1")),
+            "a manual drain must not be undone by an unrelated field's reload"
+        );
+
+        abort_everything(app).await;
+    }
+
+    #[tokio::test]
+    async fn an_open_circuit_breaker_survives_an_unrelated_reload() {
+        let old = Config::parse(TWO_LISTENERS).unwrap();
+        let app = build_app(&old, None).unwrap();
+        let a_before = http_ctx_arc(&app.reload, "a");
+        let id = lb_core::BackendId::new("a1");
+        let breaker = a_before.circuit_breakers.get(&id).unwrap();
+        // TWO_LISTENERS sets failure_threshold = 3.
+        breaker.record_failure();
+        breaker.record_failure();
+        breaker.record_failure();
+        assert_eq!(breaker.state(), lb_healthcheck::CircuitState::Open);
+
+        let new =
+            Config::parse(&TWO_LISTENERS.replacen("rate_per_sec = 50", "rate_per_sec = 999", 1))
+                .unwrap();
+        let outcome = apply_reload(&new, &old, &app.reload).await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Applied {
+                changed: vec!["a".to_string()]
+            }
+        );
+
+        let a_after = http_ctx_arc(&app.reload, "a");
+        assert_eq!(
+            a_after.circuit_breakers.get(&id).unwrap().state(),
+            lb_healthcheck::CircuitState::Open,
+            "a breaker mid-cooldown must not be reset to Closed by an unrelated field's reload"
+        );
 
         abort_everything(app).await;
     }
