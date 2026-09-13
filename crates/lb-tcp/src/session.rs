@@ -259,8 +259,9 @@ where
     // select!, the first EOF would tear down the whole connection and break
     // every protocol that half-closes one direction while still reading the
     // other.
-    let to_backend = pump(client_read, backend_write, ctx.idle_timeout);
-    let to_client = pump(backend_read, client_write, ctx.idle_timeout);
+    let activity = crate::pump::IdleTracker::new();
+    let to_backend = pump(client_read, backend_write, ctx.idle_timeout, &activity);
+    let to_client = pump(backend_read, client_write, ctx.idle_timeout, &activity);
 
     match tokio::try_join!(to_backend, to_client) {
         Ok((bytes_to_backend, bytes_to_client)) => ConnectionOutcome::Completed {

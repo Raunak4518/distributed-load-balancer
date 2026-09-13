@@ -206,8 +206,9 @@ where
                 // try_join!, not select!: half-close in either direction
                 // must not tear down the other, same reasoning as
                 // `lb_tcp::session`'s own TCP passthrough.
-                let to_backend = lb_tcp::pump(client_read, backend_write, idle_timeout);
-                let to_client = lb_tcp::pump(backend_read, client_write, idle_timeout);
+                let activity = lb_tcp::IdleTracker::new();
+                let to_backend = lb_tcp::pump(client_read, backend_write, idle_timeout, &activity);
+                let to_client = lb_tcp::pump(backend_read, client_write, idle_timeout, &activity);
                 if let Err(err) = tokio::try_join!(to_backend, to_client) {
                     tracing::debug!(error = %err, "websocket relay ended");
                 }
