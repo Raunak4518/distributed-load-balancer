@@ -50,6 +50,10 @@ fn restart_only_fields_changed(old: &ListenerConfig, new: &ListenerConfig) -> bo
         || old.max_connections != new.max_connections
         || old.max_connections_per_ip != new.max_connections_per_ip
         || old.header_read_timeout_ms != new.header_read_timeout_ms
+        || old.write_timeout_ms != new.write_timeout_ms
+        || old.compression != new.compression
+        || old.proxy_protocol != new.proxy_protocol
+        || old.client_tcp_keepalive != new.client_tcp_keepalive
 }
 
 /// The fully testable core: given a new config, the config it would replace,
@@ -103,8 +107,8 @@ pub async fn apply_reload(
             .expect("checked above: every name in new_config also exists in current_config");
         if restart_only_fields_changed(old_lc, new_lc) {
             return ReloadOutcome::Refused(format!(
-                "listener '{}': tls, backend_tls, http2, or connection limits changed -- \
-                 requires a restart",
+                "listener '{}': tls, backend_tls, http2, connection limits, write_timeout_ms, \
+                 compression, proxy_protocol, or client_tcp_keepalive changed -- requires a restart",
                 new_lc.name
             ));
         }
@@ -395,6 +399,48 @@ mod tests {
         let outcome = apply_reload(&new, &old, &app.reload).await;
         match outcome {
             ReloadOutcome::Refused(reason) => assert!(reason.contains("cluster")),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        abort_everything(app).await;
+    }
+
+    #[tokio::test]
+    async fn changing_compression_is_refused_not_silently_ignored() {
+        let old = Config::parse(TWO_LISTENERS).unwrap();
+        let app = build_app(&old, None).unwrap();
+
+        let new = Config::parse(&TWO_LISTENERS.replacen(
+            "listen = \"127.0.0.1:19801\"",
+            "listen = \"127.0.0.1:19801\"\n        compression = true",
+            1,
+        ))
+        .unwrap();
+
+        let outcome = apply_reload(&new, &old, &app.reload).await;
+        match outcome {
+            ReloadOutcome::Refused(reason) => assert!(reason.contains("compression")),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        abort_everything(app).await;
+    }
+
+    #[tokio::test]
+    async fn changing_proxy_protocol_is_refused_not_silently_ignored() {
+        let old = Config::parse(TWO_LISTENERS).unwrap();
+        let app = build_app(&old, None).unwrap();
+
+        let new = Config::parse(&TWO_LISTENERS.replacen(
+            "listen = \"127.0.0.1:19801\"",
+            "listen = \"127.0.0.1:19801\"\n        proxy_protocol = true",
+            1,
+        ))
+        .unwrap();
+
+        let outcome = apply_reload(&new, &old, &app.reload).await;
+        match outcome {
+            ReloadOutcome::Refused(reason) => assert!(reason.contains("proxy_protocol")),
             other => panic!("expected a refusal, got {other:?}"),
         }
 
