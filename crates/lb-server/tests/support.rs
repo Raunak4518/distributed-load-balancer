@@ -517,6 +517,93 @@ listen = "{traffic_listen}"
     )
 }
 
+/// A backend that speaks the HTTP/1.1 upgrade handshake itself: on
+/// `accept`, answers `101` and echoes whatever bytes arrive after the
+/// upgrade; otherwise answers a plain `200` (declines). Built on hyper's
+/// own server-side `hyper::upgrade::on`/`.with_upgrades()`, the same
+/// mechanism the load balancer's own server side must cooperate with.
+pub async fn spawn_upgrade_backend(accept: bool) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |mut req: Request<Incoming>| async move {
+                    let is_upgrade_request = req.headers().get(hyper::header::UPGRADE).is_some();
+                    if !accept || !is_upgrade_request {
+                        return Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        );
+                    }
+                    let on_upgrade = hyper::upgrade::on(&mut req);
+                    tokio::spawn(async move {
+                        let Ok(upgraded) = on_upgrade.await else {
+                            return;
+                        };
+                        let mut io = TokioIo::new(upgraded);
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            match io.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => {
+                                    if io.write_all(&buf[..n]).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    let mut resp = Response::new(Full::new(Bytes::new()));
+                    *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                    resp.headers_mut().insert(
+                        hyper::header::CONNECTION,
+                        hyper::header::HeaderValue::from_static("Upgrade"),
+                    );
+                    resp.headers_mut().insert(
+                        hyper::header::UPGRADE,
+                        hyper::header::HeaderValue::from_static("websocket"),
+                    );
+                    Ok::<_, Infallible>(resp)
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(io, svc)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+    addr
+}
+
+/// Reads from `stream` until a blank line ends the HTTP head, returning the
+/// head text and any bytes already read past it (a raw TCP read has no
+/// message boundary, so the first read after the head can easily contain
+/// the start of whatever comes next too).
+pub async fn read_response_head(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert!(
+            n > 0,
+            "connection closed before the response head completed"
+        );
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let rest = buf[pos + 4..].to_vec();
+            return (head, rest);
+        }
+    }
+}
+
 /// Waits until `addr` accepts a TCP connection, or the deadline passes.
 ///
 /// Replaces `sleep(150ms)` after starting a server. A fixed sleep is a race:

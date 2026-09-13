@@ -469,6 +469,13 @@ where
                 // equivalent above, deliberately; see the keep-alive note.
                 .header_read_timeout(*header_read_timeout)
                 .serve_connection(TokioIo::new(stream), svc)
+                // Without this, hyper's dispatcher never hands off the raw
+                // connection after a `101` -- a hard prerequisite for
+                // `lb_proxy::upgrade`'s WebSocket/Upgrade proxying, not an
+                // optimization. No h2 equivalent: RFC 8441 (h2's own
+                // upgrade mechanism) is out of scope, so the h2 branch above
+                // is unaffected.
+                .with_upgrades()
                 .await
             {
                 tracing::debug!(error = %err, "client connection error");

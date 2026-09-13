@@ -121,6 +121,12 @@ pub struct ListenerMetrics {
     pub waf_blocked_sql_injection: IntCounter,
     pub waf_blocked_xss: IntCounter,
     pub waf_blocked_path_traversal: IntCounter,
+
+    /// WebSocket/Upgrade proxying. Same fixed-outcome-set shape as the WAF
+    /// counters above.
+    pub websocket_upgrade_success: IntCounter,
+    pub websocket_upgrade_backend_declined: IntCounter,
+    pub websocket_upgrade_backend_unreachable: IntCounter,
 }
 
 /// The built-in WAF rule that matched a request -- see `lb_proxy::waf`.
@@ -154,6 +160,39 @@ impl ListenerMetrics {
             WafRule::SqlInjection => self.waf_blocked_sql_injection.inc(),
             WafRule::Xss => self.waf_blocked_xss.inc(),
             WafRule::PathTraversal => self.waf_blocked_path_traversal.inc(),
+        }
+    }
+}
+
+/// The terminal outcome of one WebSocket/`Upgrade` proxy attempt -- see
+/// `lb_proxy::upgrade`. Lives here for the same reason `WafRule` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebsocketUpgradeResult {
+    Success,
+    BackendDeclined,
+    BackendUnreachable,
+}
+
+impl WebsocketUpgradeResult {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            WebsocketUpgradeResult::Success => "success",
+            WebsocketUpgradeResult::BackendDeclined => "backend_declined",
+            WebsocketUpgradeResult::BackendUnreachable => "backend_unreachable",
+        }
+    }
+}
+
+impl ListenerMetrics {
+    pub fn record_websocket_upgrade(&self, result: WebsocketUpgradeResult) {
+        match result {
+            WebsocketUpgradeResult::Success => self.websocket_upgrade_success.inc(),
+            WebsocketUpgradeResult::BackendDeclined => {
+                self.websocket_upgrade_backend_declined.inc()
+            }
+            WebsocketUpgradeResult::BackendUnreachable => {
+                self.websocket_upgrade_backend_unreachable.inc()
+            }
         }
     }
 }

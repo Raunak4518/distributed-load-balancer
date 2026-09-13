@@ -76,6 +76,20 @@ impl BackendConnector {
         tokio_rustls::TlsConnector::from(Arc::clone(&self.config))
     }
 
+    /// For `lb-proxy`'s WebSocket/Upgrade backend leg: a dedicated,
+    /// non-pooled connection that must stay HTTP/1.1, since
+    /// `hyper::client::conn::http1` cannot parse an h2 byte stream. Unlike
+    /// `tls_connector`/`wrap_https`, which let a backend negotiate `h2` over
+    /// ALPN (`[h2, http/1.1]`, set in `new` above), this clones the config
+    /// and restricts ALPN to `http/1.1` alone -- otherwise a backend that
+    /// prefers h2 could still negotiate it on this one-off connection, and
+    /// there would be no Upgrade mechanism available on it at all.
+    pub fn tls_connector_http1_only(&self) -> tokio_rustls::TlsConnector {
+        let mut config = (*self.config).clone();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
     /// For `lb-proxy`: wraps an already-built connector with this backend's
     /// TLS config, trust roots and verification policy.
     ///
@@ -290,5 +304,50 @@ mod tests {
         // same reasoning as `a_missing_ca_file_fails_loudly` above, just
         // reachable through the sibling (no ca_file) code path.
         assert!(super::apply_native_certs(&mut roots, empty).is_err());
+    }
+
+    /// A real control, not just "it constructs without error": the server
+    /// offers both `h2` and `http/1.1` over ALPN, and `h2` is listed first in
+    /// `BackendConnector::new`'s own default order -- a connector that did
+    /// nothing special here would plausibly land on `h2`. This proves
+    /// `tls_connector_http1_only` actually pins the choice.
+    #[tokio::test]
+    async fn tls_connector_http1_only_never_negotiates_h2() {
+        let dir = tmpdir();
+        let (cert, key) = support::write_pair(&dir, "backend", &["backend.internal"]);
+
+        let tls_cfg = lb_core::TlsConfig {
+            certificates: vec![lb_core::CertificateConfig {
+                name: "backend".into(),
+                cert_file: cert.clone(),
+                key_file: key,
+                hostnames: vec!["backend.internal".to_string()],
+            }],
+            handshake_timeout_ms: Some(5_000),
+            min_version: None,
+            reload_interval_secs: None,
+            hsts_max_age_secs: None,
+        };
+        let acceptor =
+            std::sync::Arc::new(crate::TlsAcceptor::new(&tls_cfg, &[b"h2", b"http/1.1"]).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let connector = BackendConnector::new(&lb_core::BackendTlsConfig {
+            ca_file: Some(cert),
+            danger_accept_invalid_certs: false,
+        })
+        .unwrap();
+        let tls_connector = connector.tls_connector_http1_only();
+        let name = rustls::pki_types::ServerName::try_from("backend.internal").unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tls = tls_connector.connect(name, stream).await.unwrap();
+
+        let (_, conn) = tls.get_ref();
+        assert_eq!(conn.alpn_protocol(), Some(b"http/1.1".as_slice()));
     }
 }

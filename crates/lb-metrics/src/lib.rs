@@ -2,7 +2,9 @@ mod admin;
 mod handles;
 
 pub use admin::{spawn_admin_server, AdminExtension, ReadinessCheck};
-pub use handles::{BackendMetrics, ListenerMetrics, RequestCounters, StatusClass, WafRule};
+pub use handles::{
+    BackendMetrics, ListenerMetrics, RequestCounters, StatusClass, WafRule, WebsocketUpgradeResult,
+};
 
 /// Re-exported so consumer crates can hold metric handles without taking a
 /// direct dependency on the metrics backend.
@@ -51,6 +53,9 @@ pub struct Metrics {
 
     // WAF first slice.
     waf_blocked: IntCounterVec,
+
+    // WebSocket / Upgrade proxying.
+    websocket_upgrades: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -221,6 +226,13 @@ impl Metrics {
             ),
             &["listener", "rule"],
         )?;
+        let websocket_upgrades = IntCounterVec::new(
+            Opts::new(
+                "lb_websocket_upgrades_total",
+                "WebSocket/Upgrade proxy attempts, by result",
+            ),
+            &["listener", "result"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -244,6 +256,7 @@ impl Metrics {
         registry.register(Box::new(backend_tls_verification_disabled.clone()))?;
         registry.register(Box::new(cache_result.clone()))?;
         registry.register(Box::new(waf_blocked.clone()))?;
+        registry.register(Box::new(websocket_upgrades.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -269,6 +282,7 @@ impl Metrics {
             backend_tls_verification_disabled,
             cache_result,
             waf_blocked,
+            websocket_upgrades,
         })
     }
 
@@ -352,6 +366,15 @@ impl Metrics {
             waf_blocked_path_traversal: self
                 .waf_blocked
                 .with_label_values(&[name, WafRule::PathTraversal.as_label()]),
+            websocket_upgrade_success: self
+                .websocket_upgrades
+                .with_label_values(&[name, WebsocketUpgradeResult::Success.as_label()]),
+            websocket_upgrade_backend_declined: self
+                .websocket_upgrades
+                .with_label_values(&[name, WebsocketUpgradeResult::BackendDeclined.as_label()]),
+            websocket_upgrade_backend_unreachable: self
+                .websocket_upgrades
+                .with_label_values(&[name, WebsocketUpgradeResult::BackendUnreachable.as_label()]),
         }
     }
 
@@ -458,6 +481,34 @@ mod tests {
         assert!(
             text.contains(r#"lb_waf_blocked_total{listener="web",rule="path_traversal"} 1"#),
             "expected path_traversal=1 in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn websocket_upgrade_outcomes_are_counted_separately() {
+        let metrics = Metrics::new().unwrap();
+        let listener = metrics.listener("web");
+        listener.record_websocket_upgrade(WebsocketUpgradeResult::Success);
+        listener.record_websocket_upgrade(WebsocketUpgradeResult::Success);
+        listener.record_websocket_upgrade(WebsocketUpgradeResult::BackendDeclined);
+        listener.record_websocket_upgrade(WebsocketUpgradeResult::BackendUnreachable);
+
+        let text = metrics.gather_text();
+        assert!(
+            text.contains(r#"lb_websocket_upgrades_total{listener="web",result="success"} 2"#),
+            "expected success=2 in:\n{text}"
+        );
+        assert!(
+            text.contains(
+                r#"lb_websocket_upgrades_total{listener="web",result="backend_declined"} 1"#
+            ),
+            "expected backend_declined=1 in:\n{text}"
+        );
+        assert!(
+            text.contains(
+                r#"lb_websocket_upgrades_total{listener="web",result="backend_unreachable"} 1"#
+            ),
+            "expected backend_unreachable=1 in:\n{text}"
         );
     }
 

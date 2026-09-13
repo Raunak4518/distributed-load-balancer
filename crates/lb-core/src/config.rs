@@ -213,6 +213,14 @@ pub struct ListenerConfig {
     pub forward_timeout_ms: Option<u64>,
     pub max_request_body_bytes: Option<usize>,
     pub write_timeout_ms: Option<u64>,
+    /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
+    /// idle after the backend accepts the handshake -- the request-shaped
+    /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
+    /// the moment the upgrade completes, since the connection is no longer
+    /// carrying HTTP request/response traffic. Defaults to 300s, matching
+    /// `idle_timeout_ms`'s own default on a TCP listener -- the closest
+    /// analog, since a post-upgrade connection is pumped exactly like one.
+    pub websocket_idle_timeout_ms: Option<u64>,
     /// Compresses responses (gzip/brotli/deflate/zstd, negotiated against
     /// the client's `Accept-Encoding`) that aren't already encoded and pass
     /// `tower_http`'s default size/content-type heuristics -- a CPU/latency
@@ -455,6 +463,11 @@ impl ListenerConfig {
     /// still bounded.
     pub fn write_timeout(&self) -> Duration {
         Duration::from_millis(self.write_timeout_ms.unwrap_or(30_000))
+    }
+
+    /// See `websocket_idle_timeout_ms`.
+    pub fn websocket_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.websocket_idle_timeout_ms.unwrap_or(300_000))
     }
 
     /// Whether this listener serves HTTP/2.
@@ -868,9 +881,10 @@ impl ListenerConfig {
                 if self.forward_timeout_ms.is_some()
                     || self.max_request_body_bytes.is_some()
                     || self.write_timeout_ms.is_some()
+                    || self.websocket_idle_timeout_ms.is_some()
                 {
                     return Err(invalid(
-                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
+                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
                             .into(),
                     ));
                 }
@@ -1530,6 +1544,41 @@ mod tests {
         assert_eq!(
             cfg.listeners[0].write_timeout(),
             Duration::from_millis(45_000)
+        );
+    }
+
+    #[test]
+    fn websocket_idle_timeout_defaults_to_300_seconds() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert_eq!(
+            cfg.listeners[0].websocket_idle_timeout(),
+            Duration::from_millis(300_000)
+        );
+    }
+
+    #[test]
+    fn parses_a_configured_websocket_idle_timeout() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        websocket_idle_timeout_ms = 60000",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        assert_eq!(
+            cfg.listeners[0].websocket_idle_timeout(),
+            Duration::from_millis(60_000)
+        );
+    }
+
+    #[test]
+    fn rejects_websocket_idle_timeout_ms_on_tcp_listener() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:5432\"",
+            "        listen = \"0.0.0.0:5432\"\n        websocket_idle_timeout_ms = 1000",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("websocket_idle_timeout_ms"),
+            "error should name websocket_idle_timeout_ms, got: {err}"
         );
     }
 

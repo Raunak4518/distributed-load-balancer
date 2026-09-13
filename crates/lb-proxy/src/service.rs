@@ -1,6 +1,7 @@
 use crate::cache::{self, ResponseCache};
 use crate::forward::{backend_scheme_and_authority, forward, ForwardError, ProxyClient};
 use crate::sticky::{self, StickyRuntime};
+use crate::upgrade;
 use crate::waf;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -78,9 +79,19 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// `server_name` set on a plaintext listener silently upgrade its
     /// traffic to a scheme nobody asked for.
     pub backend_tls: bool,
+    /// The raw connector behind `client`'s pooled backend TLS, needed again
+    /// for the WebSocket/Upgrade backend leg's own dedicated, non-pooled
+    /// connection -- see `crate::upgrade`'s module docs for why that leg
+    /// cannot reuse `client`. `None` for a plaintext-backend listener,
+    /// exactly when `backend_tls` above is `false`.
+    pub backend_tls_connector: Option<Arc<lb_tls::BackendConnector>>,
     pub rate_limit_key: RateLimitKeySource,
     pub forward_timeout: Duration,
     pub max_request_body_bytes: usize,
+    /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
+    /// connection may sit idle once the backend accepts the handshake.
+    /// `forward_timeout`/`body_read_timeout` never apply past that point.
+    pub websocket_idle_timeout: Duration,
     /// Present only when `[cluster]` is configured; `None` means single-node.
     pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
     /// Always present, never optional: recording is a few atomic increments,
@@ -202,7 +213,7 @@ impl<R: RateLimiter, C: Clock> ProxyContext<R, C> {
     }
 }
 
-fn empty_body() -> ProxyBody {
+pub(crate) fn empty_body() -> ProxyBody {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
@@ -214,7 +225,7 @@ fn text_body(text: &'static str) -> ProxyBody {
         .boxed()
 }
 
-fn simple_response(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
+pub(crate) fn simple_response(status: StatusCode, body: &'static str) -> Response<ProxyBody> {
     let mut resp = Response::new(if body.is_empty() {
         empty_body()
     } else {
@@ -260,7 +271,7 @@ async fn read_bounded(body: Incoming, max_bytes: usize) -> Result<Bytes, ()> {
 /// Applied unconditionally rather than only for HTTP/2 clients: these headers
 /// were never correct to forward, HTTP/1.1 was simply tolerant of the
 /// mistake, and one code path is one behaviour to test.
-fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
+pub(crate) fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     const ALWAYS: [&str; 8] = [
         "connection",
         "keep-alive",
@@ -531,6 +542,15 @@ where
         }
     }
 
+    // Bypasses the cache-store/sticky-pin/retry-loop machinery below
+    // entirely -- none of it applies to a connection that is about to stop
+    // being HTTP. See `crate::upgrade`'s module docs for why this can't be
+    // handled by `strip_hop_by_hop` (which runs later, in the ordinary
+    // path) instead.
+    if upgrade::is_upgrade_request(req.headers()) {
+        return Ok(upgrade::handle_upgrade(req, &ctx, pool, balancer, &key).await);
+    }
+
     let (parts, body) = req.into_parts();
     let bytes = match tokio::time::timeout(
         ctx.body_read_timeout,
@@ -715,7 +735,8 @@ mod tests {
     use lb_core::{Backend, Decision};
     use std::convert::Infallible;
     use std::net::SocketAddr;
-    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     struct AlwaysDeny;
     impl RateLimiter for AlwaysDeny {
@@ -959,6 +980,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -987,6 +1010,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1024,6 +1049,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1056,6 +1083,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1094,6 +1123,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1140,6 +1171,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1190,6 +1223,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1240,6 +1275,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1390,6 +1427,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1484,6 +1523,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1526,6 +1567,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1631,7 +1674,14 @@ mod tests {
                     let svc = service_fn(move |req| {
                         handle(req, ctx.clone(), "127.0.0.1".parse().unwrap())
                     });
-                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                    // Mirrors the real fix in `lb-server`'s own connection
+                    // driver: without this, a WebSocket/Upgrade test through
+                    // this harness could never actually complete the
+                    // handoff, no matter what `handle` returns.
+                    let _ = http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .with_upgrades()
+                        .await;
                 });
             }
         });
@@ -1686,6 +1736,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1726,6 +1778,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1762,6 +1816,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1797,6 +1853,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1829,6 +1887,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1868,6 +1928,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1906,6 +1968,8 @@ mod tests {
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
             backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             max_request_body_bytes: 1024,
@@ -1920,5 +1984,195 @@ mod tests {
         let resp = run_through_proxy_at(ctx, "/files/../../etc/passwd", None).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A backend that itself speaks the HTTP/1.1 upgrade handshake: on
+    /// `accept`, answers `101` and echoes whatever bytes arrive after the
+    /// upgrade; otherwise answers a plain `200`, i.e. declines. Built on
+    /// hyper's own server-side `hyper::upgrade::on`/`.with_upgrades()`,
+    /// deliberately -- this is exactly the same mechanism the proxy's own
+    /// server side must cooperate with, so a backend built any other way
+    /// would prove less.
+    async fn spawn_upgrade_backend(accept: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |mut req: Request<Incoming>| async move {
+                        if !accept {
+                            return Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from_static(b"no upgrade")).boxed())
+                                    .unwrap(),
+                            );
+                        }
+                        let on_upgrade = hyper::upgrade::on(&mut req);
+                        tokio::spawn(async move {
+                            let Ok(upgraded) = on_upgrade.await else {
+                                return;
+                            };
+                            let mut io = TokioIo::new(upgraded);
+                            let mut buf = [0u8; 1024];
+                            loop {
+                                match io.read(&mut buf).await {
+                                    Ok(0) | Err(_) => return,
+                                    Ok(n) => {
+                                        if io.write_all(&buf[..n]).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        let mut resp = Response::new(Empty::<Bytes>::new().boxed());
+                        *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                        resp.headers_mut()
+                            .insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+                        resp.headers_mut()
+                            .insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+                        Ok::<_, Infallible>(resp)
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(io, svc)
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Reads from `stream` until a blank line ends the HTTP head, returning
+    /// the head text and any bytes already read past it (a raw TCP read has
+    /// no message boundary, so the first read after the head can easily
+    /// contain the start of whatever comes next too).
+    async fn read_response_head(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(
+                n > 0,
+                "connection closed before the response head completed"
+            );
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+                let rest = buf[pos + 4..].to_vec();
+                return (head, rest);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_websocket_handshake_is_relayed_end_to_end() {
+        let backend_addr = spawn_upgrade_backend(true).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky: None,
+            cache: None,
+            waf: None,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(5),
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(2),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let addr = spawn_proxy_listener(ctx).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (head, mut leftover) = read_response_head(&mut client).await;
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101, got:\n{head}"
+        );
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("connection: upgrade"), "got:\n{head}");
+        assert!(lower.contains("upgrade: websocket"), "got:\n{head}");
+
+        client.write_all(b"ping").await.unwrap();
+        while leftover.len() < 4 {
+            let mut chunk = [0u8; 64];
+            let n = client.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before the echo arrived");
+            leftover.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(&leftover[..4], b"ping");
+    }
+
+    #[tokio::test]
+    async fn a_declined_upgrade_is_relayed_as_an_ordinary_response() {
+        let backend_addr = spawn_upgrade_backend(false).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky: None,
+            cache: None,
+            waf: None,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(5),
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(2),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let addr = spawn_proxy_listener(ctx).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (head, _leftover) = read_response_head(&mut client).await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "expected 200, got:\n{head}"
+        );
     }
 }

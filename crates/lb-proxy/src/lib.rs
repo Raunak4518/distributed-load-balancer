@@ -4,6 +4,7 @@ pub mod per_backend;
 pub mod resolver;
 pub mod service;
 pub mod sticky;
+pub mod upgrade;
 pub mod waf;
 
 pub use cache::{spawn_cache_sweeper, ResponseCache};
@@ -12,3 +13,4 @@ pub use per_backend::PerBackendClients;
 pub use resolver::PinnedResolver;
 pub use service::{handle, AccessLog, CompiledRoute, ProxyBody, ProxyContext};
 pub use sticky::StickyRuntime;
+pub use upgrade::{handle_upgrade, is_upgrade_request};

@@ -9,6 +9,12 @@ lb-core = { path = "../lb-core" }
 lb-healthcheck = { path = "../lb-healthcheck" }
 lb-metrics = { path = "../lb-metrics" }
 lb-tls = { path = "../lb-tls" }
+# For `pump` (upgrade.rs's post-upgrade byte relay): already generic over
+# any `AsyncRead`/`AsyncWrite`, not TCP-specific despite the crate name, and
+# already has exactly the idle-timeout/half-close semantics a WebSocket
+# connection needs. No `lb-tcp` -> `lb-proxy` edge exists, so this adds no
+# cycle.
+lb-tcp = { path = "../lb-tcp" }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
@@ -27,7 +33,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
-tokio = { version = "1", features = ["rt", "time"] }
+# "net" for the WebSocket/Upgrade backend leg's dedicated, non-pooled
+# connection (`upgrade.rs` dials its own `TcpStream`); "io-util" for
+# `tokio::io::split`, splitting each side of that upgrade for `lb_tcp::pump`.
+tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
+# For the WebSocket/Upgrade backend leg's TLS: `BackendConnector::tls_connector_http1_only`
+# (lb-tls) returns a `tokio_rustls::TlsConnector`, called directly here rather
+# than through `hyper-rustls` (that machinery is HTTP-request-shaped and
+# pooled -- wrong fit for a one-off, must-stay-http/1.1 connection). Same
+# `ring`/`tls12` feature selection as every other TLS dependency in this
+# graph.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 # For `ResponseCache` (cache.rs): a concurrent map, already a workspace
 # dependency (lb-cluster, lb-ratelimit) for the same "many readers/writers,
 # no coarse lock" shape.

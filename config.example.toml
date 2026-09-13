@@ -66,6 +66,14 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
                                   # the connection open forever. HTTP-only — a
                                   # TCP listener gets the same protection from
                                   # idle_timeout_ms below instead.
+# websocket_idle_timeout_ms = 300000
+# WebSocket/Upgrade proxying needs no toggle -- a client sending
+# `Connection: Upgrade` + `Upgrade: websocket` always gets it, on any HTTP
+# listener, over HTTP/1.1 (an h2 client connection has no Upgrade header
+# semantics, so it's unaffected either way). This only tunes how long a
+# WebSocket connection may sit idle once the backend accepts the handshake --
+# the request-shaped timeouts above stop applying at that point, the same
+# way idle_timeout_ms below governs a TCP listener's whole connection.
 
 # proxy_protocol = true
 # Only turn this on when EVERY connection this listener accepts comes from

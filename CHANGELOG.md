@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **WebSocket/`Upgrade` proxying.** Previously, `strip_hop_by_hop` removed
+  the `Connection` and `Upgrade` headers on every request and response
+  unconditionally, so a WebSocket handshake was silently mangled and any
+  client routed through this load balancer for WebSocket traffic simply
+  broke. A request carrying `Connection: Upgrade` + `Upgrade: websocket` is
+  now detected before that stripping happens, dialed to the backend over
+  its own dedicated, non-pooled HTTP/1.1 connection (never the shared
+  pooled client -- reusing a pooled connection that's mid-WebSocket-stream
+  for an unrelated request would be a cross-talk bug), and on a `101`, both
+  legs are handed off (`hyper::upgrade`) to a background byte-pump reusing
+  `lb_tcp::pump` verbatim. HTTP/1.1 only on both legs for v1 -- h2's own
+  upgrade mechanism (RFC 8441 extended CONNECT) is a different bootstrapping
+  protocol and out of scope; an h2 client connection has no `Upgrade` header
+  semantics anyway. New `websocket_idle_timeout_ms` (HTTP listeners,
+  default 300s) governs the post-upgrade connection once the request-shaped
+  timeouts stop applying. New `lb_websocket_upgrades_total{listener,result}`
+  metric.
+
 ### Added
 
 - **`[listeners.waf]` (HTTP listeners)**: a WAF first slice -- blocks (or,
