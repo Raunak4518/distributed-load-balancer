@@ -1,4 +1,5 @@
 use crate::forward::{backend_scheme_and_authority, forward, ForwardError, ProxyClient};
+use crate::sticky::{self, StickyRuntime};
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
@@ -35,6 +36,13 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// on that path -- resolving "no match" against an empty `Vec` is one
     /// `is_empty()` check.
     pub routes: Vec<CompiledRoute>,
+    /// Session affinity via a `Set-Cookie` naming the backend a client last
+    /// landed on -- see `crate::sticky`'s module docs. Listener-level, so it
+    /// applies uniformly to `pool`/`balancer` above and to every entry in
+    /// `routes`: a pin naming a backend from a pool other than the one this
+    /// request resolved into simply fails `BackendPool::is_eligible` and
+    /// falls through, exactly as an absent cookie would.
+    pub sticky: Option<StickyRuntime>,
     /// Flat, not scoped per pool: correct because `Config::validate()`
     /// requires every backend id to be unique across the default backends
     /// *and every route's* within one listener, so a `BackendId` here
@@ -488,9 +496,21 @@ where
         }
     };
 
+    // Read once, used only on the first attempt below -- a pin that just
+    // failed must not be retried against the same broken backend, so a
+    // retry always falls back to `balancer.pick` regardless of the cookie.
+    let sticky_pin = ctx
+        .sticky
+        .as_ref()
+        .and_then(|s| sticky::read_sticky_backend(&parts.headers, &s.cookie_name));
+
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     for attempt in 0..2u8 {
-        let Some(backend_id) = balancer.pick(pool, &key) else {
+        let pinned = (attempt == 0)
+            .then(|| sticky_pin.clone())
+            .flatten()
+            .filter(|id| pool.is_eligible(id));
+        let Some(backend_id) = pinned.or_else(|| balancer.pick(pool, &key)) else {
             return Ok(simple_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no healthy backend",
@@ -538,6 +558,16 @@ where
                 // hop-by-hop header the backend sent us (describing its hop
                 // to us) is never carried onto our hop to the client.
                 strip_hop_by_hop(&mut resp_parts.headers);
+                // Refreshed on every successful response, whether or not it
+                // matches an incoming pin -- this both renews the TTL for an
+                // already-pinned client and pins a first-time client
+                // starting from their very first response.
+                if let Some(sticky) = &ctx.sticky {
+                    resp_parts.headers.insert(
+                        header::SET_COOKIE,
+                        sticky::set_cookie_header(sticky, &backend_id),
+                    );
+                }
                 return Ok(Response::from_parts(resp_parts, resp_body.boxed()));
             }
             Err(err) => {
@@ -707,6 +737,38 @@ mod tests {
         Response::from_parts(parts, bytes)
     }
 
+    /// Like `run_through_proxy`, but for sticky-cookie tests that need to
+    /// send a `Cookie` request header -- the read side `resolve_route`'s
+    /// helpers above have no reason to exercise.
+    async fn run_through_proxy_with_cookie<R, C>(
+        ctx: Arc<ProxyContext<R, C>>,
+        cookie: Option<&str>,
+    ) -> Response<Bytes>
+    where
+        R: RateLimiter + 'static,
+        C: Clock + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone(), "127.0.0.1".parse().unwrap()));
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+
+        let client = build_client(None, HashMap::new(), false);
+        let mut builder = Request::builder().uri(format!("http://{addr}/"));
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        let req = builder.body(Full::new(Bytes::new())).unwrap();
+        let resp = client.request(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        Response::from_parts(parts, bytes)
+    }
+
     fn empty_pool() -> Arc<BackendPool> {
         Arc::new(BackendPool::new(vec![]))
     }
@@ -730,6 +792,7 @@ mod tests {
             balancer: Arc::new(NoBackend), // would return None if reached; proves we short-circuit
             pool: empty_pool(),
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -755,6 +818,7 @@ mod tests {
             balancer: Arc::new(NoBackend),
             pool: empty_pool(),
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -789,6 +853,7 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -818,6 +883,7 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -853,6 +919,7 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -896,6 +963,7 @@ mod tests {
             balancer: Arc::new(PreferFirstEligible),
             pool: pool.clone(),
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -943,6 +1011,7 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -990,6 +1059,7 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            sticky: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1137,6 +1207,7 @@ mod tests {
                 pool: route_pool,
                 balancer: Arc::new(FixedPick(route_backend.id.clone())),
             }],
+            sticky: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1228,6 +1299,7 @@ mod tests {
                     balancer: Arc::new(FixedPick(second_backend.id.clone())),
                 },
             ],
+            sticky: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1245,5 +1317,102 @@ mod tests {
 
         let resp = run_through_proxy_at(ctx, "/api/orders", None).await;
         assert_eq!(resp.body(), "first");
+    }
+
+    /// Builds a `ProxyContext` with two backends and `balancer` always
+    /// wanting `algorithm_backend` -- the fixture every sticky-cookie test
+    /// below starts from, so a pin naming the *other* backend can prove it
+    /// actually overrides the algorithm rather than merely agreeing with it.
+    async fn ctx_with_two_backends_and_sticky(
+        sticky: Option<StickyRuntime>,
+    ) -> (Arc<ProxyContext<AlwaysAllow, FakeClock>>, Backend, Backend) {
+        let a_addr = spawn_fixed_response_backend(StatusCode::OK, "a").await;
+        let b_addr = spawn_fixed_response_backend(StatusCode::OK, "b").await;
+        let backend_a = Backend::new("backend-a", a_addr, 1, None);
+        let backend_b = Backend::new("backend-b", b_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend_a.clone(), backend_b.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            // The algorithm always wants "b" -- any test where a sticky pin
+            // for "a" wins is proof the pin overrode this, not luck.
+            balancer: Arc::new(FixedPick(backend_b.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        (ctx, backend_a, backend_b)
+    }
+
+    fn test_sticky_runtime() -> StickyRuntime {
+        StickyRuntime {
+            cookie_name: "lb_sticky".to_string(),
+            max_age_secs: None,
+            secure: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_sticky_config_means_no_set_cookie_header() {
+        let (ctx, _, _) = ctx_with_two_backends_and_sticky(None).await;
+        let resp = run_through_proxy_with_cookie(ctx, None).await;
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_first_successful_response_sets_a_cookie_naming_the_chosen_backend() {
+        let (ctx, _, backend_b) =
+            ctx_with_two_backends_and_sticky(Some(test_sticky_runtime())).await;
+        let resp = run_through_proxy_with_cookie(ctx, None).await;
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie header missing")
+            .to_str()
+            .unwrap();
+        // No pin was sent, so the algorithm's own choice ("b") is what gets
+        // pinned.
+        assert!(set_cookie.starts_with(&format!("lb_sticky={}", backend_b.id)));
+    }
+
+    #[tokio::test]
+    async fn a_valid_pin_overrides_the_underlying_algorithm() {
+        let (ctx, backend_a, _) =
+            ctx_with_two_backends_and_sticky(Some(test_sticky_runtime())).await;
+        let resp =
+            run_through_proxy_with_cookie(ctx, Some(&format!("lb_sticky={}", backend_a.id))).await;
+        // The algorithm always wants "b" -- getting "a" back proves the pin
+        // won, not that the algorithm happened to agree.
+        assert_eq!(resp.body(), "a");
+    }
+
+    #[tokio::test]
+    async fn a_pin_naming_an_unknown_backend_falls_through_to_the_algorithm() {
+        let (ctx, _, _) = ctx_with_two_backends_and_sticky(Some(test_sticky_runtime())).await;
+        let resp = run_through_proxy_with_cookie(ctx, Some("lb_sticky=no-such-backend-id")).await;
+        assert_eq!(resp.body(), "b");
+    }
+
+    #[tokio::test]
+    async fn a_pin_naming_a_manually_drained_backend_falls_through_to_the_algorithm() {
+        let (ctx, backend_a, _) =
+            ctx_with_two_backends_and_sticky(Some(test_sticky_runtime())).await;
+        ctx.pool.set_manually_drained(&backend_a.id, true);
+        let resp =
+            run_through_proxy_with_cookie(ctx, Some(&format!("lb_sticky={}", backend_a.id))).await;
+        assert_eq!(resp.body(), "b");
     }
 }

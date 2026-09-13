@@ -268,6 +268,42 @@ pub struct ListenerConfig {
     /// always meant.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+
+    /// HTTP-only. Once a client's request lands on a backend, sets a cookie
+    /// naming it and prefers that backend on the client's next request --
+    /// nginx's commercial `sticky` module, HAProxy's `cookie` directive.
+    /// Layered on top of whatever `load_balancing.strategy` is chosen
+    /// rather than being a strategy itself: the whole point is "keep
+    /// picking what worked last time, and fall back to the underlying
+    /// algorithm when that's not possible," which every strategy already
+    /// gives it for free. Listener-level, not per-route -- a request that
+    /// resolves into a route's pool still uses this same cookie; a pin
+    /// naming a backend from a different pool simply fails eligibility and
+    /// falls through, exactly as an absent cookie would.
+    #[serde(default)]
+    pub sticky: Option<StickyConfig>,
+}
+
+/// See `ListenerConfig::sticky`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct StickyConfig {
+    /// The cookie's value is the raw backend id, unsigned: ids are
+    /// operator-chosen, already exposed unauthenticated via the admin
+    /// API's `GET /backends`, and not secret. A forged or stale cookie can
+    /// at worst name a real-but-ineligible or nonexistent backend, both of
+    /// which fall straight through to the underlying strategy -- never a
+    /// crash, never a forced bad route.
+    #[serde(default = "default_sticky_cookie_name")]
+    pub cookie_name: String,
+    /// `None` sends no `Max-Age`/`Expires` -- a session cookie, gone when
+    /// the browser closes. `Some` is refreshed on every response that sets
+    /// the cookie, so an active client's pin never expires mid-session.
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+}
+
+fn default_sticky_cookie_name() -> String {
+    "lb_sticky".to_string()
 }
 
 /// One routing rule -- see `ListenerConfig::routes`. Deliberately does not
@@ -773,6 +809,12 @@ impl ListenerConfig {
                             .into(),
                     ));
                 }
+                if self.sticky.is_some() {
+                    return Err(invalid(
+                        "sticky is an http-only setting -- a tcp listener has no cookie to set or read"
+                            .into(),
+                    ));
+                }
                 if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
                     return Err(invalid(format!(
                         "rate_limit.key 'header:{name}' is http-only — a tcp listener has no headers to read, use 'source_ip'"
@@ -1206,6 +1248,61 @@ mod tests {
         let text = with_route(&format!("{ROUTE}{second_route}"));
         let err = Config::parse(&text).unwrap_err();
         assert!(format!("{err}").contains("duplicate"));
+    }
+
+    #[test]
+    fn sticky_defaults_to_none() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(cfg.listeners[0].sticky.is_none());
+    }
+
+    #[test]
+    fn parses_sticky_with_default_cookie_name() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.sticky]",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let sticky = cfg.listeners[0]
+            .sticky
+            .as_ref()
+            .expect("sticky should parse");
+        assert_eq!(sticky.cookie_name, "lb_sticky");
+        assert_eq!(sticky.max_age_secs, None);
+    }
+
+    #[test]
+    fn parses_a_configured_sticky_section() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.sticky]\n          cookie_name = \"my_cookie\"\n          max_age_secs = 3600",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let sticky = cfg.listeners[0]
+            .sticky
+            .as_ref()
+            .expect("sticky should parse");
+        assert_eq!(sticky.cookie_name, "my_cookie");
+        assert_eq!(sticky.max_age_secs, Some(3600));
+    }
+
+    #[test]
+    fn rejects_sticky_on_tcp_listener() {
+        // Both listeners' blocks end in the identical two lines, so a plain
+        // `.replace()` would insert into both -- `rfind` targets only the
+        // *last* occurrence, i.e. the TCP listener's, same trick
+        // `rejects_routes_on_tcp_listener` uses above.
+        let anchor = "          [listeners.load_balancing]\n          strategy = \"round_robin\"";
+        let insert_at = VALID.rfind(anchor).unwrap() + anchor.len();
+        let mut text = String::from(&VALID[..insert_at]);
+        text.push_str("\n\n          [listeners.sticky]");
+        text.push_str(&VALID[insert_at..]);
+
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("sticky"),
+            "error should name sticky, got: {err}"
+        );
     }
 
     #[test]

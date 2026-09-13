@@ -10,7 +10,7 @@ use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
 };
 use lb_metrics::Metrics;
-use lb_proxy::{CompiledRoute, ProxyContext};
+use lb_proxy::{CompiledRoute, ProxyContext, StickyRuntime};
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
 use lb_tcp::TcpContext;
 use std::collections::HashMap;
@@ -635,6 +635,14 @@ pub(crate) fn build_listener_core(
                 balancer: build_balancer(&lc.load_balancing.strategy),
                 pool: Arc::clone(&pool),
                 routes: compiled_routes,
+                // Same fact `hsts_max_age_secs` below is gated on -- a
+                // sticky cookie routes traffic, so it earns the same
+                // `Secure` treatment as HSTS earns its own header.
+                sticky: lc.sticky.as_ref().map(|s| StickyRuntime {
+                    cookie_name: s.cookie_name.clone(),
+                    max_age_secs: s.max_age_secs,
+                    secure: lc.tls.is_some(),
+                }),
                 circuit_breakers,
                 client,
                 per_backend_client,

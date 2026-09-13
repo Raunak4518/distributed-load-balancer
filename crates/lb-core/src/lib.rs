@@ -22,7 +22,7 @@ pub use config::{
     AdminConfig, BackendConfig, BackendTlsConfig, CertificateConfig, ClusterConfig, Config,
     HealthCheckConfig, ListenerConfig, LoadBalancingConfig, LoadBalancingStrategy, LogFormat,
     LoggingConfig, PeerTlsConfig, Protocol, RateLimitConfig, RateLimitKeySource, RouteConfig,
-    ServerConfig, TlsConfig, TlsVersion, TracingConfig,
+    ServerConfig, StickyConfig, TlsConfig, TlsVersion, TracingConfig,
 };
 pub use dns::DnsDiscoveryConfig;
 pub use error::ConfigError;

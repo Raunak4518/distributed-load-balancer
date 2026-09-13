@@ -294,6 +294,29 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
 # only in which static backends and which load-balancing strategy/
 # health-check apply.
 
+# ── Sticky-cookie session affinity (optional, HTTP-only) ────────────────
+# Once a client's request lands on a backend, sets a cookie naming it and
+# prefers that backend on the client's next request -- nginx's commercial
+# `sticky` module, HAProxy's `cookie` directive. Layered on top of whatever
+# load_balancing.strategy is chosen above, not a replacement for it: a
+# request with no cookie, an unparseable one, or one naming a backend
+# that's no longer eligible (removed, circuit-open, drained) falls straight
+# through to that strategy, exactly as if sticky weren't configured at all.
+#
+# [listeners.sticky]
+#   # The cookie's value is the backend's own id, unsigned -- ids are
+#   # already exposed via the admin API's GET /backends and aren't secret.
+#   cookie_name = "lb_sticky"
+#   # Omit for a session cookie (no Max-Age -- gone when the browser
+#   # closes). Refreshed on every response that sets the cookie, so an
+#   # active client's pin never expires mid-session.
+#   # max_age_secs = 3600
+#
+# Applies uniformly to this listener's default backends and to every
+# [[listeners.routes]] pool above -- there is no separate per-route toggle.
+# A pin naming a backend from the wrong pool for a given request simply
+# fails eligibility and falls through, the same as an absent cookie would.
+
 # ── TCP (L4) listener ─────────────────────────────────────────────────
 [[listeners]]
 name     = "postgres"

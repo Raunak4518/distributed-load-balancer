@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[listeners.sticky]` (HTTP listeners)**: sticky-cookie session
+  affinity -- nginx's commercial `sticky` module, HAProxy's `cookie`
+  directive. Once a client's request lands on a backend, sets a cookie
+  naming it and prefers that backend on the client's next request, layered
+  on top of whatever `load_balancing.strategy` is chosen rather than being
+  a strategy itself: a request with no cookie, an unparseable one, or one
+  naming a backend that's no longer eligible falls straight through to the
+  underlying strategy, exactly as if sticky weren't configured. The
+  cookie's value is the backend's own id, unsigned -- ids are already
+  exposed via the admin API's `GET /backends` and aren't secret, and a
+  forged or stale value can at worst fall through to the strategy, never
+  force a bad route. Applies uniformly to a listener's default backends and
+  every `[[listeners.routes]]` pool -- there is no separate per-route toggle.
 - **`[[listeners.routes]]` (HTTP listeners)**: path-prefix and/or Host-header
   based backend selection within one listener -- nginx's `location` blocks
   and HAProxy's ACL-based backend selection, both doing the same job. Rules
