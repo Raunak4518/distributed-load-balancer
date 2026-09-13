@@ -828,11 +828,16 @@ pub(crate) fn spawn_listener_tasks(
     let mut tasks = Vec::new();
 
     if let Some(dns) = &lc.dns_discovery {
+        let per_backend_client = match &core.kind {
+            ListenerCoreKind::Http(ctx) => ctx.per_backend_client.clone(),
+            ListenerCoreKind::Tcp(_) => None,
+        };
         tasks.push(crate::dns::spawn_dns_poller(
             crate::dns::TokioResolver,
             dns.clone(),
             Arc::clone(&core.pool),
             lc.name.clone(),
+            per_backend_client,
         ));
     }
 

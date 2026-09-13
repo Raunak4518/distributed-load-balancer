@@ -46,6 +46,18 @@ impl PerBackendClients {
         }
     }
 
+    pub fn evict_missing(&self, live_ids: &[BackendId]) {
+        let live: std::collections::HashSet<&BackendId> = live_ids.iter().collect();
+        self.clients
+            .write()
+            .unwrap()
+            .retain(|id, _| live.contains(id));
+    }
+
+    pub fn tracked_ids(&self) -> Vec<BackendId> {
+        self.clients.read().unwrap().keys().cloned().collect()
+    }
+
     pub fn get_or_build(&self, backend: &Backend) -> ProxyClient {
         if let Some(client) = self.clients.read().unwrap().get(&backend.id) {
             return client.clone();
@@ -125,5 +137,21 @@ mod tests {
         clients.get_or_build(&b1);
 
         assert_eq!(clients.clients.read().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn evict_missing_removes_only_backends_no_longer_live() {
+        let clients = PerBackendClients::new("svc.internal".into(), connector(), false, None);
+        let b1 = Backend::new("b1", "127.0.0.1:9001".parse().unwrap(), 1, None);
+        let b2 = Backend::new("b2", "127.0.0.1:9002".parse().unwrap(), 1, None);
+        clients.get_or_build(&b1);
+        clients.get_or_build(&b2);
+
+        clients.evict_missing(&[Id::new("b1")]);
+
+        let table = clients.clients.read().unwrap();
+        assert_eq!(table.len(), 1);
+        assert!(table.contains_key(&Id::new("b1")));
+        assert!(!table.contains_key(&Id::new("b2")));
     }
 }
