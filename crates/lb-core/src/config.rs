@@ -282,6 +282,54 @@ pub struct ListenerConfig {
     /// falls through, exactly as an absent cookie would.
     #[serde(default)]
     pub sticky: Option<StickyConfig>,
+
+    /// HTTP-only. Answers a repeated `GET` straight from memory instead of
+    /// forwarding it to a backend at all -- nginx's `proxy_cache`, Varnish.
+    /// Deliberately narrow for v1: only `GET` requests, only a `200`
+    /// response, and only one that declares a `Content-Length` within
+    /// `max_entry_bytes` are ever cached (chunked/unknown-length, non-GET,
+    /// and non-200 traffic is simply proxied exactly as it is today,
+    /// streamed, uncached) -- see `lb_proxy::cache`'s module docs for why
+    /// that precondition is what keeps buffering a response safe. `Cache-
+    /// Control: max-age=N` from the backend picks the TTL when present and
+    /// nonzero; `no-store`/`private`/`no-cache`/`max-age=0` all mean "don't
+    /// cache"; otherwise `default_ttl_secs` applies. Listener-level, not
+    /// per-route: a route's `path_prefix`/`host` are already part of the
+    /// cache key, so one cache per listener is already correctly
+    /// partitioned between routes without a separate per-route toggle.
+    #[serde(default)]
+    pub cache: Option<CacheConfig>,
+}
+
+/// See `ListenerConfig::cache`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CacheConfig {
+    /// A single response larger than this (by its `Content-Length`) is
+    /// never cached -- the response is still served, just not stored.
+    #[serde(default = "default_cache_max_entry_bytes")]
+    pub max_entry_bytes: usize,
+    /// Aggregate budget across every entry this listener's cache holds.
+    /// Once full, new entries are simply not admitted until something
+    /// already stored expires and is swept -- there is no eviction
+    /// algorithm competing for space in v1.
+    #[serde(default = "default_cache_max_total_bytes")]
+    pub max_total_bytes: usize,
+    /// Used only when the backend's response carries no `Cache-Control:
+    /// max-age` of its own.
+    #[serde(default = "default_cache_default_ttl_secs")]
+    pub default_ttl_secs: u64,
+}
+
+fn default_cache_max_entry_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+fn default_cache_max_total_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_cache_default_ttl_secs() -> u64 {
+    60
 }
 
 /// See `ListenerConfig::sticky`.
@@ -815,6 +863,12 @@ impl ListenerConfig {
                             .into(),
                     ));
                 }
+                if self.cache.is_some() {
+                    return Err(invalid(
+                        "cache is an http-only setting -- a tcp listener has no response to cache"
+                            .into(),
+                    ));
+                }
                 if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
                     return Err(invalid(format!(
                         "rate_limit.key 'header:{name}' is http-only — a tcp listener has no headers to read, use 'source_ip'"
@@ -1302,6 +1356,55 @@ mod tests {
         assert!(
             format!("{err}").contains("sticky"),
             "error should name sticky, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cache_defaults_to_none() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(cfg.listeners[0].cache.is_none());
+    }
+
+    #[test]
+    fn parses_cache_with_defaults() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.cache]",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let cache = cfg.listeners[0].cache.as_ref().expect("cache should parse");
+        assert_eq!(cache.max_entry_bytes, 2 * 1024 * 1024);
+        assert_eq!(cache.max_total_bytes, 64 * 1024 * 1024);
+        assert_eq!(cache.default_ttl_secs, 60);
+    }
+
+    #[test]
+    fn parses_a_configured_cache_section() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.cache]\n          max_entry_bytes = 1024\n          max_total_bytes = 4096\n          default_ttl_secs = 30",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let cache = cfg.listeners[0].cache.as_ref().expect("cache should parse");
+        assert_eq!(cache.max_entry_bytes, 1024);
+        assert_eq!(cache.max_total_bytes, 4096);
+        assert_eq!(cache.default_ttl_secs, 30);
+    }
+
+    #[test]
+    fn rejects_cache_on_tcp_listener() {
+        // Same `rfind`-the-last-occurrence trick as `rejects_sticky_on_tcp_listener`
+        // above -- both listener blocks share identical trailing lines.
+        let anchor = "          [listeners.load_balancing]\n          strategy = \"round_robin\"";
+        let insert_at = VALID.rfind(anchor).unwrap() + anchor.len();
+        let mut text = String::from(&VALID[..insert_at]);
+        text.push_str("\n\n          [listeners.cache]");
+        text.push_str(&VALID[insert_at..]);
+
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("cache"),
+            "error should name cache, got: {err}"
         );
     }
 

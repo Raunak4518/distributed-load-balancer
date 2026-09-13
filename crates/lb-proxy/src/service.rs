@@ -1,3 +1,4 @@
+use crate::cache::{self, ResponseCache};
 use crate::forward::{backend_scheme_and_authority, forward, ForwardError, ProxyClient};
 use crate::sticky::{self, StickyRuntime};
 use bytes::Bytes;
@@ -5,7 +6,7 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use lb_core::{
     BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimitKeySource, RateLimiter,
 };
@@ -43,6 +44,12 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// request resolved into simply fails `BackendPool::is_eligible` and
     /// falls through, exactly as an absent cookie would.
     pub sticky: Option<StickyRuntime>,
+    /// Answers a repeated `GET` straight from memory -- see `crate::cache`'s
+    /// module docs. Listener-level for the same reason `sticky` is: a
+    /// route's `path_prefix`/`host` are already part of the cache key, so
+    /// one cache per listener is already correctly partitioned between
+    /// routes without a separate per-route toggle.
+    pub cache: Option<Arc<ResponseCache<C>>>,
     /// Flat, not scoped per pool: correct because `Config::validate()`
     /// requires every backend id to be unique across the default backends
     /// *and every route's* within one listener, so a `BackendId` here
@@ -432,6 +439,31 @@ where
         }
     }
 
+    // Checked before anything else below (route resolution, body read,
+    // circuit-breaker refresh, the sticky pin, the retry loop) -- a hit
+    // skips all of it, which is the entire point of caching. Correctness
+    // doesn't depend on which pool this request would resolve into: the
+    // key already carries the request's path/query/Host, so a listener's
+    // one cache is already correctly partitioned between routes.
+    let cache_key = ctx
+        .cache
+        .as_ref()
+        .filter(|_| req.method() == Method::GET)
+        .map(|_| cache::key_for(req.method(), req.uri(), req.headers()));
+    if let (Some(cache), Some(key)) = (&ctx.cache, &cache_key) {
+        if let Some(cached) = cache.get(key) {
+            ctx.metrics.cache_hit.inc();
+            let (mut parts, _) = Response::new(()).into_parts();
+            parts.status = cached.status;
+            parts.headers = cached.headers;
+            let body = Full::new(cached.body)
+                .map_err(|never| match never {})
+                .boxed();
+            return Ok(Response::from_parts(parts, body));
+        }
+        ctx.metrics.cache_miss.inc();
+    }
+
     // Resolved once per request and used for everything below -- the
     // default `pool`/`balancer` for a listener with no `[[listeners.routes]]`
     // or no matching rule, otherwise the matched route's. `path()` alone
@@ -558,6 +590,54 @@ where
                 // hop-by-hop header the backend sent us (describing its hop
                 // to us) is never carried onto our hop to the client.
                 strip_hop_by_hop(&mut resp_parts.headers);
+
+                // Decided (and, if cacheable, buffered) before the sticky
+                // Set-Cookie below is added: a cached entry must never carry
+                // one client's sticky pin, or every future client served
+                // from it would be silently pinned to that same backend too.
+                let cache_ttl = match (&ctx.cache, &cache_key) {
+                    (Some(cache), Some(_)) => cache::cacheable_ttl(
+                        &Method::GET,
+                        resp_parts.status,
+                        &resp_parts.headers,
+                        cache.max_entry_bytes(),
+                        cache.default_ttl(),
+                    ),
+                    _ => None,
+                };
+                let body: ProxyBody = if let (Some(cache), Some(key), Some(ttl)) =
+                    (&ctx.cache, &cache_key, cache_ttl)
+                {
+                    let cache_status = resp_parts.status;
+                    let cache_headers = resp_parts.headers.clone();
+                    // Content-Length was already checked against
+                    // max_entry_bytes above, so this collect is bounded
+                    // in size; still time-boxed, since a declared length
+                    // is no guarantee the backend delivers it promptly.
+                    // A body already being collected can't be handed
+                    // back as a live stream on failure -- the same "no
+                    // replay after `.collect()`" constraint
+                    // `read_bounded` already lives with on the request
+                    // side -- so a timeout or transport error here
+                    // surfaces as a clean error instead of a truncated
+                    // stream.
+                    match tokio::time::timeout(ctx.body_read_timeout, resp_body.collect()).await {
+                        Ok(Ok(collected)) => {
+                            let bytes = collected.to_bytes();
+                            cache.put(key.clone(), cache_status, cache_headers, bytes.clone(), ttl);
+                            Full::new(bytes).map_err(|never| match never {}).boxed()
+                        }
+                        _ => {
+                            return Ok(simple_response(
+                                StatusCode::BAD_GATEWAY,
+                                "backend response could not be read",
+                            ));
+                        }
+                    }
+                } else {
+                    resp_body.boxed()
+                };
+
                 // Refreshed on every successful response, whether or not it
                 // matches an incoming pin -- this both renews the TTL for an
                 // already-pinned client and pins a first-time client
@@ -568,7 +648,7 @@ where
                         sticky::set_cookie_header(sticky, &backend_id),
                     );
                 }
-                return Ok(Response::from_parts(resp_parts, resp_body.boxed()));
+                return Ok(Response::from_parts(resp_parts, body));
             }
             Err(err) => {
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
@@ -651,6 +731,15 @@ mod tests {
         }
     }
 
+    /// Proves a cache hit skips picking a backend entirely: any call to
+    /// `pick` at all is the test failing, not just picking wrong.
+    struct PanicIfPicked;
+    impl LoadBalancer for PanicIfPicked {
+        fn pick(&self, _pool: &BackendPool, _key: &str) -> Option<BackendId> {
+            panic!("balancer.pick() must not be called on a cache hit");
+        }
+    }
+
     async fn spawn_fixed_response_backend(status: StatusCode, body: &'static str) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -674,6 +763,49 @@ mod tests {
             }
         });
         addr
+    }
+
+    /// Like `spawn_fixed_response_backend`, but counts requests and sends an
+    /// explicit `Content-Length` (required for `cacheable_ttl` to consider a
+    /// response cacheable at all) plus whatever `extra_headers` a
+    /// cache-behavior test needs (typically `Cache-Control`).
+    async fn spawn_counting_cacheable_backend(
+        body: &'static str,
+        extra_headers: &'static [(&'static str, &'static str)],
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let io = TokioIo::new(stream);
+                let count = count_clone.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        async move {
+                            let mut builder = Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_LENGTH, body.len().to_string());
+                            for (name, value) in extra_headers {
+                                builder = builder.header(*name, *value);
+                            }
+                            Ok::<_, Infallible>(
+                                builder
+                                    .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        (addr, count)
     }
 
     /// Drives a real request through our own proxy listener so `handle` sees
@@ -793,6 +925,7 @@ mod tests {
             pool: empty_pool(),
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -819,6 +952,7 @@ mod tests {
             pool: empty_pool(),
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -854,6 +988,7 @@ mod tests {
             pool,
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -884,6 +1019,7 @@ mod tests {
             pool,
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -920,6 +1056,7 @@ mod tests {
             pool,
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -964,6 +1101,7 @@ mod tests {
             pool: pool.clone(),
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1012,6 +1150,7 @@ mod tests {
             pool,
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1060,6 +1199,7 @@ mod tests {
             pool,
             routes: Vec::new(),
             sticky: None,
+            cache: None,
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1208,6 +1348,7 @@ mod tests {
                 balancer: Arc::new(FixedPick(route_backend.id.clone())),
             }],
             sticky: None,
+            cache: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1300,6 +1441,7 @@ mod tests {
                 },
             ],
             sticky: None,
+            cache: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1340,6 +1482,7 @@ mod tests {
             pool,
             routes: Vec::new(),
             sticky,
+            cache: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -1414,5 +1557,217 @@ mod tests {
         let resp =
             run_through_proxy_with_cookie(ctx, Some(&format!("lb_sticky={}", backend_a.id))).await;
         assert_eq!(resp.body(), "b");
+    }
+
+    fn test_cache() -> Arc<ResponseCache<FakeClock>> {
+        Arc::new(ResponseCache::new(
+            1024 * 1024,
+            16 * 1024 * 1024,
+            Duration::from_secs(60),
+            FakeClock::new(),
+        ))
+    }
+
+    /// Binds a listener and serves `ctx` on it for as long as the test
+    /// runs, accepting any number of connections -- unlike
+    /// `run_through_proxy`, which accepts exactly one. Returns the address
+    /// immediately, before any request is sent, so a test can pre-populate
+    /// a cache keyed on that exact address (the `Host` header a client
+    /// dialing it sends) ahead of the first request.
+    async fn spawn_proxy_listener<R, C>(ctx: Arc<ProxyContext<R, C>>) -> SocketAddr
+    where
+        R: RateLimiter + 'static,
+        C: Clock + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let io = TokioIo::new(stream);
+                let ctx = ctx.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req| {
+                        handle(req, ctx.clone(), "127.0.0.1".parse().unwrap())
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn get(addr: SocketAddr) -> Response<Bytes> {
+        let client = build_client(None, HashMap::new(), false);
+        let req = Request::builder()
+            .uri(format!("http://{addr}/"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        Response::from_parts(parts, bytes)
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_never_calls_the_balancer() {
+        let cache = test_cache();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A client dialing `addr` sends `Host: <addr>` -- the key must be
+        // built from that same value so the pre-populated entry is what the
+        // first (and only) real request actually looks up.
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            header::HOST,
+            HeaderValue::from_str(&addr.to_string()).unwrap(),
+        );
+        let uri: hyper::Uri = "/".parse().unwrap();
+        let key = cache::key_for(&Method::GET, &uri, &headers);
+        cache.put(
+            key,
+            StatusCode::OK,
+            hyper::HeaderMap::new(),
+            Bytes::from_static(b"cached"),
+            Duration::from_secs(60),
+        );
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(PanicIfPicked),
+            pool: empty_pool(),
+            routes: Vec::new(),
+            sticky: None,
+            cache: Some(cache),
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone(), "127.0.0.1".parse().unwrap()));
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+
+        let resp = get(addr).await;
+        assert_eq!(resp.body(), "cached");
+    }
+
+    #[tokio::test]
+    async fn a_cache_miss_then_hit_only_calls_the_backend_once() {
+        let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky: None,
+            cache: Some(test_cache()),
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let addr = spawn_proxy_listener(ctx).await;
+        assert_eq!(get(addr).await.body(), "hello");
+        assert_eq!(get(addr).await.body(), "hello");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_no_store_response_is_never_cached() {
+        let (backend_addr, count) =
+            spawn_counting_cacheable_backend("hello", &[("cache-control", "no-store")]).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky: None,
+            cache: Some(test_cache()),
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let addr = spawn_proxy_listener(ctx).await;
+        get(addr).await;
+        get(addr).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn no_cache_config_means_every_request_reaches_the_backend() {
+        let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            sticky: None,
+            cache: None,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let addr = spawn_proxy_listener(ctx).await;
+        get(addr).await;
+        get(addr).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }

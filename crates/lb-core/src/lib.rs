@@ -19,10 +19,10 @@ pub use clock::test_util;
 pub use clock::{Clock, SystemClock};
 pub use cluster::ClusterCoordinator;
 pub use config::{
-    AdminConfig, BackendConfig, BackendTlsConfig, CertificateConfig, ClusterConfig, Config,
-    HealthCheckConfig, ListenerConfig, LoadBalancingConfig, LoadBalancingStrategy, LogFormat,
-    LoggingConfig, PeerTlsConfig, Protocol, RateLimitConfig, RateLimitKeySource, RouteConfig,
-    ServerConfig, StickyConfig, TlsConfig, TlsVersion, TracingConfig,
+    AdminConfig, BackendConfig, BackendTlsConfig, CacheConfig, CertificateConfig, ClusterConfig,
+    Config, HealthCheckConfig, ListenerConfig, LoadBalancingConfig, LoadBalancingStrategy,
+    LogFormat, LoggingConfig, PeerTlsConfig, Protocol, RateLimitConfig, RateLimitKeySource,
+    RouteConfig, ServerConfig, StickyConfig, TlsConfig, TlsVersion, TracingConfig,
 };
 pub use dns::DnsDiscoveryConfig;
 pub use error::ConfigError;

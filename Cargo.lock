@@ -928,6 +928,7 @@ name = "lb-proxy"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "dashmap",
  "http",
  "http-body-util",
  "hyper",

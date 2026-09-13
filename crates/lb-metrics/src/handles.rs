@@ -107,6 +107,12 @@ pub struct ListenerMetrics {
     /// resolving a label pair here is not a hot-path cost the way it would
     /// be per-request or per-handshake.
     pub tls_certificate_expiry_timestamp_seconds: IntGaugeVec,
+
+    /// Response caching. Absent from a listener with no `[listeners.cache]`
+    /// -- these are simply never incremented there, same as every other
+    /// feature-gated counter above.
+    pub cache_hit: IntCounter,
+    pub cache_miss: IntCounter,
 }
 
 impl ListenerMetrics {

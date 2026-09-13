@@ -10,7 +10,7 @@ use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
 };
 use lb_metrics::Metrics;
-use lb_proxy::{CompiledRoute, ProxyContext, StickyRuntime};
+use lb_proxy::{spawn_cache_sweeper, CompiledRoute, ProxyContext, ResponseCache, StickyRuntime};
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
 use lb_tcp::TcpContext;
 use std::collections::HashMap;
@@ -643,6 +643,14 @@ pub(crate) fn build_listener_core(
                     max_age_secs: s.max_age_secs,
                     secure: lc.tls.is_some(),
                 }),
+                cache: lc.cache.as_ref().map(|c| {
+                    Arc::new(ResponseCache::new(
+                        c.max_entry_bytes,
+                        c.max_total_bytes,
+                        Duration::from_secs(c.default_ttl_secs),
+                        SystemClock,
+                    ))
+                }),
                 circuit_breakers,
                 client,
                 per_backend_client,
@@ -737,6 +745,12 @@ pub(crate) fn spawn_listener_tasks(
                 Duration::from_secs(30),
                 Duration::from_secs(60),
             ));
+            if let Some(cache) = &ctx.cache {
+                tasks.push(spawn_cache_sweeper(
+                    Arc::clone(cache),
+                    Duration::from_secs(30),
+                ));
+            }
             let probe_client: Arc<dyn lb_core::ProbeClient> = match &ctx.per_backend_client {
                 Some(per_backend) => Arc::clone(per_backend) as Arc<dyn lb_core::ProbeClient>,
                 None => Arc::new(lb_proxy::ProbeCapableClient(ctx.client.clone())),

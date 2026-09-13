@@ -45,6 +45,9 @@ pub struct Metrics {
     /// zero here on a plaintext-backend listener would read as "backend TLS
     /// is on and verifying", which is a lie a dashboard would repeat.
     pub backend_tls_verification_disabled: IntGaugeVec,
+
+    // Response caching.
+    cache_result: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -201,6 +204,13 @@ impl Metrics {
             ),
             &["listener"],
         )?;
+        let cache_result = IntCounterVec::new(
+            Opts::new(
+                "lb_cache_result_total",
+                "Response cache outcomes, by result",
+            ),
+            &["listener", "result"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -222,6 +232,7 @@ impl Metrics {
         registry.register(Box::new(tls_certificate_reloads.clone()))?;
         registry.register(Box::new(tls_certificate_expiry_timestamp_seconds.clone()))?;
         registry.register(Box::new(backend_tls_verification_disabled.clone()))?;
+        registry.register(Box::new(cache_result.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -245,6 +256,7 @@ impl Metrics {
             tls_certificate_reloads,
             tls_certificate_expiry_timestamp_seconds,
             backend_tls_verification_disabled,
+            cache_result,
         })
     }
 
@@ -317,6 +329,8 @@ impl Metrics {
             tls_certificate_expiry_timestamp_seconds: self
                 .tls_certificate_expiry_timestamp_seconds
                 .clone(),
+            cache_hit: self.cache_result.with_label_values(&[name, "hit"]),
+            cache_miss: self.cache_result.with_label_values(&[name, "miss"]),
         }
     }
 
@@ -643,7 +657,7 @@ mod tests {
             .set(1);
         let text = metrics.gather_text();
 
-        const ALLOWED: [&str; 11] = [
+        const ALLOWED: [&str; 12] = [
             "listener", "protocol", "status", "backend", "outcome", "layer", "peer",
             // Phase 5: both drawn from fixed sets in the code, never input.
             "reason", "phase",
@@ -654,6 +668,9 @@ mod tests {
             // never client-controlled -- unlike the SNI hostname, which is
             // deliberately not a label anywhere.
             "cert",
+            // Response caching: always exactly "hit" or "miss", drawn from
+            // the code, never from a cached key or client-supplied header.
+            "result",
         ];
         for line in text.lines().filter(|l| !l.starts_with('#')) {
             let Some(start) = line.find('{') else {

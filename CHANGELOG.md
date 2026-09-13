@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[listeners.cache]` (HTTP listeners)**: answers a repeated `GET`
+  straight from memory instead of forwarding it to a backend at all --
+  nginx's `proxy_cache`, Varnish. Deliberately narrow for v1: only a `GET`
+  request, only a `200` response, and only one that declares a
+  `Content-Length` within `max_entry_bytes` is ever cached -- that
+  precondition is what makes buffering a response safe to do at all, since
+  it means a body is never fully collected unless it's already known to fit
+  in the cap. `Cache-Control: max-age=N` from the backend picks the TTL when
+  present and nonzero; `no-store`/`private`/`no-cache`/`max-age=0` all mean
+  "don't cache"; otherwise `default_ttl_secs` applies. Everything else
+  (chunked/unknown-length bodies, non-GET, non-200, `Vary`/`ETag`/
+  conditional requests) is simply proxied exactly as it is with no
+  `[listeners.cache]` section, streamed, uncached. Listener-level, not
+  per-route: a route's `path_prefix`/`host` are already part of the cache
+  key. Wiped on every config hot-reload -- the deliberately simplest
+  invalidation story, with no purge-by-pattern API. New
+  `lb_cache_result_total{listener,result}` metric.
 - **`[listeners.sticky]` (HTTP listeners)**: sticky-cookie session
   affinity -- nginx's commercial `sticky` module, HAProxy's `cookie`
   directive. Once a client's request lands on a backend, sets a cookie

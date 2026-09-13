@@ -28,6 +28,10 @@ http-body-util = "0.1"
 http = "1"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "time"] }
+# For `ResponseCache` (cache.rs): a concurrent map, already a workspace
+# dependency (lb-cluster, lb-ratelimit) for the same "many readers/writers,
+# no coarse lock" shape.
+dashmap = "6"
 # For `PinnedResolver` (resolver.rs): a custom `HttpConnector` resolver is a
 # `tower_service::Service<Name>` impl -- see hyper-util's `connect::dns`
 # module docs. Already resolved transitively via hyper-util itself, so this

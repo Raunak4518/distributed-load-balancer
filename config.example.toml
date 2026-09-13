@@ -317,6 +317,37 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
 # A pin naming a backend from the wrong pool for a given request simply
 # fails eligibility and falls through, the same as an absent cookie would.
 
+# ── Response caching (optional, HTTP-only) ──────────────────────────────
+# Answers a repeated GET straight from memory instead of forwarding it to a
+# backend at all -- nginx's `proxy_cache`, Varnish. Deliberately narrow:
+# only a GET request, only a 200 response, and only one that declares a
+# Content-Length within max_entry_bytes are ever cached. Everything else
+# (chunked/unknown-length bodies, non-GET methods, non-200 statuses) is
+# simply proxied exactly as it is with this section absent -- streamed,
+# uncached, no behavior change. Cache-Control: max-age=N from the backend
+# picks the TTL when present and nonzero; no-store/private/no-cache/
+# max-age=0 all mean "don't cache"; otherwise default_ttl_secs applies.
+#
+# [listeners.cache]
+#   # A single response larger than this (by its Content-Length) is never
+#   # cached -- it is still served, just not stored.
+#   max_entry_bytes = 2097152
+#   # Aggregate budget across every entry this listener's cache holds. Once
+#   # full, new entries are simply not admitted until something already
+#   # stored expires -- there is no eviction algorithm competing for space.
+#   max_total_bytes = 67108864
+#   # Used only when the backend's response carries no Cache-Control:
+#   # max-age of its own.
+#   default_ttl_secs = 60
+#
+# Applies uniformly to this listener's default backends and to every
+# [[listeners.routes]] pool above -- a route's path_prefix/host are already
+# part of the cache key, so one cache per listener is already correctly
+# partitioned between routes without a separate per-route toggle. Wiped on
+# every config hot-reload (a fresh cache is built along with the rest of the
+# listener's context) -- the deliberately simplest invalidation story, with
+# no purge-by-pattern API.
+
 # ── TCP (L4) listener ─────────────────────────────────────────────────
 [[listeners]]
 name     = "postgres"
