@@ -75,7 +75,7 @@ serde_json = "1"
 # = false` on tower-http: its default feature set is empty anyway, this is
 # just explicit about only pulling the compression algorithms, not e.g. its
 # unrelated `fs`/`trace`/`auth` middleware.
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", default-features = false, features = [
     "compression-full",
 ] }

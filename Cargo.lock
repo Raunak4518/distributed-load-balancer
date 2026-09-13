@@ -862,6 +862,10 @@ dependencies = [
 name = "lb-bench"
 version = "0.2.0"
 dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "lb-balancer",
  "lb-cluster",
  "lb-core",
@@ -869,6 +873,7 @@ dependencies = [
  "lb-ratelimit",
  "rcgen",
  "rustls",
+ "tokio",
 ]
 
 [[package]]
