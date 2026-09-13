@@ -11,8 +11,8 @@ pub use handles::{
 pub use prometheus::IntGauge;
 
 use prometheus::{
-    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 /// Process-wide metric families. Per-listener and per-backend handles are
@@ -56,6 +56,14 @@ pub struct Metrics {
 
     // WebSocket / Upgrade proxying.
     websocket_upgrades: IntCounterVec,
+
+    // Admin API access control.
+    /// 1 when the admin listener has no bearer token configured -- mirrors
+    /// `backend_tls_verification_disabled`'s "logged as a warning and
+    /// exported as a metric" pattern, so an open admin port never ships
+    /// silently.
+    pub admin_auth_disabled: IntGauge,
+    pub admin_auth_failures: IntCounter,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -234,6 +242,17 @@ impl Metrics {
             &["listener", "result"],
         )?;
 
+        // 1 when the admin listener has no bearer token configured. Alert on
+        // it, the same way as backend_tls_verification_disabled.
+        let admin_auth_disabled = IntGauge::new(
+            "lb_admin_auth_disabled",
+            "1 when the admin listener has no bearer token configured",
+        )?;
+        let admin_auth_failures = IntCounter::new(
+            "lb_admin_auth_failures_total",
+            "Admin API requests rejected for a missing or incorrect bearer token",
+        )?;
+
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
         registry.register(Box::new(active_connections.clone()))?;
@@ -257,6 +276,8 @@ impl Metrics {
         registry.register(Box::new(cache_result.clone()))?;
         registry.register(Box::new(waf_blocked.clone()))?;
         registry.register(Box::new(websocket_upgrades.clone()))?;
+        registry.register(Box::new(admin_auth_disabled.clone()))?;
+        registry.register(Box::new(admin_auth_failures.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -283,6 +304,8 @@ impl Metrics {
             cache_result,
             waf_blocked,
             websocket_upgrades,
+            admin_auth_disabled,
+            admin_auth_failures,
         })
     }
 

@@ -32,6 +32,50 @@ pub struct AdminConfig {
     /// Bind privately. This surface exposes internal topology (backend names,
     /// health, traffic volumes) and must never face the public internet.
     pub listen: SocketAddr,
+    /// Name of the environment variable holding the admin bearer token.
+    /// Preferred: config files end up in version control, secrets shouldn't.
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// Literal token. Accepted for tests and constrained environments; the
+    /// environment-variable form is preferred.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl AdminConfig {
+    /// Resolves the admin bearer token.
+    ///
+    /// Unlike `ClusterConfig::resolve_secret`, `Ok(None)` (neither field set)
+    /// is a valid, common result -- it means the admin listener stays
+    /// unauthenticated, exactly as it always was before this existed. Both
+    /// fields set is rejected by `Config::validate()` before this is ever
+    /// called; `token_env` naming an unset variable fails fast here, same as
+    /// `resolve_secret`.
+    ///
+    /// Deliberately not done during `parse`, for the same reason
+    /// `resolve_secret` isn't: reading the environment is a side effect, and
+    /// config parsing should be pure. `lb-server` calls this at startup,
+    /// before anything binds.
+    pub fn resolve_token(&self) -> Result<Option<Vec<u8>>, ConfigError> {
+        let token = match (&self.token_env, &self.token) {
+            (None, None) => return Ok(None),
+            (Some(var), None) => std::env::var(var).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "admin.token_env names '{var}', but that environment variable is not set"
+                ))
+            })?,
+            (None, Some(literal)) => literal.clone(),
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "admin requires at most one of token_env or token".into(),
+                ))
+            }
+        };
+        if token.is_empty() {
+            return Err(ConfigError::Invalid("admin token must not be empty".into()));
+        }
+        Ok(Some(token.into_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -816,6 +860,15 @@ impl Config {
                         admin.listen
                     )));
                 }
+            }
+            // Unlike cluster's shared_secret above, *neither* set is fine --
+            // an admin token defaults to absent (today's behavior,
+            // unauthenticated) rather than being mandatory, since making it
+            // mandatory would break every existing [admin] config.
+            if admin.token_env.is_some() && admin.token.is_some() {
+                return Err(ConfigError::Invalid(
+                    "admin requires at most one of token_env or token".into(),
+                ));
             }
         }
 
@@ -1974,6 +2027,61 @@ mod tests {
     #[test]
     fn rejects_admin_listen_clashing_with_a_traffic_listener() {
         let text = format!("[admin]\nlisten = \"0.0.0.0:8080\"\n\n{VALID}");
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn admin_token_defaults_to_none() {
+        let text = format!("[admin]\nlisten = \"127.0.0.1:9090\"\n\n{VALID}");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(cfg.admin.unwrap().resolve_token().unwrap(), None);
+    }
+
+    #[test]
+    fn resolves_a_literal_admin_token() {
+        let text = format!("[admin]\nlisten = \"127.0.0.1:9090\"\ntoken = \"s3cret\"\n\n{VALID}");
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.admin.unwrap().resolve_token().unwrap(),
+            Some(b"s3cret".to_vec())
+        );
+    }
+
+    #[test]
+    fn resolves_an_admin_token_from_the_environment() {
+        let text = format!(
+            "[admin]\nlisten = \"127.0.0.1:9090\"\ntoken_env = \"LB_TEST_ADMIN_TOKEN\"\n\n{VALID}"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        std::env::set_var("LB_TEST_ADMIN_TOKEN", "from-env");
+        assert_eq!(
+            cfg.admin.unwrap().resolve_token().unwrap(),
+            Some(b"from-env".to_vec())
+        );
+        std::env::remove_var("LB_TEST_ADMIN_TOKEN");
+    }
+
+    #[test]
+    fn reports_a_missing_admin_token_environment_variable() {
+        let text = format!(
+            "[admin]\nlisten = \"127.0.0.1:9090\"\ntoken_env = \"LB_DEFINITELY_UNSET_ADMIN_TOKEN_XYZ\"\n\n{VALID}"
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert!(cfg.admin.unwrap().resolve_token().is_err());
+    }
+
+    #[test]
+    fn rejects_an_empty_admin_token() {
+        let text = format!("[admin]\nlisten = \"127.0.0.1:9090\"\ntoken = \"\"\n\n{VALID}");
+        let cfg = Config::parse(&text).unwrap();
+        assert!(cfg.admin.unwrap().resolve_token().is_err());
+    }
+
+    #[test]
+    fn rejects_admin_with_both_token_sources() {
+        let text = format!(
+            "[admin]\nlisten = \"127.0.0.1:9090\"\ntoken = \"a\"\ntoken_env = \"SOME_VAR\"\n\n{VALID}"
+        );
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
     }
 

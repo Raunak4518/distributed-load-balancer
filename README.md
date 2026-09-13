@@ -143,7 +143,7 @@ See [`config.example.toml`](config.example.toml) for the authoritative reference
 - **`[listeners.http2]`** — per-listener HTTP/2 settings. Every field has a safe default; omitting the section still gets full protection.
 - **`[cluster]`** — distributed rate limiting. Node ID, peer addresses, sliding window, pre-shared key (mandatory).
 - **`[cluster.tls]`** — optional mutual TLS on the peer channel. Without it the peer port is authenticated but not encrypted; every node presents the same cert (signed by a shared CA) to every peer.
-- **`[admin]`** — private admin listener for metrics and health endpoints.
+- **`[admin]`** — private admin listener for metrics, health endpoints, and backend drain/undrain. Optional `token`/`token_env` gate the whole surface behind an `Authorization: Bearer` header, checked in constant time; absent (the default), the listener stays exactly as unauthenticated as it always was, logged as a startup warning and exported on the `lb_admin_auth_disabled` gauge. There is no TLS on this listener, so the token is defense *in addition to* binding privately, not a replacement for it.
 
 Full field-by-field reference: [docs/configuration-reference.md](docs/configuration-reference.md)
 
@@ -210,6 +210,10 @@ The admin port (`/metrics`) exposes Prometheus counters and histograms: requests
 An optional `[tracing]` section exports one OpenTelemetry span per HTTP request and per TCP session over OTLP/HTTP to a collector — see the commented-out example in [`config.example.toml`](config.example.toml).
 
 `/healthz` is always 200 — liveness must not follow backend health, or a backend outage restarts the load balancer in a loop. `/ready` returns 503 when no backend in any pool is eligible.
+
+### Admin API access control
+
+None of the above is authenticated by default — exactly the risk nginx's paywalled stats page and HAProxy's single shared stats password both leave an operator to manage themselves. Set `[admin] token` or `token_env` to require every request on this port (`/metrics`, `/healthz`, `/ready`, and the backend API below) to carry a matching `Authorization: Bearer <token>` header, compared in constant time. Leaving both unset keeps the port exactly as open as it was before this existed, but it doesn't do so silently: a startup warning is logged and the `lb_admin_auth_disabled` gauge reads `1`, so an open admin port shows up on a dashboard rather than being discovered later. This listener has no TLS of its own, so the token is a second layer on top of binding privately — not a substitute for it.
 
 ### Admin backend API
 

@@ -64,6 +64,16 @@ pub async fn run_and_report_reload_handle(
         None => None,
     };
 
+    // Unlike `cluster_secret`, `None` here is a valid, common result -- see
+    // `AdminConfig::resolve_token`'s own docs for why an admin token is
+    // optional rather than mandatory.
+    let admin_token = match config.admin.as_ref() {
+        Some(a) => a.resolve_token().map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?,
+        None => None,
+    };
+
     let WiredApp {
         listeners,
         tls_reload_tasks,
@@ -151,6 +161,19 @@ pub async fn run_and_report_reload_handle(
         })?;
         tracing::info!(addr = %admin_listener.local_addr()?, "admin listener bound");
 
+        // Surfaced on a dashboard rather than living undiscovered in a
+        // config file, the same way `danger_accept_invalid_certs` is --
+        // a gap and a zero must not look identical to an alert.
+        metrics
+            .admin_auth_disabled
+            .set(admin_token.is_none() as i64);
+        if admin_token.is_none() {
+            tracing::warn!(
+                "admin listener has no token configured -- metrics, health, and backend \
+                 drain/undrain are reachable by anyone who can reach this port"
+            );
+        }
+
         // Ready when any listener has somewhere to forward. If every backend
         // is down, this instance should leave rotation — but stay alive, since
         // restarting it would not bring the backends back.
@@ -161,6 +184,7 @@ pub async fn run_and_report_reload_handle(
             admin_listener,
             readiness,
             Some(admin_backends::extension(Arc::clone(&reload))),
+            admin_token.map(|t| Arc::from(t.into_boxed_slice())),
         ));
     }
 

@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[admin] token` / `token_env`**: optional bearer-token access control
+  for the entire admin surface -- `/metrics`, `/healthz`, `/ready`, and
+  `GET`/`POST /backends`. Checked once, centrally, in
+  `lb_metrics::admin::route` (every route passes through it, including the
+  `/backends` extension), so no handler needed its own auth logic. Token
+  comparison is constant-time (`subtle::ConstantTimeEq`), the same concern
+  `lb-cluster`'s gossip HMAC check already guards against. Absent (the
+  default): the admin listener stays exactly as unauthenticated as it
+  always was, but not silently -- a startup warning is logged and the new
+  `lb_admin_auth_disabled` gauge reads `1`, mirroring
+  `backend_tls_verification_disabled`'s "logged as a warning and exported
+  as a metric" pattern. A rejected request increments the new
+  `lb_admin_auth_failures_total` counter. This listener has no TLS of its
+  own, so the token is defense in addition to binding privately, not a
+  replacement for it -- documented explicitly rather than glossed over.
 - **`[[listeners.canary]]` (HTTP listeners)**: weighted traffic-split /
   canary pools -- holds back a percentage of the request volume that
   matched no `[[listeners.routes]]` rule for one or more independently

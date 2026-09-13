@@ -12,6 +12,10 @@ http-body-util = "0.1"
 bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "macros"] }
 tracing = "0.1"
+# Constant-time comparison for the admin bearer token (`admin::route`) --
+# a byte-wise `==` would leak match progress through timing, the same
+# concern `lb-cluster`'s gossip HMAC check already guards against.
+subtle = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

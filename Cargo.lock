@@ -919,6 +919,7 @@ dependencies = [
  "hyper-util",
  "prometheus",
  "reqwest",
+ "subtle",
  "tokio",
  "tracing",
 ]

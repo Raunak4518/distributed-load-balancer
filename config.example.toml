@@ -507,3 +507,22 @@ max_connections_per_ip = 100
   # See the HTTP listener's load_balancing block above for the full list of
   # strategies and what each one does.
   strategy = "round_robin"
+
+# ── Admin API (optional) ─────────────────────────────────────────────────
+# A private listener for /metrics, /healthz, /ready, and GET/POST /backends
+# (drain/undrain). Bind privately -- this surface exposes internal topology
+# and must never face the public internet; the token below is defense in
+# addition to that, not a replacement for it. There is no TLS on this
+# listener today, so a token sent to it is sniffable on the wire to anyone
+# already positioned to observe the link -- network isolation is still the
+# primary control.
+# [admin]
+# listen = "127.0.0.1:9090"
+# Exactly one of these two, like [cluster]'s shared_secret/shared_secret_env
+# below. Neither set (the default) leaves this listener exactly as
+# unauthenticated as it always was -- logged as a startup warning and
+# exported on the lb_admin_auth_disabled gauge, so an open admin port never
+# ships silently.
+# token = "..."
+# token_env = "LB_ADMIN_TOKEN"
+# A request must then carry: Authorization: Bearer <token>
