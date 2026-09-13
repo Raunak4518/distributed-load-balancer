@@ -255,6 +255,45 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
   #                             backend set doesn't change.
   strategy = "round_robin"
 
+# ── L7 routing rules (optional, HTTP-only) ──────────────────────────────
+# Routes a request to a *different* backend set based on its path and/or
+# Host header -- nginx's `location` blocks, HAProxy's ACL-based backend
+# selection. Evaluated in declaration order, first match wins; a request
+# that matches no rule (or every rule, if this is left out entirely) falls
+# through to this listener's own backends/health_check/load_balancing
+# above, so adding routes to an existing listener never changes what an
+# already-working request does.
+#
+# [[listeners.routes]]
+#   # Matched as a path *segment* prefix, not a bare string prefix: "/api"
+#   # matches /api and /api/anything, but not /apiary -- nginx's own
+#   # `location /api` has exactly this gotcha, and this rule avoids it.
+#   path_prefix = "/api"
+#   # Case-insensitive exact match against the request's Host header.
+#   # Optional, and independent of path_prefix -- a rule may set either,
+#   # both (matched as AND), or neither (an unconditional override, only
+#   # sane as the last rule).
+#   # host = "api.example.com"
+#
+#   [[listeners.routes.backends]]
+#   id = "api1"
+#   address = "127.0.0.1:9101"
+#
+#   [listeners.routes.health_check]
+#   path = "/health"
+#   interval_ms = 2000
+#   timeout_ms = 500
+#   failure_threshold = 3
+#   cooldown_ms = 5000
+#
+#   [listeners.routes.load_balancing]
+#   strategy = "round_robin"
+#
+# Deliberately out of scope for a route: dns_discovery and backend_tls.
+# Every route shares this listener's single TLS/client policy and differs
+# only in which static backends and which load-balancing strategy/
+# health-check apply.
+
 # ── TCP (L4) listener ─────────────────────────────────────────────────
 [[listeners]]
 name     = "postgres"

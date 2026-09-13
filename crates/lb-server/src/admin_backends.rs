@@ -40,10 +40,36 @@ pub fn extension(reload: Arc<ReloadState>) -> lb_metrics::AdminExtension {
     })
 }
 
-fn pool_for(reload: &ReloadState, listener: &str) -> Option<Arc<BackendPool>> {
+/// Every pool this listener holds: the default one, plus one per
+/// `[[listeners.routes]]` rule (always none for a TCP listener). `drain`/
+/// `undrain` search across all of them by id -- safe because
+/// `Config::validate()` requires every backend id on a listener to be
+/// unique across its default backends and every route's.
+fn pools_for(reload: &ReloadState, listener: &str) -> Option<Vec<(String, Arc<BackendPool>)>> {
     match reload.listeners.get(listener)? {
-        ListenerReloadHandle::Http(ctx) => Some(Arc::clone(&ctx.load().pool)),
-        ListenerReloadHandle::Tcp(ctx) => Some(Arc::clone(&ctx.load().pool)),
+        ListenerReloadHandle::Http(ctx) => {
+            let ctx = ctx.load();
+            let mut pools = vec![("default".to_string(), Arc::clone(&ctx.pool))];
+            pools.extend(
+                ctx.routes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (route_label(i, &r.path_prefix, &r.host), Arc::clone(&r.pool))),
+            );
+            Some(pools)
+        }
+        ListenerReloadHandle::Tcp(ctx) => {
+            Some(vec![("default".to_string(), Arc::clone(&ctx.load().pool))])
+        }
+    }
+}
+
+fn route_label(idx: usize, path_prefix: &Option<String>, host: &Option<String>) -> String {
+    match (path_prefix, host) {
+        (Some(p), Some(h)) => format!("route:{idx} (path_prefix={p}, host={h})"),
+        (Some(p), None) => format!("route:{idx} (path_prefix={p})"),
+        (None, Some(h)) => format!("route:{idx} (host={h})"),
+        (None, None) => format!("route:{idx}"),
     }
 }
 
@@ -77,25 +103,26 @@ fn handle(req: &Request<Incoming>, reload: &ReloadState) -> Response<Full<Bytes>
 
 fn list_all(reload: &ReloadState) -> Response<Full<Bytes>> {
     let mut listeners = serde_json::Map::new();
-    for (name, handle) in &reload.listeners {
-        let pool = match handle {
-            ListenerReloadHandle::Http(ctx) => Arc::clone(&ctx.load().pool),
-            ListenerReloadHandle::Tcp(ctx) => Arc::clone(&ctx.load().pool),
+    for name in reload.listeners.keys() {
+        let Some(pools) = pools_for(reload, name) else {
+            continue;
         };
-        let backends: Vec<serde_json::Value> = pool
-            .all_backend_ids()
-            .into_iter()
-            .filter_map(|id| {
-                let backend = pool.backend(&id)?;
-                Some(serde_json::json!({
-                    "id": id.0.to_string(),
-                    "address": backend.address.to_string(),
-                    "active_healthy": pool.is_active_healthy(&id),
-                    "circuit_open": pool.is_circuit_open(&id),
-                    "manually_drained": pool.is_manually_drained(&id),
-                    "eligible": pool.is_eligible(&id),
-                    "active_conns": pool.active_count(&id),
-                }))
+        let backends: Vec<serde_json::Value> = pools
+            .iter()
+            .flat_map(|(route, pool)| {
+                pool.all_backend_ids().into_iter().filter_map(move |id| {
+                    let backend = pool.backend(&id)?;
+                    Some(serde_json::json!({
+                        "id": id.0.to_string(),
+                        "route": route,
+                        "address": backend.address.to_string(),
+                        "active_healthy": pool.is_active_healthy(&id),
+                        "circuit_open": pool.is_circuit_open(&id),
+                        "manually_drained": pool.is_manually_drained(&id),
+                        "eligible": pool.is_eligible(&id),
+                        "active_conns": pool.active_count(&id),
+                    }))
+                })
             })
             .collect();
         listeners.insert(name.clone(), serde_json::Value::Array(backends));
@@ -104,21 +131,24 @@ fn list_all(reload: &ReloadState) -> Response<Full<Bytes>> {
 }
 
 fn set_drain(reload: &ReloadState, listener: &str, id: &str, drain: bool) -> Response<Full<Bytes>> {
-    let Some(pool) = pool_for(reload, listener) else {
+    let Some(pools) = pools_for(reload, listener) else {
         return json_response(
             StatusCode::NOT_FOUND,
             serde_json::json!({"error": format!("no such listener '{listener}'")}),
         );
     };
     let backend_id = BackendId::new(id);
-    if pool.backend(&backend_id).is_none() {
+    let Some((_, pool)) = pools
+        .iter()
+        .find(|(_, pool)| pool.backend(&backend_id).is_some())
+    else {
         return json_response(
             StatusCode::NOT_FOUND,
             serde_json::json!({
                 "error": format!("no such backend '{id}' on listener '{listener}'")
             }),
         );
-    }
+    };
     pool.set_manually_drained(&backend_id, drain);
     json_response(
         StatusCode::OK,

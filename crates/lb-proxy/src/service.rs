@@ -21,8 +21,25 @@ pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub rate_limiter: Arc<R>,
+    /// The default route: used for any request that matches no rule in
+    /// `routes` below, and for every request when `routes` is empty (the
+    /// common case, and the entire config surface before routing rules
+    /// existed) -- this is what makes routing rules fully backward
+    /// compatible with every config that predates them.
     pub balancer: Arc<dyn LoadBalancer>,
     pub pool: Arc<BackendPool>,
+    /// Path/Host-based backend selection (nginx's `location` blocks,
+    /// HAProxy's ACL-based backend selection). Evaluated in order, first
+    /// match wins, checked before `pool`/`balancer` above. Empty for a
+    /// listener with no `[[listeners.routes]]`, which costs nothing extra
+    /// on that path -- resolving "no match" against an empty `Vec` is one
+    /// `is_empty()` check.
+    pub routes: Vec<CompiledRoute>,
+    /// Flat, not scoped per pool: correct because `Config::validate()`
+    /// requires every backend id to be unique across the default backends
+    /// *and every route's* within one listener, so a `BackendId` here
+    /// unambiguously names one backend in one pool (`pool` or exactly one
+    /// `routes[i].pool`) regardless of how many pools this context holds.
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
     pub client: ProxyClient,
     /// Set only for a `dns_discovery` + `backend_tls` HTTP listener, where
@@ -71,6 +88,50 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// actively tells the browser to forget the policy, rather than simply
     /// never having asserted one.
     pub hsts_max_age_secs: Option<u64>,
+}
+
+/// One compiled routing rule -- see `ProxyContext::routes`.
+pub struct CompiledRoute {
+    /// Matched as a path *segment* prefix: `"/api"` matches `/api` and
+    /// `/api/anything`, but not `/apiary` -- nginx's own `location /api`
+    /// has exactly this gotcha (`route_matches` below is what avoids it).
+    /// `None` matches every path.
+    pub path_prefix: Option<String>,
+    /// Case-insensitive exact match against the request's `Host` header.
+    /// `None` matches every host.
+    pub host: Option<String>,
+    pub pool: Arc<BackendPool>,
+    pub balancer: Arc<dyn LoadBalancer>,
+}
+
+/// `path` must be the path component alone (no query string) -- a route's
+/// `path_prefix` is about where a request is going, not what it carries in
+/// its query, and query strings can otherwise produce surprising matches
+/// (`/api?path_prefix=/other`).
+fn route_matches(route: &CompiledRoute, path: &str, host: Option<&str>) -> bool {
+    let path_ok = match &route.path_prefix {
+        None => true,
+        Some(prefix) => path == prefix || path.starts_with(&format!("{prefix}/")),
+    };
+    let host_ok = match &route.host {
+        None => true,
+        Some(expected) => host.is_some_and(|h| h.eq_ignore_ascii_case(expected)),
+    };
+    path_ok && host_ok
+}
+
+/// The first rule (in declaration order) whose `path_prefix`/`host` both
+/// match, or `None` if `routes` is empty or nothing matches -- the caller's
+/// existing `pool`/`balancer` fields are the correct fallback for `None`,
+/// which is what makes an empty `routes` list behave exactly as it did
+/// before routing rules existed.
+fn resolve_route<'a, R: RateLimiter, C: Clock>(
+    ctx: &'a ProxyContext<R, C>,
+    path: &str,
+    headers: &hyper::HeaderMap,
+) -> Option<&'a CompiledRoute> {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    ctx.routes.iter().find(|r| route_matches(r, path, host))
 }
 
 /// Sampled per-request access logging.
@@ -363,6 +424,17 @@ where
         }
     }
 
+    // Resolved once per request and used for everything below -- the
+    // default `pool`/`balancer` for a listener with no `[[listeners.routes]]`
+    // or no matching rule, otherwise the matched route's. `path()` alone
+    // (never `path_and_query()`): a route's `path_prefix` is about where a
+    // request is going, not what it carries in its query string.
+    let route = resolve_route(&ctx, req.uri().path(), req.headers());
+    let (pool, balancer): (&Arc<BackendPool>, &Arc<dyn LoadBalancer>) = match route {
+        Some(r) => (&r.pool, &r.balancer),
+        None => (&ctx.pool, &ctx.balancer),
+    };
+
     // CircuitBreaker's Open -> HalfOpen transition is evaluated lazily inside
     // `is_open()`; BackendPool's `circuit_open` flag is a separate cached
     // bool that only this loop keeps in sync. Without refreshing it here, a
@@ -372,11 +444,15 @@ where
     // forwarded to. Refreshing once per request (cheap: a handful of
     // backends, one mutex check each) keeps the pool's view current and lets
     // a backend become eligible for a probe request as soon as it's due.
-    for id in &ctx.pool.all_backend_ids() {
+    // Scoped to `pool` (the one resolved above), not every pool this
+    // context might hold: a route nobody is hitting has no traffic to keep
+    // fresh for, for exactly the same reason a completely idle single-pool
+    // listener already didn't refresh anything before routing rules existed
+    // -- this loop only ever runs inside a request that is about to use it.
+    for id in &pool.all_backend_ids() {
         if let Some(breaker) = ctx.circuit_breakers.get(id) {
             let state = breaker.state();
-            ctx.pool
-                .set_circuit_open(id, state == lb_healthcheck::CircuitState::Open);
+            pool.set_circuit_open(id, state == lb_healthcheck::CircuitState::Open);
             if let Some(bm) = ctx.backend_metrics.get(id) {
                 bm.circuit_state.set(match state {
                     lb_healthcheck::CircuitState::Closed => 0,
@@ -414,19 +490,19 @@ where
 
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     for attempt in 0..2u8 {
-        let Some(backend_id) = ctx.balancer.pick(&ctx.pool, &key) else {
+        let Some(backend_id) = balancer.pick(pool, &key) else {
             return Ok(simple_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no healthy backend",
             ));
         };
-        let Some(backend) = ctx.pool.backend(&backend_id) else {
+        let Some(backend) = pool.backend(&backend_id) else {
             continue;
         };
         // Held across the dial+forward below and dropped at the end of this
         // iteration regardless of outcome -- the only way `LeastConnections`
         // has real numbers to compare.
-        let _active_guard = ctx.pool.track_active(&backend_id);
+        let _active_guard = pool.track_active(&backend_id);
         let Some(outbound) =
             build_outbound_request(&parts, bytes.clone(), &backend, ctx.backend_tls)
         else {
@@ -456,7 +532,7 @@ where
                 }
                 // Propagate immediately (not just next request) so a backend
                 // that just recovered is usable again within this same burst.
-                ctx.pool.set_circuit_open(&backend_id, false);
+                pool.set_circuit_open(&backend_id, false);
                 let (mut resp_parts, resp_body) = resp.into_parts();
                 // Direction: backend -> client. Strip before returning so a
                 // hop-by-hop header the backend sent us (describing its hop
@@ -476,7 +552,7 @@ where
                     // Propagate immediately so the retry attempt below (if any)
                     // sees a freshly-tripped breaker instead of the stale flag
                     // from the top-of-request refresh.
-                    ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
+                    pool.set_circuit_open(&backend_id, breaker.is_open());
                 }
                 last_status = StatusCode::BAD_GATEWAY;
                 if attempt == 1 {
@@ -597,6 +673,40 @@ mod tests {
         Response::from_parts(parts, bytes)
     }
 
+    /// Like `run_through_proxy`, but for routing-rule tests that need to
+    /// choose the request's path and/or `Host` header -- `resolve_route`
+    /// matches on both, and neither is reachable through the plain-`/`
+    /// helper above.
+    async fn run_through_proxy_at<R, C>(
+        ctx: Arc<ProxyContext<R, C>>,
+        path: &str,
+        host: Option<&str>,
+    ) -> Response<Bytes>
+    where
+        R: RateLimiter + 'static,
+        C: Clock + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone(), "127.0.0.1".parse().unwrap()));
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+
+        let client = build_client(None, HashMap::new(), false);
+        let mut builder = Request::builder().uri(format!("http://{addr}{path}"));
+        if let Some(host) = host {
+            builder = builder.header(header::HOST, host);
+        }
+        let req = builder.body(Full::new(Bytes::new())).unwrap();
+        let resp = client.request(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        Response::from_parts(parts, bytes)
+    }
+
     fn empty_pool() -> Arc<BackendPool> {
         Arc::new(BackendPool::new(vec![]))
     }
@@ -619,6 +729,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysDeny),
             balancer: Arc::new(NoBackend), // would return None if reached; proves we short-circuit
             pool: empty_pool(),
+            routes: Vec::new(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -643,6 +754,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysAllow),
             balancer: Arc::new(NoBackend),
             pool: empty_pool(),
+            routes: Vec::new(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -676,6 +788,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysAllow),
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
+            routes: Vec::new(),
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -704,6 +817,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysAllow),
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
+            routes: Vec::new(),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -738,6 +852,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysAllow),
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
+            routes: Vec::new(),
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -780,6 +895,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysAllow),
             balancer: Arc::new(PreferFirstEligible),
             pool: pool.clone(),
+            routes: Vec::new(),
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -826,6 +942,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysAllow),
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
+            routes: Vec::new(),
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -872,6 +989,7 @@ mod tests {
             rate_limiter: Arc::new(AlwaysAllow),
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
+            routes: Vec::new(),
             circuit_breakers: breakers,
             client: build_client(None, HashMap::new(), false),
             per_backend_client: None,
@@ -989,5 +1107,143 @@ mod tests {
             headers.get("content-type").map(|v| v.as_bytes()),
             Some(&b"application/json"[..])
         );
+    }
+
+    /// Builds a `ProxyContext` with one default backend and one routed
+    /// backend behind `route`'s `path_prefix`/`host` -- the fixture every
+    /// routing-rule test below starts from.
+    async fn ctx_with_one_route(
+        route_path_prefix: Option<&str>,
+        route_host: Option<&str>,
+    ) -> (
+        Arc<ProxyContext<AlwaysAllow, FakeClock>>,
+        SocketAddr,
+        SocketAddr,
+    ) {
+        let default_addr = spawn_fixed_response_backend(StatusCode::OK, "default").await;
+        let route_addr = spawn_fixed_response_backend(StatusCode::OK, "route").await;
+        let default_backend = Backend::new("default-1", default_addr, 1, None);
+        let route_backend = Backend::new("route-1", route_addr, 1, None);
+        let default_pool = Arc::new(BackendPool::new(vec![default_backend.clone()]));
+        let route_pool = Arc::new(BackendPool::new(vec![route_backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(default_backend.id.clone())),
+            pool: default_pool,
+            routes: vec![CompiledRoute {
+                path_prefix: route_path_prefix.map(str::to_string),
+                host: route_host.map(str::to_string),
+                pool: route_pool,
+                balancer: Arc::new(FixedPick(route_backend.id.clone())),
+            }],
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        (ctx, default_addr, route_addr)
+    }
+
+    #[tokio::test]
+    async fn a_request_matching_a_route_path_prefix_is_served_by_the_routes_backend() {
+        let (ctx, _, _) = ctx_with_one_route(Some("/api"), None).await;
+        let resp = run_through_proxy_at(ctx, "/api/orders", None).await;
+        assert_eq!(resp.body(), "route");
+    }
+
+    #[tokio::test]
+    async fn a_request_matching_no_route_falls_through_to_the_default() {
+        let (ctx, _, _) = ctx_with_one_route(Some("/api"), None).await;
+        let resp = run_through_proxy_at(ctx, "/other", None).await;
+        assert_eq!(resp.body(), "default");
+    }
+
+    /// nginx's own `location /api` gotcha: `/apiary` shares the `/api`
+    /// prefix as a string but is not the same path segment, and must not
+    /// match.
+    #[tokio::test]
+    async fn path_prefix_does_not_match_a_longer_segment() {
+        let (ctx, _, _) = ctx_with_one_route(Some("/api"), None).await;
+        let resp = run_through_proxy_at(ctx, "/apiary", None).await;
+        assert_eq!(resp.body(), "default");
+    }
+
+    #[tokio::test]
+    async fn a_route_with_only_a_host_condition_matches_regardless_of_path() {
+        let (ctx, _, _) = ctx_with_one_route(None, Some("api.internal")).await;
+        let resp = run_through_proxy_at(ctx, "/anything", Some("api.internal")).await;
+        assert_eq!(resp.body(), "route");
+    }
+
+    #[tokio::test]
+    async fn host_matching_is_case_insensitive() {
+        let (ctx, _, _) = ctx_with_one_route(None, Some("api.internal")).await;
+        let resp = run_through_proxy_at(ctx, "/anything", Some("API.INTERNAL")).await;
+        assert_eq!(resp.body(), "route");
+    }
+
+    #[tokio::test]
+    async fn a_host_condition_that_does_not_match_falls_through_to_the_default() {
+        let (ctx, _, _) = ctx_with_one_route(None, Some("api.internal")).await;
+        let resp = run_through_proxy_at(ctx, "/anything", Some("other.internal")).await;
+        assert_eq!(resp.body(), "default");
+    }
+
+    /// First-match-wins, in declaration order: a second rule that would also
+    /// match is never reached once an earlier one already did.
+    #[tokio::test]
+    async fn first_matching_route_wins_over_a_later_one_that_would_also_match() {
+        let default_addr = spawn_fixed_response_backend(StatusCode::OK, "default").await;
+        let first_addr = spawn_fixed_response_backend(StatusCode::OK, "first").await;
+        let second_addr = spawn_fixed_response_backend(StatusCode::OK, "second").await;
+        let default_backend = Backend::new("default-1", default_addr, 1, None);
+        let first_backend = Backend::new("first-1", first_addr, 1, None);
+        let second_backend = Backend::new("second-1", second_addr, 1, None);
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(default_backend.id.clone())),
+            pool: Arc::new(BackendPool::new(vec![default_backend.clone()])),
+            routes: vec![
+                CompiledRoute {
+                    path_prefix: Some("/api".to_string()),
+                    host: None,
+                    pool: Arc::new(BackendPool::new(vec![first_backend.clone()])),
+                    balancer: Arc::new(FixedPick(first_backend.id.clone())),
+                },
+                CompiledRoute {
+                    path_prefix: Some("/api".to_string()),
+                    host: None,
+                    pool: Arc::new(BackendPool::new(vec![second_backend.clone()])),
+                    balancer: Arc::new(FixedPick(second_backend.id.clone())),
+                },
+            ],
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false),
+            per_backend_client: None,
+            backend_tls: false,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let resp = run_through_proxy_at(ctx, "/api/orders", None).await;
+        assert_eq!(resp.body(), "first");
     }
 }

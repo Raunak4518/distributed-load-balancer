@@ -3,14 +3,14 @@ use lb_balancer::{ConsistentHash, LeastConnections, RoundRobin, WeightedRoundRob
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::ClusterCoordinator;
 use lb_core::{
-    Backend, BackendPool, ClusterConfig, Config, Http2Config, ListenerConfig, LoadBalancer,
-    LoadBalancingStrategy, LoggingConfig, Protocol, SystemClock,
+    Backend, BackendPool, ClusterConfig, Config, HealthCheckConfig, Http2Config, ListenerConfig,
+    LoadBalancer, LoadBalancingStrategy, LoggingConfig, Protocol, SystemClock,
 };
 use lb_healthcheck::{
     spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
 };
 use lb_metrics::Metrics;
-use lb_proxy::ProxyContext;
+use lb_proxy::{CompiledRoute, ProxyContext};
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
 use lb_tcp::TcpContext;
 use std::collections::HashMap;
@@ -318,6 +318,9 @@ pub fn build_app(
             &metrics,
         );
         pools.push(Arc::clone(&core.pool));
+        for route in &core.routes {
+            pools.push(Arc::clone(&route.pool));
+        }
         let tasks = spawn_listener_tasks(lc, &core, &metrics);
         reload_tasks.insert(lc.name.clone(), tasks);
 
@@ -430,6 +433,27 @@ pub(crate) struct ListenerCore {
     pub(crate) backends: Vec<Backend>,
     pub(crate) pool: Arc<BackendPool>,
     pub(crate) kind: ListenerCoreKind,
+    /// One entry per `[[listeners.routes]]` rule, in declaration order --
+    /// always empty for a TCP listener (routes are HTTP-only, rejected at
+    /// config validation for `Protocol::Tcp`). Kept alongside the default
+    /// `backends`/`pool` above so `spawn_listener_tasks` can spawn health
+    /// checkers for every route's backends the same way it does for the
+    /// default set, and so `build_app` can add every route's pool to the
+    /// readiness check.
+    pub(crate) routes: Vec<RoutePool>,
+}
+
+/// One `[[listeners.routes]]` rule's built pool -- see `ListenerCore::routes`.
+/// Mirrors `CompiledRoute` (`lb_proxy`), minus the balancer: that is built
+/// directly into `ProxyContext::routes` below, since nothing outside the
+/// request path ever needs to pick through a route's pool.
+pub(crate) struct RoutePool {
+    pub(crate) backends: Vec<Backend>,
+    pub(crate) pool: Arc<BackendPool>,
+    /// A route's own `health_check`, independent of the listener's default
+    /// one -- a route may probe a different path/interval than the backends
+    /// it falls back to.
+    pub(crate) health_check: HealthCheckConfig,
 }
 
 pub(crate) enum ListenerCoreKind {
@@ -464,6 +488,30 @@ pub(crate) fn build_listener_core(
         .collect();
     let pool = Arc::new(BackendPool::new(backends.clone()));
 
+    // Built once per route, the same way the default `backends`/`pool` above
+    // are -- `Config::validate()` already guarantees every id here is unique
+    // across the default backends and every route's, so the flat
+    // `circuit_breakers`/`backend_metrics` maps built below stay correct with
+    // no per-pool scoping key.
+    let route_pools: Vec<(&lb_core::RouteConfig, Vec<Backend>, Arc<BackendPool>)> = lc
+        .routes
+        .iter()
+        .map(|r| {
+            let route_backends: Vec<Backend> = r
+                .backends
+                .iter()
+                .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
+                .collect();
+            let route_pool = Arc::new(BackendPool::new(route_backends.clone()));
+            (r, route_backends, route_pool)
+        })
+        .collect();
+    let all_backends = || {
+        backends
+            .iter()
+            .chain(route_pools.iter().flat_map(|(_, bs, _)| bs.iter()))
+    };
+
     // Pins the L7 forwarding client's TCP dial to each backend's configured
     // `address`, even though the forwarding authority is that backend's
     // `server_name` (chosen so SNI and hostname verification check the
@@ -475,17 +523,18 @@ pub(crate) fn build_listener_core(
     // plaintext listener's requests carry an IP-literal authority, so the
     // table is simply never consulted there. See
     // `lb_proxy::resolver::PinnedResolver`.
-    let server_name_addresses: HashMap<String, SocketAddr> = backends
-        .iter()
+    let server_name_addresses: HashMap<String, SocketAddr> = all_backends()
         .filter_map(|b| b.server_name.clone().map(|name| (name, b.address)))
         .collect();
 
     let listener_metrics = Arc::new(metrics.listener(&lc.name));
-    let backend_metrics: HashMap<_, _> = backends
-        .iter()
+    let backend_metrics: HashMap<_, _> = all_backends()
         .map(|b| (b.id.clone(), metrics.backend(&lc.name, &b.id.0)))
         .collect();
 
+    // Each route's own `health_check.failure_threshold`/`cooldown_ms` governs
+    // its own backends' breakers; the default backends keep using the
+    // listener's own `health_check` as they always have.
     let mut circuit_breakers = HashMap::new();
     for b in &backends {
         circuit_breakers.insert(
@@ -496,6 +545,18 @@ pub(crate) fn build_listener_core(
                 SystemClock,
             ),
         );
+    }
+    for (route, route_backends, _) in &route_pools {
+        for b in route_backends {
+            circuit_breakers.insert(
+                b.id.clone(),
+                CircuitBreaker::new(
+                    route.health_check.failure_threshold,
+                    Duration::from_millis(route.health_check.cooldown_ms),
+                    SystemClock,
+                ),
+            );
+        }
     }
 
     let rate_limiter = Arc::new(Gcra::new(
@@ -556,10 +617,24 @@ pub(crate) fn build_listener_core(
                 ))),
                 _ => None,
             };
+            // One `CompiledRoute` per `[[listeners.routes]]` rule, in
+            // declaration order -- `handle`'s `resolve_route` walks this
+            // `Vec` and falls through to `pool`/`balancer` above when it's
+            // empty or nothing matches.
+            let compiled_routes: Vec<CompiledRoute> = route_pools
+                .iter()
+                .map(|(route, _, route_pool)| CompiledRoute {
+                    path_prefix: route.path_prefix.clone(),
+                    host: route.host.clone(),
+                    pool: Arc::clone(route_pool),
+                    balancer: build_balancer(&route.load_balancing.strategy),
+                })
+                .collect();
             ListenerCoreKind::Http(Box::new(ProxyContext {
                 rate_limiter,
                 balancer: build_balancer(&lc.load_balancing.strategy),
                 pool: Arc::clone(&pool),
+                routes: compiled_routes,
                 circuit_breakers,
                 client,
                 per_backend_client,
@@ -610,10 +685,20 @@ pub(crate) fn build_listener_core(
         }
     };
 
+    let routes: Vec<RoutePool> = route_pools
+        .into_iter()
+        .map(|(route, backends, pool)| RoutePool {
+            backends,
+            pool,
+            health_check: route.health_check.clone(),
+        })
+        .collect();
+
     ListenerCore {
         backends,
         pool,
         kind,
+        routes,
     }
 }
 
@@ -648,17 +733,34 @@ pub(crate) fn spawn_listener_tasks(
                 Some(per_backend) => Arc::clone(per_backend) as Arc<dyn lb_core::ProbeClient>,
                 None => Arc::new(lb_proxy::ProbeCapableClient(ctx.client.clone())),
             };
+            let transport = ProbeTransport::Http {
+                client: probe_client,
+                backend_tls: ctx.backend_tls,
+            };
             spawn_health_checkers(
-                lc,
+                &lc.name,
+                &lc.health_check,
                 &core.backends,
                 &core.pool,
                 &mut tasks,
                 metrics,
-                ProbeTransport::Http {
-                    client: probe_client,
-                    backend_tls: ctx.backend_tls,
-                },
+                &transport,
             );
+            // Every `[[listeners.routes]]` rule gets the same probe
+            // transport as the default backends above (same client, same
+            // trust roots -- routes share the listener's TLS/client policy),
+            // but its own `health_check` settings.
+            for route in &core.routes {
+                spawn_health_checkers(
+                    &lc.name,
+                    &route.health_check,
+                    &route.backends,
+                    &route.pool,
+                    &mut tasks,
+                    metrics,
+                    &transport,
+                );
+            }
         }
         ListenerCoreKind::Tcp(ctx) => {
             tasks.push(spawn_sweeper(
@@ -667,12 +769,13 @@ pub(crate) fn spawn_listener_tasks(
                 Duration::from_secs(60),
             ));
             spawn_health_checkers(
-                lc,
+                &lc.name,
+                &lc.health_check,
                 &core.backends,
                 &core.pool,
                 &mut tasks,
                 metrics,
-                ProbeTransport::Tcp(ctx.backend_tls.clone()),
+                &ProbeTransport::Tcp(ctx.backend_tls.clone()),
             );
         }
     }
@@ -790,30 +893,31 @@ enum ProbeTransport {
 /// here too, and then they would be *this* function's, not the listener's,
 /// which is precisely the divergence the whole design exists to prevent.
 fn spawn_health_checkers(
-    lc: &ListenerConfig,
+    listener_name: &str,
+    health_check: &HealthCheckConfig,
     backends: &[Backend],
     pool: &Arc<BackendPool>,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     metrics: &Metrics,
-    transport: ProbeTransport,
+    transport: &ProbeTransport,
 ) {
-    let interval = Duration::from_millis(lc.health_check.interval_ms);
-    let timeout = Duration::from_millis(lc.health_check.timeout_ms);
+    let interval = Duration::from_millis(health_check.interval_ms);
+    let timeout = Duration::from_millis(health_check.timeout_ms);
 
     for b in backends {
         let config = ActiveCheckConfig {
             interval,
-            healthy_gauge: Some(metrics.backend(&lc.name, &b.id.0).healthy),
+            healthy_gauge: Some(metrics.backend(listener_name, &b.id.0).healthy),
         };
-        match &transport {
+        match transport {
             ProbeTransport::Http {
                 client,
                 backend_tls,
             } => {
-                let path =
-                    lc.health_check.path.clone().expect(
-                        "config validation guarantees http listeners have a health_check.path",
-                    );
+                let path = health_check
+                    .path
+                    .clone()
+                    .expect("config validation guarantees http listeners have a health_check.path");
                 tasks.push(spawn_active_checker(
                     b.clone(),
                     pool.clone(),

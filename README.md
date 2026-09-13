@@ -129,6 +129,7 @@ Send `SIGHUP` (`systemctl reload lb-server`, or `kill -HUP <pid>`) to reload wit
 See [`config.example.toml`](config.example.toml) for the authoritative reference with inline commentary. The major sections:
 
 - **`[[listeners]]`** — one per entry point: protocol (`http`/`tcp`), bind address, backends, rate limits, health checks, optional TLS.
+- **`[[listeners.routes]]`** — HTTP-only, optional. Routes a request to a different backend set by path prefix and/or `Host` header, first match wins — nginx's `location` blocks, HAProxy's ACL-based backend selection. A listener with none behaves exactly as it did before routes existed.
 - **`[listeners.tls]`** — edge TLS termination. ALPN, handshake timeout, HSTS, cert reload interval.
 - **`[listeners.backend_tls]`** — re-encryption to backends. Custom CA or system roots. `danger_accept_invalid_certs` is logged as a warning and exported as a metric.
 - **`[listeners.http2]`** — per-listener HTTP/2 settings. Every field has a safe default; omitting the section still gets full protection.
@@ -147,10 +148,11 @@ Full field-by-field reference: [docs/configuration-reference.md](docs/configurat
 3. TLS handshake runs in the spawned task, not the accept loop. Both limit guards held across it.
 4. ALPN result dispatches to HTTP/1.1 (`header_read_timeout`) or HTTP/2 (stream limits, PING keep-alive, `FirstByteDeadline`). Both are additionally wrapped in `write_timeout` — the read-side timeouts bound how long a client may take to *send*; this bounds how long it may take to *read the response*, so a client that stops draining its socket can't hold the connection open forever either.
 5. Local GCRA check — free, in-process. Then cluster budget if configured.
-6. Circuit-breaker states refreshed from the breakers to the pool.
-7. Body read with size cap and timeout.
-8. The configured strategy (`round_robin`, `least_connections`, `weighted_round_robin`, or `consistent_hash`) picks an eligible backend. Request forwarded through a `hyper_util::Client` with connection pooling.
-9. On backend failure, one retry to a different backend. On success, hop-by-hop headers stripped, `X-Request-Id` added, HSTS injected if configured.
+6. If `[[listeners.routes]]` is configured, the request's path/Host is matched against each rule in order; the first match's backend pool and strategy are used for everything below, falling through to the listener's default pool when nothing matches.
+7. Circuit-breaker states refreshed from the breakers to the (matched or default) pool.
+8. Body read with size cap and timeout.
+9. The configured strategy (`round_robin`, `least_connections`, `weighted_round_robin`, or `consistent_hash`) picks an eligible backend. Request forwarded through a `hyper_util::Client` with connection pooling.
+10. On backend failure, one retry to a different backend. On success, hop-by-hop headers stripped, `X-Request-Id` added, HSTS injected if configured.
 
 ### TCP
 
@@ -199,7 +201,7 @@ An optional `[tracing]` section exports one OpenTelemetry span per HTTP request 
 
 ### Admin backend API
 
-The same private admin port also serves `GET /backends` (every listener's backends, with health/circuit/drain state and in-flight connection counts, as JSON) and `POST /backends/{listener}/{id}/drain` / `.../undrain` — runtime backend inspection and draining with no config edit or reload, the two things nginx paywalls into nginx Plus's dynamic reconfiguration API. A drain is a separate flag from the active health checker's own healthy/unhealthy verdict, so a passing probe doesn't silently undo an operator's drain request. It doesn't add or remove backends — that still goes through the config file and `SIGHUP`.
+The same private admin port also serves `GET /backends` (every listener's backends, with health/circuit/drain state, in-flight connection counts, and which route each one belongs to — `default` or a `route:N` label — as JSON) and `POST /backends/{listener}/{id}/drain` / `.../undrain` — runtime backend inspection and draining with no config edit or reload, the two things nginx paywalls into nginx Plus's dynamic reconfiguration API. A drain is a separate flag from the active health checker's own healthy/unhealthy verdict, so a passing probe doesn't silently undo an operator's drain request. It doesn't add or remove backends — that still goes through the config file and `SIGHUP`.
 
 ## Documentation
 

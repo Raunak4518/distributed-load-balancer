@@ -256,6 +256,41 @@ pub struct ListenerConfig {
     pub health_check: HealthCheckConfig,
     pub rate_limit: RateLimitConfig,
     pub load_balancing: LoadBalancingConfig,
+
+    /// HTTP-only. Routes a request to a *different* set of backends based
+    /// on its path and/or `Host` header -- nginx's `location` blocks and
+    /// HAProxy's ACL-based backend selection, both doing the same job.
+    /// Evaluated in declaration order, first match wins; a request that
+    /// matches no rule (or every rule, if this is empty) falls through to
+    /// this listener's own `backends`/`health_check`/`load_balancing`
+    /// above, which is what makes this fully backward compatible -- an
+    /// existing config with no `[[listeners.routes]]` means exactly what it
+    /// always meant.
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
+}
+
+/// One routing rule -- see `ListenerConfig::routes`. Deliberately does not
+/// support its own `dns_discovery` or `backend_tls`: every route shares the
+/// listener's single TLS/client policy and differs only in which static
+/// backends and which load-balancing strategy/health-check apply. Widening
+/// that is possible later; it is not what was found missing.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RouteConfig {
+    /// Matched as a path *segment* prefix, not a bare `starts_with`:
+    /// `"/api"` matches `/api` and `/api/anything`, but not `/apiary` --
+    /// nginx's own `location /api` has exactly this gotcha, and this
+    /// avoids it by construction. `None` matches every path.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    /// Case-insensitive exact match against the request's `Host` header.
+    /// `None` matches every host.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub backends: Vec<BackendConfig>,
+    pub health_check: HealthCheckConfig,
+    pub load_balancing: LoadBalancingConfig,
 }
 
 impl ListenerConfig {
@@ -630,10 +665,26 @@ impl ListenerConfig {
                 return Err(invalid("dns_discovery.port must be positive".into()));
             }
         }
+        // Unique across the default backends *and every route's* -- not
+        // just within one list. `ProxyContext`'s circuit-breaker/metrics
+        // maps are flat `HashMap<BackendId, _>` with no per-pool scoping,
+        // so a collision between a route's backend and another route's (or
+        // the default's) would silently overwrite one's state with the
+        // other's.
         let mut ids = HashSet::new();
         for b in &self.backends {
             if !ids.insert(&b.id) {
                 return Err(invalid(format!("duplicate backend id: {}", b.id)));
+            }
+        }
+        for route in &self.routes {
+            for b in &route.backends {
+                if !ids.insert(&b.id) {
+                    return Err(invalid(format!(
+                        "duplicate backend id across routes: {}",
+                        b.id
+                    )));
+                }
             }
         }
 
@@ -681,6 +732,18 @@ impl ListenerConfig {
                         "connect_timeout_ms/idle_timeout_ms are tcp-only settings".into(),
                     ));
                 }
+                for route in &self.routes {
+                    if route.backends.is_empty() {
+                        return Err(invalid(
+                            "each [[listeners.routes]] needs at least one backend".into(),
+                        ));
+                    }
+                    if route.health_check.path.is_none() {
+                        return Err(invalid(
+                            "each [[listeners.routes]] needs health_check.path, same as the listener itself".into(),
+                        ));
+                    }
+                }
             }
             Protocol::Tcp => {
                 if self.health_check.path.is_some() {
@@ -701,6 +764,12 @@ impl ListenerConfig {
                 if self.compression {
                     return Err(invalid(
                         "compression is an http-only setting -- a tcp listener has no response to compress"
+                            .into(),
+                    ));
+                }
+                if !self.routes.is_empty() {
+                    return Err(invalid(
+                        "routes is an http-only setting -- a tcp listener has no path or Host to route on"
                             .into(),
                     ));
                 }
@@ -1025,6 +1094,118 @@ mod tests {
             format!("{err}").contains("compression"),
             "error should name compression, got: {err}"
         );
+    }
+
+    /// Inserts `route_toml` as a second listener entry's worth of extra
+    /// TOML, right before the "postgres" (TCP) listener -- keeps every
+    /// route test's fixture anchored to the same known-good `VALID` base
+    /// rather than hand-building a whole config from scratch.
+    fn with_route(route_toml: &str) -> String {
+        VALID.replace(
+            "\n        [[listeners]]\n        name = \"postgres\"",
+            &format!("{route_toml}\n        [[listeners]]\n        name = \"postgres\""),
+        )
+    }
+
+    const ROUTE: &str = r#"
+
+          [[listeners.routes]]
+          path_prefix = "/api"
+
+            [[listeners.routes.backends]]
+            id = "api1"
+            address = "127.0.0.1:9101"
+
+            [listeners.routes.health_check]
+            path = "/health"
+            interval_ms = 2000
+            timeout_ms = 500
+            failure_threshold = 3
+            cooldown_ms = 5000
+
+            [listeners.routes.load_balancing]
+            strategy = "round_robin"
+"#;
+
+    #[test]
+    fn routes_default_to_empty() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(cfg.listeners[0].routes.is_empty());
+    }
+
+    #[test]
+    fn parses_a_route_with_path_prefix() {
+        let cfg = Config::parse(&with_route(ROUTE)).expect("valid config should parse");
+        let route = &cfg.listeners[0].routes[0];
+        assert_eq!(route.path_prefix.as_deref(), Some("/api"));
+        assert_eq!(route.host, None);
+        assert_eq!(route.backends.len(), 1);
+        assert_eq!(route.backends[0].id, "api1");
+    }
+
+    #[test]
+    fn parses_a_route_with_host() {
+        let text =
+            with_route(ROUTE).replace("path_prefix = \"/api\"", "host = \"api.example.com\"");
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        assert_eq!(
+            cfg.listeners[0].routes[0].host.as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(cfg.listeners[0].routes[0].path_prefix, None);
+    }
+
+    #[test]
+    fn rejects_routes_on_tcp_listener() {
+        // Both listeners' blocks end in the identical two lines, so a plain
+        // `.replace()` would insert into both -- `rfind` targets only the
+        // *last* occurrence, i.e. the TCP listener's.
+        let anchor = "          [listeners.load_balancing]\n          strategy = \"round_robin\"";
+        let insert_at = VALID.rfind(anchor).unwrap() + anchor.len();
+        let mut text = String::from(&VALID[..insert_at]);
+        text.push_str(ROUTE);
+        text.push_str(&VALID[insert_at..]);
+
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("routes"),
+            "error should name routes, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_route_with_no_backends() {
+        let text = with_route(ROUTE).replace(
+            "[[listeners.routes.backends]]\n            id = \"api1\"\n            address = \"127.0.0.1:9101\"\n\n",
+            "",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("backend"));
+    }
+
+    #[test]
+    fn rejects_a_route_with_no_health_check_path() {
+        let text = with_route(ROUTE).replace("path = \"/health\"\n            ", "");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("health_check"));
+    }
+
+    #[test]
+    fn rejects_duplicate_backend_id_between_default_and_a_route() {
+        let text = with_route(ROUTE).replace("id = \"api1\"", "id = \"web1\"");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("duplicate"));
+    }
+
+    #[test]
+    fn rejects_duplicate_backend_id_across_two_routes() {
+        // A second route, same backend id as the first, different path so
+        // this isn't rejected for being a duplicate *rule* -- only the id
+        // collision should trip validation.
+        let second_route = ROUTE.replace("path_prefix = \"/api\"", "path_prefix = \"/other\"");
+        let text = with_route(&format!("{ROUTE}{second_route}"));
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("duplicate"));
     }
 
     #[test]

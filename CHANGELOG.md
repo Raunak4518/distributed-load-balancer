@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[[listeners.routes]]` (HTTP listeners)**: path-prefix and/or Host-header
+  based backend selection within one listener -- nginx's `location` blocks
+  and HAProxy's ACL-based backend selection, both doing the same job. Rules
+  are evaluated in declaration order, first match wins; a request matching
+  no rule (or every listener without a `[[listeners.routes]]` section at
+  all) falls through to the listener's own top-level `backends`/
+  `health_check`/`load_balancing`, which is what makes this fully backward
+  compatible -- an existing config means exactly what it always meant.
+  `path_prefix` matches on a path *segment* boundary (`/api` matches `/api`
+  and `/api/anything`, not `/apiary`), avoiding nginx's own well-known
+  `location /api` gotcha. Each route gets its own backends, health checks,
+  and load-balancing strategy, but shares the listener's single TLS/client
+  policy -- per-route `dns_discovery`/`backend_tls` is out of scope for now.
+  `GET /backends` on the admin API now labels each backend with which
+  route it belongs to (or `default`), and `drain`/`undrain` search across
+  every route's backends the same way they already did for the default set.
 - **`compression` (HTTP listeners)**: gzip/brotli/deflate/zstd response
   compression, negotiated against the client's `Accept-Encoding` via
   `tower-http`'s `CompressionLayer`. Off by default, matching nginx's own
