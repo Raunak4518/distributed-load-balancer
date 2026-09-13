@@ -291,6 +291,21 @@ pub struct ListenerConfig {
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
 
+    /// HTTP-only. Splits traffic that matched no `routes` rule across one or
+    /// more independently health-checked, independently load-balanced pools
+    /// by percentage -- a canary/blue-green rollout construct, distinct from
+    /// `weight` on an individual backend (which biases selection *within*
+    /// one pool). Each pool's `percent` is an absolute share of the
+    /// listener's total request volume; the sum across every entry here must
+    /// be at most 99, leaving the listener's own `backends` above at least
+    /// 1% so it is never configured but silently unreachable. Evaluated
+    /// after `routes`: a request that matches a route rule is unaffected by
+    /// this section entirely. Empty (the default) costs nothing extra --
+    /// every request falls straight through to `backends`/`load_balancing`
+    /// above, exactly as it did before this section existed.
+    #[serde(default)]
+    pub canary: Vec<CanaryPoolConfig>,
+
     /// HTTP-only. Once a client's request lands on a backend, sets a cookie
     /// naming it and prefers that backend on the client's next request --
     /// nginx's commercial `sticky` module, HAProxy's `cookie` directive.
@@ -450,6 +465,23 @@ pub struct RouteConfig {
     /// `None` matches every host.
     #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
+    pub backends: Vec<BackendConfig>,
+    pub health_check: HealthCheckConfig,
+    pub load_balancing: LoadBalancingConfig,
+}
+
+/// One weighted traffic-split pool -- see `ListenerConfig::canary`. Same
+/// shape as `RouteConfig` minus `path_prefix`/`host` (a canary pool is
+/// selected by a percentage roll, not by matching anything about the
+/// request) plus `percent`. Deliberately distinct from `BackendConfig`'s own
+/// `weight`: that is a *relative* unit `weighted_round_robin` uses to bias
+/// selection among backends inside one pool, while `percent` here is an
+/// *absolute* share of the listener's total request volume, orthogonal to
+/// whichever `load_balancing.strategy` a canary pool uses internally.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct CanaryPoolConfig {
+    pub percent: u8,
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
     pub health_check: HealthCheckConfig,
@@ -855,6 +887,16 @@ impl ListenerConfig {
                 }
             }
         }
+        for pool in &self.canary {
+            for b in &pool.backends {
+                if !ids.insert(&b.id) {
+                    return Err(invalid(format!(
+                        "duplicate backend id across canary pools: {}",
+                        b.id
+                    )));
+                }
+            }
+        }
 
         if self.rate_limit.rate_per_sec <= 0.0 {
             return Err(invalid("rate_limit.rate_per_sec must be positive".into()));
@@ -912,6 +954,30 @@ impl ListenerConfig {
                         ));
                     }
                 }
+                let mut canary_percent_total: u32 = 0;
+                for pool in &self.canary {
+                    if pool.backends.is_empty() {
+                        return Err(invalid(
+                            "each [[listeners.canary]] needs at least one backend".into(),
+                        ));
+                    }
+                    if pool.health_check.path.is_none() {
+                        return Err(invalid(
+                            "each [[listeners.canary]] needs health_check.path, same as the listener itself".into(),
+                        ));
+                    }
+                    if pool.percent == 0 || pool.percent > 99 {
+                        return Err(invalid(
+                            "each [[listeners.canary]] percent must be between 1 and 99".into(),
+                        ));
+                    }
+                    canary_percent_total += pool.percent as u32;
+                }
+                if canary_percent_total > 99 {
+                    return Err(invalid(
+                        "the sum of every [[listeners.canary]] percent must be at most 99, leaving the listener's own backends at least 1%".into(),
+                    ));
+                }
             }
             Protocol::Tcp => {
                 if self.health_check.path.is_some() {
@@ -939,6 +1005,12 @@ impl ListenerConfig {
                 if !self.routes.is_empty() {
                     return Err(invalid(
                         "routes is an http-only setting -- a tcp listener has no path or Host to route on"
+                            .into(),
+                    ));
+                }
+                if !self.canary.is_empty() {
+                    return Err(invalid(
+                        "canary is an http-only setting -- a tcp listener has no request identity to split traffic by"
                             .into(),
                     ));
                 }
@@ -1391,6 +1463,107 @@ mod tests {
         // collision should trip validation.
         let second_route = ROUTE.replace("path_prefix = \"/api\"", "path_prefix = \"/other\"");
         let text = with_route(&format!("{ROUTE}{second_route}"));
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("duplicate"));
+    }
+
+    const CANARY: &str = r#"
+
+          [[listeners.canary]]
+          percent = 5
+
+            [[listeners.canary.backends]]
+            id = "web-canary"
+            address = "127.0.0.1:9201"
+
+            [listeners.canary.health_check]
+            path = "/health"
+            interval_ms = 2000
+            timeout_ms = 500
+            failure_threshold = 3
+            cooldown_ms = 5000
+
+            [listeners.canary.load_balancing]
+            strategy = "round_robin"
+"#;
+
+    #[test]
+    fn canary_defaults_to_empty() {
+        let cfg = Config::parse(VALID).expect("valid config should parse");
+        assert!(cfg.listeners[0].canary.is_empty());
+    }
+
+    #[test]
+    fn parses_a_configured_canary_pool() {
+        let cfg = Config::parse(&with_route(CANARY)).expect("valid config should parse");
+        let pool = &cfg.listeners[0].canary[0];
+        assert_eq!(pool.percent, 5);
+        assert_eq!(pool.backends.len(), 1);
+        assert_eq!(pool.backends[0].id, "web-canary");
+    }
+
+    #[test]
+    fn rejects_canary_on_tcp_listener() {
+        let anchor = "          [listeners.load_balancing]\n          strategy = \"round_robin\"";
+        let insert_at = VALID.rfind(anchor).unwrap() + anchor.len();
+        let mut text = String::from(&VALID[..insert_at]);
+        text.push_str(CANARY);
+        text.push_str(&VALID[insert_at..]);
+
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("canary"),
+            "error should name canary, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_canary_pool_with_no_backends() {
+        let text = with_route(CANARY).replace(
+            "[[listeners.canary.backends]]\n            id = \"web-canary\"\n            address = \"127.0.0.1:9201\"\n\n",
+            "",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("backend"));
+    }
+
+    #[test]
+    fn rejects_a_canary_pool_with_no_health_check_path() {
+        let text = with_route(CANARY).replace("path = \"/health\"\n            ", "");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("health_check"));
+    }
+
+    #[test]
+    fn rejects_a_canary_percent_of_zero() {
+        let text = with_route(CANARY).replace("percent = 5", "percent = 0");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("percent"));
+    }
+
+    #[test]
+    fn rejects_a_canary_percent_over_99() {
+        let text = with_route(CANARY).replace("percent = 5", "percent = 100");
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("percent"));
+    }
+
+    #[test]
+    fn rejects_canary_percentages_summing_over_99() {
+        let second_pool = CANARY
+            .replace("percent = 5", "percent = 96")
+            .replace("id = \"web-canary\"", "id = \"web-canary-2\"");
+        let text = with_route(&format!(
+            "{}{second_pool}",
+            CANARY.replace("percent = 5", "percent = 4")
+        ));
+        let err = Config::parse(&text).unwrap_err();
+        assert!(format!("{err}").contains("percent"));
+    }
+
+    #[test]
+    fn rejects_duplicate_backend_id_between_default_and_a_canary_pool() {
+        let text = with_route(CANARY).replace("id = \"web-canary\"", "id = \"web1\"");
         let err = Config::parse(&text).unwrap_err();
         assert!(format!("{err}").contains("duplicate"));
     }

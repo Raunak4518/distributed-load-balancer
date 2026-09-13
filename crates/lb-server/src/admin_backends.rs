@@ -41,10 +41,11 @@ pub fn extension(reload: Arc<ReloadState>) -> lb_metrics::AdminExtension {
 }
 
 /// Every pool this listener holds: the default one, plus one per
-/// `[[listeners.routes]]` rule (always none for a TCP listener). `drain`/
-/// `undrain` search across all of them by id -- safe because
-/// `Config::validate()` requires every backend id on a listener to be
-/// unique across its default backends and every route's.
+/// `[[listeners.routes]]` rule and one per `[[listeners.canary]]` pool
+/// (always none of either for a TCP listener). `drain`/`undrain` search
+/// across all of them by id -- safe because `Config::validate()` requires
+/// every backend id on a listener to be unique across its default backends,
+/// every route's, and every canary pool's.
 fn pools_for(reload: &ReloadState, listener: &str) -> Option<Vec<(String, Arc<BackendPool>)>> {
     match reload.listeners.get(listener)? {
         ListenerReloadHandle::Http(ctx) => {
@@ -55,6 +56,12 @@ fn pools_for(reload: &ReloadState, listener: &str) -> Option<Vec<(String, Arc<Ba
                     .iter()
                     .enumerate()
                     .map(|(i, r)| (route_label(i, &r.path_prefix, &r.host), Arc::clone(&r.pool))),
+            );
+            pools.extend(
+                ctx.canary
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (canary_label(i, c.percent), Arc::clone(&c.pool))),
             );
             Some(pools)
         }
@@ -71,6 +78,10 @@ fn route_label(idx: usize, path_prefix: &Option<String>, host: &Option<String>) 
         (None, Some(h)) => format!("route:{idx} (host={h})"),
         (None, None) => format!("route:{idx}"),
     }
+}
+
+fn canary_label(idx: usize, percent: u8) -> String {
+    format!("canary:{idx} ({percent}%)")
 }
 
 fn handle(req: &Request<Incoming>, reload: &ReloadState) -> Response<Full<Bytes>> {

@@ -39,6 +39,15 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// on that path -- resolving "no match" against an empty `Vec` is one
     /// `is_empty()` check.
     pub routes: Vec<CompiledRoute>,
+    /// Weighted traffic-split / canary pools -- see `resolve_default_or_canary_pool`.
+    /// Consulted only for a request that matched no rule in `routes` above;
+    /// empty for a listener with no `[[listeners.canary]]`, costing one
+    /// `is_empty()` check on that path, same as `routes`.
+    pub canary: Vec<CompiledCanaryPool>,
+    /// Deterministic cursor for `canary`'s weighted roll -- see
+    /// `resolve_default_or_canary_pool`. Never consulted when `canary` is
+    /// empty.
+    pub canary_cursor: std::sync::atomic::AtomicUsize,
     /// Session affinity via a `Set-Cookie` naming the backend a client last
     /// landed on -- see `crate::sticky`'s module docs. Listener-level, so it
     /// applies uniformly to `pool`/`balancer` above and to every entry in
@@ -145,6 +154,19 @@ pub struct CompiledRoute {
     pub balancer: Arc<dyn LoadBalancer>,
 }
 
+/// One `[[listeners.canary]]` pool -- see `ProxyContext::canary`. Mirrors
+/// `CompiledRoute` minus `path_prefix`/`host` (a canary pool is selected by
+/// a weighted roll, not by matching anything about the request) plus
+/// `percent`.
+pub struct CompiledCanaryPool {
+    /// Absolute percentage (1-99) of this listener's total request volume
+    /// that matched no route -- not the same unit as a backend's own
+    /// `weight`, which biases selection *within* one pool.
+    pub percent: u8,
+    pub pool: Arc<BackendPool>,
+    pub balancer: Arc<dyn LoadBalancer>,
+}
+
 /// `path` must be the path component alone (no query string) -- a route's
 /// `path_prefix` is about where a request is going, not what it carries in
 /// its query, and query strings can otherwise produce surprising matches
@@ -173,6 +195,55 @@ fn resolve_route<'a, R: RateLimiter, C: Clock>(
 ) -> Option<&'a CompiledRoute> {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     ctx.routes.iter().find(|r| route_matches(r, path, host))
+}
+
+/// Chooses the default `pool`/`balancer` or one of `ctx.canary`'s pools, for
+/// a request that matched no `[[listeners.routes]]` rule -- a route match
+/// always wins outright and never reaches this function.
+///
+/// `sticky_pin`, when present, is checked *before* rolling the weighted
+/// split: if it names a backend that structurally belongs to one of these
+/// pools (regardless of that specific backend's current health -- exactly
+/// the same "pin the pool, let `balancer.pick` handle an unhealthy pinned
+/// backend within it" split `handle`'s retry loop already relies on), that
+/// pool is used directly, with no roll. This is what keeps one client's
+/// whole session on whichever pool (default or canary) it first landed in,
+/// rather than re-rolling the split on every request the way a plain
+/// weighted-random pick would.
+///
+/// The roll itself is a deterministic `AtomicUsize` cursor mod 100 (same
+/// pattern as `lb_balancer::RoundRobin`'s own cursor), bucketed by
+/// cumulative `percent` -- exact long-run convergence to the configured
+/// split, no `rand` dependency.
+fn resolve_default_or_canary_pool<'a, R: RateLimiter, C: Clock>(
+    ctx: &'a ProxyContext<R, C>,
+    sticky_pin: Option<&BackendId>,
+) -> (&'a Arc<BackendPool>, &'a Arc<dyn LoadBalancer>) {
+    if ctx.canary.is_empty() {
+        return (&ctx.pool, &ctx.balancer);
+    }
+    if let Some(id) = sticky_pin {
+        if ctx.pool.all_backend_ids().contains(id) {
+            return (&ctx.pool, &ctx.balancer);
+        }
+        for c in &ctx.canary {
+            if c.pool.all_backend_ids().contains(id) {
+                return (&c.pool, &c.balancer);
+            }
+        }
+    }
+    let bucket = ctx
+        .canary_cursor
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        % 100;
+    let mut cumulative: u32 = 0;
+    for c in &ctx.canary {
+        cumulative += c.percent as u32;
+        if (bucket as u32) < cumulative {
+            return (&c.pool, &c.balancer);
+        }
+    }
+    (&ctx.pool, &ctx.balancer)
 }
 
 /// Sampled per-request access logging.
@@ -510,15 +581,29 @@ where
         ctx.metrics.cache_miss.inc();
     }
 
+    // Read from the request head, before the body is consumed below --
+    // cheap, and needed here (not just at its other use site further down)
+    // so `resolve_default_or_canary_pool` can pin a returning client to
+    // whichever pool (default or canary) their last session landed in. Used
+    // again, unchanged, by the retry loop below: only the first attempt
+    // trusts it, since a pin that just failed must not be retried against
+    // the same broken backend.
+    let sticky_pin = ctx
+        .sticky
+        .as_ref()
+        .and_then(|s| sticky::read_sticky_backend(req.headers(), &s.cookie_name));
+
     // Resolved once per request and used for everything below -- the
     // default `pool`/`balancer` for a listener with no `[[listeners.routes]]`
     // or no matching rule, otherwise the matched route's. `path()` alone
     // (never `path_and_query()`): a route's `path_prefix` is about where a
-    // request is going, not what it carries in its query string.
+    // request is going, not what it carries in its query string. A route
+    // match always wins outright; only the fallback case is subject to
+    // `[[listeners.canary]]`'s weighted split.
     let route = resolve_route(&ctx, req.uri().path(), req.headers());
     let (pool, balancer): (&Arc<BackendPool>, &Arc<dyn LoadBalancer>) = match route {
         Some(r) => (&r.pool, &r.balancer),
-        None => (&ctx.pool, &ctx.balancer),
+        None => resolve_default_or_canary_pool(&ctx, sticky_pin.as_ref()),
     };
 
     // CircuitBreaker's Open -> HalfOpen transition is evaluated lazily inside
@@ -582,14 +667,6 @@ where
             ));
         }
     };
-
-    // Read once, used only on the first attempt below -- a pin that just
-    // failed must not be retried against the same broken backend, so a
-    // retry always falls back to `balancer.pick` regardless of the cookie.
-    let sticky_pin = ctx
-        .sticky
-        .as_ref()
-        .and_then(|s| sticky::read_sticky_backend(&parts.headers, &s.cookie_name));
 
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     for attempt in 0..2u8 {
@@ -980,6 +1057,8 @@ mod tests {
             balancer: Arc::new(NoBackend), // would return None if reached; proves we short-circuit
             pool: empty_pool(),
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1011,6 +1090,8 @@ mod tests {
             balancer: Arc::new(NoBackend),
             pool: empty_pool(),
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1051,6 +1132,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1086,6 +1169,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1127,6 +1212,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1176,6 +1263,8 @@ mod tests {
             balancer: Arc::new(PreferFirstEligible),
             pool: pool.clone(),
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1229,6 +1318,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1282,6 +1373,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1435,6 +1528,8 @@ mod tests {
                 pool: route_pool,
                 balancer: Arc::new(FixedPick(route_backend.id.clone())),
             }],
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1532,6 +1627,8 @@ mod tests {
                     balancer: Arc::new(FixedPick(second_backend.id.clone())),
                 },
             ],
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1557,6 +1654,116 @@ mod tests {
         assert_eq!(resp.body(), "first");
     }
 
+    /// `resolve_default_or_canary_pool` unit tests -- called directly rather
+    /// than through `run_through_proxy_at`, since nothing here forwards a
+    /// request and these pools' addresses are never dialed.
+    fn ctx_with_canary(canary: Vec<CompiledCanaryPool>) -> ProxyContext<AlwaysAllow, FakeClock> {
+        let default_backend = Backend::new("default-1", "127.0.0.1:9301".parse().unwrap(), 1, None);
+        ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(default_backend.id.clone())),
+            pool: Arc::new(BackendPool::new(vec![default_backend])),
+            routes: Vec::new(),
+            canary,
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        }
+    }
+
+    fn canary_pool(id: &str, port: u16, percent: u8) -> CompiledCanaryPool {
+        let backend = Backend::new(id, format!("127.0.0.1:{port}").parse().unwrap(), 1, None);
+        CompiledCanaryPool {
+            percent,
+            pool: Arc::new(BackendPool::new(vec![backend.clone()])),
+            balancer: Arc::new(FixedPick(backend.id)),
+        }
+    }
+
+    #[test]
+    fn no_canary_configured_always_uses_the_default_pool() {
+        let ctx = ctx_with_canary(Vec::new());
+        let (pool, _) = resolve_default_or_canary_pool(&ctx, None);
+        assert!(Arc::ptr_eq(pool, &ctx.pool));
+    }
+
+    #[test]
+    fn weighted_roll_converges_exactly_to_the_configured_percentage() {
+        let ctx = ctx_with_canary(vec![canary_pool("canary-1", 9302, 30)]);
+        let mut canary_hits = 0;
+        let mut default_hits = 0;
+        for _ in 0..100 {
+            let (pool, _) = resolve_default_or_canary_pool(&ctx, None);
+            if Arc::ptr_eq(pool, &ctx.canary[0].pool) {
+                canary_hits += 1;
+            } else if Arc::ptr_eq(pool, &ctx.pool) {
+                default_hits += 1;
+            }
+        }
+        assert_eq!(canary_hits, 30);
+        assert_eq!(default_hits, 70);
+    }
+
+    #[test]
+    fn sticky_pin_naming_a_canary_backend_returns_that_pool_without_rolling() {
+        let ctx = ctx_with_canary(vec![canary_pool("canary-1", 9303, 5)]);
+        let pinned = ctx.canary[0].pool.all_backend_ids()[0].clone();
+
+        let (pool, _) = resolve_default_or_canary_pool(&ctx, Some(&pinned));
+
+        assert!(Arc::ptr_eq(pool, &ctx.canary[0].pool));
+        assert_eq!(
+            ctx.canary_cursor.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a pinned pool must not consume a roll slot"
+        );
+    }
+
+    #[test]
+    fn sticky_pin_naming_the_default_pool_returns_it_without_rolling() {
+        let ctx = ctx_with_canary(vec![canary_pool("canary-1", 9304, 99)]);
+        let pinned = ctx.pool.all_backend_ids()[0].clone();
+
+        let (pool, _) = resolve_default_or_canary_pool(&ctx, Some(&pinned));
+
+        assert!(Arc::ptr_eq(pool, &ctx.pool));
+        assert_eq!(
+            ctx.canary_cursor.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn sticky_pin_naming_an_unknown_backend_falls_through_to_a_fresh_roll() {
+        let ctx = ctx_with_canary(vec![canary_pool("canary-1", 9305, 5)]);
+        let unknown = BackendId::new("nobody-here");
+
+        resolve_default_or_canary_pool(&ctx, Some(&unknown));
+
+        assert_eq!(
+            ctx.canary_cursor.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unrecognised pin must roll fresh, same as no pin at all"
+        );
+    }
+
     /// Builds a `ProxyContext` with two backends and `balancer` always
     /// wanting `algorithm_backend` -- the fixture every sticky-cookie test
     /// below starts from, so a pin naming the *other* backend can prove it
@@ -1577,6 +1784,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend_b.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky,
             cache: None,
             waf: None,
@@ -1747,6 +1956,8 @@ mod tests {
             balancer: Arc::new(PanicIfPicked),
             pool: empty_pool(),
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: Some(cache),
             waf: None,
@@ -1790,6 +2001,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: Some(test_cache()),
             waf: None,
@@ -1829,6 +2042,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: Some(test_cache()),
             waf: None,
@@ -1867,6 +2082,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -1902,6 +2119,8 @@ mod tests {
             balancer: Arc::new(PanicIfPicked),
             pool: empty_pool(),
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: Some(WafMode::Block),
@@ -1944,6 +2163,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: Some(WafMode::Log),
@@ -1985,6 +2206,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -2106,6 +2329,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,
@@ -2166,6 +2391,8 @@ mod tests {
             balancer: Arc::new(FixedPick(backend.id.clone())),
             pool,
             routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
             sticky: None,
             cache: None,
             waf: None,

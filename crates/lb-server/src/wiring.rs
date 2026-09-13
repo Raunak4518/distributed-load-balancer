@@ -339,6 +339,9 @@ pub fn build_app(
         for route in &core.routes {
             pools.push(Arc::clone(&route.pool));
         }
+        for pool in &core.canary {
+            pools.push(Arc::clone(&pool.pool));
+        }
         let tasks = spawn_listener_tasks(lc, &core, &metrics);
         reload_tasks.insert(lc.name.clone(), tasks);
 
@@ -461,6 +464,12 @@ pub(crate) struct ListenerCore {
     /// default set, and so `build_app` can add every route's pool to the
     /// readiness check.
     pub(crate) routes: Vec<RoutePool>,
+    /// One entry per `[[listeners.canary]]` pool, in declaration order --
+    /// always empty for a TCP listener (canary is HTTP-only, rejected at
+    /// config validation for `Protocol::Tcp`). Same role as `routes` above:
+    /// lets `spawn_listener_tasks` spawn each pool's own health checkers and
+    /// `build_app` add each pool to the readiness check.
+    pub(crate) canary: Vec<CanaryPool>,
 }
 
 /// One `[[listeners.routes]]` rule's built pool -- see `ListenerCore::routes`.
@@ -473,6 +482,19 @@ pub(crate) struct RoutePool {
     /// A route's own `health_check`, independent of the listener's default
     /// one -- a route may probe a different path/interval than the backends
     /// it falls back to.
+    pub(crate) health_check: HealthCheckConfig,
+}
+
+/// One `[[listeners.canary]]` pool's built pool -- see `ListenerCore::canary`.
+/// Mirrors `RoutePool` exactly: no `percent` here, for the same reason
+/// `RoutePool` carries no `path_prefix`/`host` -- this struct exists only for
+/// health-checker spawning and the readiness check, neither of which needs
+/// it. `percent` lives on `lb_proxy::CompiledCanaryPool` instead, the only
+/// place it's ever consulted (request-time pool selection, and the admin
+/// API's label, which reads it from the same live `ProxyContext`).
+pub(crate) struct CanaryPool {
+    pub(crate) backends: Vec<Backend>,
+    pub(crate) pool: Arc<BackendPool>,
     pub(crate) health_check: HealthCheckConfig,
 }
 
@@ -523,10 +545,25 @@ pub(crate) fn build_listener_core(
             (r, route_backends, route_pool)
         })
         .collect();
+    // Same construction as `route_pools` above, for `[[listeners.canary]]`.
+    let canary_pools: Vec<(&lb_core::CanaryPoolConfig, Vec<Backend>, Arc<BackendPool>)> = lc
+        .canary
+        .iter()
+        .map(|c| {
+            let canary_backends: Vec<Backend> = c
+                .backends
+                .iter()
+                .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
+                .collect();
+            let canary_pool = Arc::new(BackendPool::new(canary_backends.clone()));
+            (c, canary_backends, canary_pool)
+        })
+        .collect();
     let all_backends = || {
         backends
             .iter()
             .chain(route_pools.iter().flat_map(|(_, bs, _)| bs.iter()))
+            .chain(canary_pools.iter().flat_map(|(_, bs, _)| bs.iter()))
     };
 
     // Pins the L7 forwarding client's TCP dial to each backend's configured
@@ -570,6 +607,18 @@ pub(crate) fn build_listener_core(
                 CircuitBreaker::new(
                     route.health_check.failure_threshold,
                     Duration::from_millis(route.health_check.cooldown_ms),
+                    SystemClock,
+                ),
+            );
+        }
+    }
+    for (canary, canary_backends, _) in &canary_pools {
+        for b in canary_backends {
+            circuit_breakers.insert(
+                b.id.clone(),
+                CircuitBreaker::new(
+                    canary.health_check.failure_threshold,
+                    Duration::from_millis(canary.health_check.cooldown_ms),
                     SystemClock,
                 ),
             );
@@ -652,11 +701,24 @@ pub(crate) fn build_listener_core(
                     balancer: build_balancer(&route.load_balancing.strategy),
                 })
                 .collect();
+            // One `CompiledCanaryPool` per `[[listeners.canary]]` pool, in
+            // declaration order -- `handle`'s `resolve_default_or_canary_pool`
+            // walks this `Vec` only for a request that matched no route.
+            let compiled_canary: Vec<lb_proxy::CompiledCanaryPool> = canary_pools
+                .iter()
+                .map(|(canary, _, canary_pool)| lb_proxy::CompiledCanaryPool {
+                    percent: canary.percent,
+                    pool: Arc::clone(canary_pool),
+                    balancer: build_balancer(&canary.load_balancing.strategy),
+                })
+                .collect();
             ListenerCoreKind::Http(Box::new(ProxyContext {
                 rate_limiter,
                 balancer: build_balancer(&lc.load_balancing.strategy),
                 pool: Arc::clone(&pool),
                 routes: compiled_routes,
+                canary: compiled_canary,
+                canary_cursor: std::sync::atomic::AtomicUsize::new(0),
                 // Same fact `hsts_max_age_secs` below is gated on -- a
                 // sticky cookie routes traffic, so it earns the same
                 // `Secure` treatment as HSTS earns its own header.
@@ -736,12 +798,21 @@ pub(crate) fn build_listener_core(
             health_check: route.health_check.clone(),
         })
         .collect();
+    let canary: Vec<CanaryPool> = canary_pools
+        .into_iter()
+        .map(|(canary, backends, pool)| CanaryPool {
+            backends,
+            pool,
+            health_check: canary.health_check.clone(),
+        })
+        .collect();
 
     ListenerCore {
         backends,
         pool,
         kind,
         routes,
+        canary,
     }
 }
 
@@ -805,6 +876,18 @@ pub(crate) fn spawn_listener_tasks(
                     &route.health_check,
                     &route.backends,
                     &route.pool,
+                    &mut tasks,
+                    metrics,
+                    &transport,
+                );
+            }
+            // Same reasoning as routes above, for `[[listeners.canary]]`.
+            for canary in &core.canary {
+                spawn_health_checkers(
+                    &lc.name,
+                    &canary.health_check,
+                    &canary.backends,
+                    &canary.pool,
                     &mut tasks,
                     metrics,
                     &transport,

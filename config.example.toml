@@ -319,6 +319,40 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
 # only in which static backends and which load-balancing strategy/
 # health-check apply.
 
+# ── Weighted traffic-split / canary pools (optional, HTTP-only) ─────────
+# Splits traffic that matched no [[listeners.routes]] rule above across one
+# or more independently health-checked, independently load-balanced pools
+# by percentage -- for holding back a slice of traffic to a new backend
+# version. Each pool's percent is an absolute share of this listener's
+# total request volume (not the same unit as a backend's own weight above,
+# which only biases selection *within* one pool); the sum across every
+# [[listeners.canary]] entry must be at most 99, leaving this listener's
+# own backends above at least 1% so they're never configured but silently
+# unreachable.
+#
+# [[listeners.canary]]
+#   percent = 5
+#
+#   [[listeners.canary.backends]]
+#   id = "web-canary"
+#   address = "127.0.0.1:9201"
+#
+#   [listeners.canary.health_check]
+#   path = "/health"
+#   interval_ms = 2000
+#   timeout_ms = 500
+#   failure_threshold = 3
+#   cooldown_ms = 5000
+#
+#   [listeners.canary.load_balancing]
+#   strategy = "round_robin"
+#
+# When [listeners.sticky] below is also configured, a client's pinned
+# backend id determines which pool (default or canary) they stay on for
+# the rest of their session -- the split is only rolled fresh for a client
+# with no valid pin, not on every request, so one client's whole session
+# stays on one version.
+
 # ── Sticky-cookie session affinity (optional, HTTP-only) ────────────────
 # Once a client's request lands on a backend, sets a cookie naming it and
 # prefers that backend on the client's next request -- nginx's commercial

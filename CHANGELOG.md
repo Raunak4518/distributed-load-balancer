@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`[[listeners.canary]]` (HTTP listeners)**: weighted traffic-split /
+  canary pools -- holds back a percentage of the request volume that
+  matched no `[[listeners.routes]]` rule for one or more independently
+  health-checked, independently load-balanced pools, each with its own
+  `percent` (summing to at most 99, leaving the listener's own backends at
+  least 1%). Distinct from a backend's own `weight`, which only biases
+  selection *within* one pool. Selection is a deterministic `AtomicUsize`
+  cursor mod 100 (no `rand` dependency), not random, for exact convergence
+  to the configured split. When `[listeners.sticky]` is also configured, a
+  returning client's pinned backend id is checked for pool membership
+  *before* rolling the split -- a client whose session already landed in
+  the canary pool stays there for the rest of its session instead of
+  re-rolling on every request, which is the concrete thing nginx/HAProxy/
+  Envoy don't give you for free. New `GET /backends` entries labeled
+  `canary:{n} ({percent}%)`.
 - **`[listeners.client_tcp_keepalive]` / `[listeners.backend_tcp_keepalive]`**
   (either listener type): `SO_KEEPALIVE`/`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/
   `TCP_KEEPCNT` tuning -- nginx's `so_keepalive`/`proxy_socket_keepalive`,
