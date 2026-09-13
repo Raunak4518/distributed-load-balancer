@@ -21,6 +21,8 @@ pub struct CounterStore {
 
 const MAX_TRACKED_KEYS: usize = 100_000;
 
+const FUTURE_SKEW_TOLERANCE_SECS: u64 = 5;
+
 #[derive(Default)]
 struct KeyCounts {
     /// node_id -> (epoch_second -> count)
@@ -109,33 +111,38 @@ impl CounterStore {
     /// re-receiving the same update must not inflate the count.
     ///
     /// `now_secs` bounds two things a peer's message cannot be trusted to
-    /// bound itself: an `epoch` after `now_secs` is dropped (a node can only
-    /// ever report a count for a second that has already happened, and a
-    /// future-dated cell would otherwise never be reclaimed by `prune`,
-    /// since its cutoff comparison is relative to whatever `now_secs` is at
-    /// prune time), and a brand-new `key` is dropped once this store already
-    /// tracks `MAX_TRACKED_KEYS`, mirroring `lb_ratelimit::Gcra`'s own key
-    /// cap for the same reason: an attacker's key set must not be free to
-    /// grow this node's memory without bound.
+    /// bound itself: an `epoch` more than `FUTURE_SKEW_TOLERANCE_SECS` ahead
+    /// of `now_secs` is dropped (a node can only ever report a count for a
+    /// second at or near the present, and an unbounded future-dated cell
+    /// would otherwise never be reclaimed by `prune`, since its cutoff
+    /// comparison is relative to whatever `now_secs` is at prune time --
+    /// the tolerance absorbs ordinary clock skew between real nodes, which
+    /// `snapshot_message`'s own `now` and this node's `now_secs` at merge
+    /// time are never perfectly identical), and a brand-new `key` is
+    /// dropped once this store already tracks `MAX_TRACKED_KEYS`, mirroring
+    /// `lb_ratelimit::Gcra`'s own key cap for the same reason: an
+    /// attacker's key set must not be free to grow this node's memory
+    /// without bound.
     pub fn merge(&self, key: &str, node_id: &str, buckets: &[(u64, u64)], now_secs: u64) {
-        if !buckets.iter().any(|(epoch, _)| *epoch <= now_secs) {
+        let max_epoch = now_secs + FUTURE_SKEW_TOLERANCE_SECS;
+        if !buckets.iter().any(|(epoch, _)| *epoch <= max_epoch) {
             return;
         }
         if let Some(mut counts) = self.keys.get_mut(key) {
-            Self::merge_into(&mut counts, node_id, buckets, now_secs);
+            Self::merge_into(&mut counts, node_id, buckets, max_epoch);
             return;
         }
         if self.keys.len() >= MAX_TRACKED_KEYS {
             return;
         }
         let mut counts = self.keys.entry(key.to_string()).or_default();
-        Self::merge_into(&mut counts, node_id, buckets, now_secs);
+        Self::merge_into(&mut counts, node_id, buckets, max_epoch);
     }
 
-    fn merge_into(counts: &mut KeyCounts, node_id: &str, buckets: &[(u64, u64)], now_secs: u64) {
+    fn merge_into(counts: &mut KeyCounts, node_id: &str, buckets: &[(u64, u64)], max_epoch: u64) {
         if let Some(node_buckets) = counts.per_node.get_mut(node_id) {
             for (epoch, count) in buckets {
-                if *epoch > now_secs {
+                if *epoch > max_epoch {
                     continue;
                 }
                 let slot = node_buckets.entry(*epoch).or_insert(0);
@@ -143,12 +150,12 @@ impl CounterStore {
             }
             return;
         }
-        if !buckets.iter().any(|(epoch, _)| *epoch <= now_secs) {
+        if !buckets.iter().any(|(epoch, _)| *epoch <= max_epoch) {
             return;
         }
         let node_buckets = counts.per_node.entry(node_id.to_string()).or_default();
         for (epoch, count) in buckets {
-            if *epoch > now_secs {
+            if *epoch > max_epoch {
                 continue;
             }
             let slot = node_buckets.entry(*epoch).or_insert(0);
@@ -320,6 +327,17 @@ mod tests {
         assert_eq!(store.key_count(), 1);
         assert_eq!(store.total_in_window("fresh", NOW), 5);
         assert_eq!(store.total_in_window("stale", NOW), 0);
+    }
+
+    /// A peer's clock running a couple of seconds ahead of ours (ordinary,
+    /// unsynchronized real-world skew -- not an attack) must not have its
+    /// admitted counts silently dropped at merge time, or the cluster budget
+    /// under-counts a perfectly legitimate peer.
+    #[test]
+    fn a_cell_within_ordinary_clock_skew_is_still_merged() {
+        let store = CounterStore::new(10);
+        store.merge("k", "n1", &[(NOW + 2, 5)], NOW);
+        assert_eq!(store.total_in_window("k", NOW + 2), 5);
     }
 
     #[test]
