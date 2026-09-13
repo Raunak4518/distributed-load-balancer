@@ -54,8 +54,10 @@ impl<C: Clock> ClusterNode<C> {
         if msg.node_id == self.node_id {
             return MergeOutcome::OwnNodeIdEcho;
         }
+        let now = self.clock.unix_secs();
         for entry in &msg.entries {
-            self.store.merge(&entry.key, &msg.node_id, &entry.buckets);
+            self.store
+                .merge(&entry.key, &msg.node_id, &entry.buckets, now);
         }
         MergeOutcome::Merged
     }

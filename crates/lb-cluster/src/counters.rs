@@ -19,6 +19,8 @@ pub struct CounterStore {
     keys: DashMap<String, KeyCounts>,
 }
 
+const MAX_TRACKED_KEYS: usize = 100_000;
+
 #[derive(Default)]
 struct KeyCounts {
     /// node_id -> (epoch_second -> count)
@@ -105,22 +107,50 @@ impl CounterStore {
 
     /// Merges a peer's view of its own cells. Per-cell `max`, never sum:
     /// re-receiving the same update must not inflate the count.
-    pub fn merge(&self, key: &str, node_id: &str, buckets: &[(u64, u64)]) {
+    ///
+    /// `now_secs` bounds two things a peer's message cannot be trusted to
+    /// bound itself: an `epoch` after `now_secs` is dropped (a node can only
+    /// ever report a count for a second that has already happened, and a
+    /// future-dated cell would otherwise never be reclaimed by `prune`,
+    /// since its cutoff comparison is relative to whatever `now_secs` is at
+    /// prune time), and a brand-new `key` is dropped once this store already
+    /// tracks `MAX_TRACKED_KEYS`, mirroring `lb_ratelimit::Gcra`'s own key
+    /// cap for the same reason: an attacker's key set must not be free to
+    /// grow this node's memory without bound.
+    pub fn merge(&self, key: &str, node_id: &str, buckets: &[(u64, u64)], now_secs: u64) {
+        if !buckets.iter().any(|(epoch, _)| *epoch <= now_secs) {
+            return;
+        }
         if let Some(mut counts) = self.keys.get_mut(key) {
-            Self::merge_into(&mut counts, node_id, buckets);
+            Self::merge_into(&mut counts, node_id, buckets, now_secs);
+            return;
+        }
+        if self.keys.len() >= MAX_TRACKED_KEYS {
             return;
         }
         let mut counts = self.keys.entry(key.to_string()).or_default();
-        Self::merge_into(&mut counts, node_id, buckets);
+        Self::merge_into(&mut counts, node_id, buckets, now_secs);
     }
 
-    fn merge_into(counts: &mut KeyCounts, node_id: &str, buckets: &[(u64, u64)]) {
-        let node_buckets = if let Some(existing) = counts.per_node.get_mut(node_id) {
-            existing
-        } else {
-            counts.per_node.entry(node_id.to_string()).or_default()
-        };
+    fn merge_into(counts: &mut KeyCounts, node_id: &str, buckets: &[(u64, u64)], now_secs: u64) {
+        if let Some(node_buckets) = counts.per_node.get_mut(node_id) {
+            for (epoch, count) in buckets {
+                if *epoch > now_secs {
+                    continue;
+                }
+                let slot = node_buckets.entry(*epoch).or_insert(0);
+                *slot = (*slot).max(*count);
+            }
+            return;
+        }
+        if !buckets.iter().any(|(epoch, _)| *epoch <= now_secs) {
+            return;
+        }
+        let node_buckets = counts.per_node.entry(node_id.to_string()).or_default();
         for (epoch, count) in buckets {
+            if *epoch > now_secs {
+                continue;
+            }
             let slot = node_buckets.entry(*epoch).or_insert(0);
             *slot = (*slot).max(*count);
         }
@@ -191,8 +221,8 @@ mod tests {
     #[test]
     fn counts_from_different_nodes_are_summed() {
         let store = CounterStore::new(10);
-        store.merge("k", "n1", &[(NOW, 4)]);
-        store.merge("k", "n2", &[(NOW, 6)]);
+        store.merge("k", "n1", &[(NOW, 4)], NOW);
+        store.merge("k", "n2", &[(NOW, 6)], NOW);
         // Additive across nodes — this is the property Trap 1 in the spec
         // gets wrong by using max.
         assert_eq!(store.total_in_window("k", NOW), 10);
@@ -201,7 +231,7 @@ mod tests {
     #[test]
     fn one_nodes_counts_reduce_anothers_budget() {
         let store = CounterStore::new(10);
-        store.merge("k", "peer", &[(NOW, 9)]);
+        store.merge("k", "peer", &[(NOW, 9)], NOW);
         assert!(store.try_admit("k", "me", NOW, 10)); // 10th request
         assert!(!store.try_admit("k", "me", NOW, 10)); // budget exhausted by peer
     }
@@ -217,8 +247,8 @@ mod tests {
     #[test]
     fn counts_outside_the_window_are_excluded() {
         let store = CounterStore::new(10);
-        store.merge("k", "n1", &[(NOW - 20, 100)]); // long past
-        store.merge("k", "n1", &[(NOW, 2)]);
+        store.merge("k", "n1", &[(NOW - 20, 100)], NOW); // long past
+        store.merge("k", "n1", &[(NOW, 2)], NOW);
         assert_eq!(store.total_in_window("k", NOW), 2);
     }
 
@@ -226,16 +256,16 @@ mod tests {
     fn window_edge_is_inclusive_at_both_ends() {
         let store = CounterStore::new(10);
         // A 10s window covers [NOW-9, NOW].
-        store.merge("k", "n1", &[(NOW - 9, 1), (NOW - 10, 1), (NOW, 1)]);
+        store.merge("k", "n1", &[(NOW - 9, 1), (NOW - 10, 1), (NOW, 1)], NOW);
         assert_eq!(store.total_in_window("k", NOW), 2);
     }
 
     #[test]
     fn merge_is_idempotent() {
         let store = CounterStore::new(10);
-        store.merge("k", "n1", &[(NOW, 5)]);
-        store.merge("k", "n1", &[(NOW, 5)]);
-        store.merge("k", "n1", &[(NOW, 5)]);
+        store.merge("k", "n1", &[(NOW, 5)], NOW);
+        store.merge("k", "n1", &[(NOW, 5)], NOW);
+        store.merge("k", "n1", &[(NOW, 5)], NOW);
         // A duplicated message must not inflate anything — this is why the
         // merge is max and not +=.
         assert_eq!(store.total_in_window("k", NOW), 5);
@@ -244,12 +274,12 @@ mod tests {
     #[test]
     fn merge_is_commutative() {
         let a = CounterStore::new(10);
-        a.merge("k", "n1", &[(NOW, 3)]);
-        a.merge("k", "n2", &[(NOW, 7)]);
+        a.merge("k", "n1", &[(NOW, 3)], NOW);
+        a.merge("k", "n2", &[(NOW, 7)], NOW);
 
         let b = CounterStore::new(10);
-        b.merge("k", "n2", &[(NOW, 7)]);
-        b.merge("k", "n1", &[(NOW, 3)]);
+        b.merge("k", "n2", &[(NOW, 7)], NOW);
+        b.merge("k", "n1", &[(NOW, 3)], NOW);
 
         assert_eq!(a.total_in_window("k", NOW), b.total_in_window("k", NOW));
     }
@@ -259,9 +289,9 @@ mod tests {
         // Out-of-order delivery of the same node's successive counts must
         // converge to the highest, not the last-received.
         let a = CounterStore::new(10);
-        a.merge("k", "n1", &[(NOW, 2)]);
-        a.merge("k", "n1", &[(NOW, 9)]);
-        a.merge("k", "n1", &[(NOW, 5)]); // stale message arriving late
+        a.merge("k", "n1", &[(NOW, 2)], NOW);
+        a.merge("k", "n1", &[(NOW, 9)], NOW);
+        a.merge("k", "n1", &[(NOW, 5)], NOW); // stale message arriving late
 
         assert_eq!(a.total_in_window("k", NOW), 9);
     }
@@ -269,8 +299,8 @@ mod tests {
     #[test]
     fn snapshot_returns_only_our_own_in_window_cells() {
         let store = CounterStore::new(10);
-        store.merge("k", "me", &[(NOW, 2), (NOW - 50, 99)]);
-        store.merge("k", "other", &[(NOW, 7)]);
+        store.merge("k", "me", &[(NOW, 2), (NOW - 50, 99)], NOW);
+        store.merge("k", "other", &[(NOW, 7)], NOW);
 
         let snap = store.snapshot_own("me", NOW);
         assert_eq!(snap.len(), 1);
@@ -281,8 +311,8 @@ mod tests {
     #[test]
     fn prune_drops_out_of_window_cells_and_empty_keys() {
         let store = CounterStore::new(10);
-        store.merge("stale", "n1", &[(NOW - 100, 5)]);
-        store.merge("fresh", "n1", &[(NOW, 5)]);
+        store.merge("stale", "n1", &[(NOW - 100, 5)], NOW);
+        store.merge("fresh", "n1", &[(NOW, 5)], NOW);
         assert_eq!(store.key_count(), 2);
 
         store.prune(NOW);
@@ -290,6 +320,32 @@ mod tests {
         assert_eq!(store.key_count(), 1);
         assert_eq!(store.total_in_window("fresh", NOW), 5);
         assert_eq!(store.total_in_window("stale", NOW), 0);
+    }
+
+    #[test]
+    fn a_future_dated_cell_is_dropped_not_merged() {
+        let store = CounterStore::new(10);
+        store.merge("k", "n1", &[(NOW + 1_000_000, 5)], NOW);
+        assert_eq!(store.key_count(), 0);
+        assert_eq!(store.total_in_window("k", NOW + 1_000_000), 0);
+    }
+
+    #[test]
+    fn a_future_dated_cell_on_an_already_tracked_key_is_still_dropped() {
+        let store = CounterStore::new(10);
+        store.merge("k", "n1", &[(NOW, 3)], NOW);
+        store.merge("k", "n1", &[(NOW + 1_000_000, 5)], NOW);
+        store.prune(NOW + 1_000_000);
+        assert_eq!(store.key_count(), 0);
+    }
+
+    #[test]
+    fn merge_stops_tracking_new_keys_past_the_cap() {
+        let store = CounterStore::new(10);
+        for i in 0..(MAX_TRACKED_KEYS + 10) {
+            store.merge(&format!("k{i}"), "n1", &[(NOW, 1)], NOW);
+        }
+        assert_eq!(store.key_count(), MAX_TRACKED_KEYS);
     }
 
     #[test]
