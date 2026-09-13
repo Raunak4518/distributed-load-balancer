@@ -37,6 +37,12 @@ async fn start(rate_per_sec: f64, burst: u32) -> (SocketAddr, SocketAddr) {
     .unwrap();
     tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(traffic).await;
+    // The traffic and admin listeners bind independently inside `run` --
+    // waiting on one is no guarantee the other is up yet. Every test in
+    // this file scrapes `admin` right after `start()` returns, so without
+    // this a slow/contended CI runner can still see a connection refused on
+    // the admin port even though the traffic port answered fine.
+    support::wait_until_listening(admin).await;
 
     (traffic, admin)
 }

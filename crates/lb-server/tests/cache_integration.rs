@@ -70,6 +70,10 @@ async fn a_repeated_get_is_served_from_cache_without_a_second_backend_hit() {
     let config = Config::parse(&cache_config_toml(admin, &listen.to_string(), backend)).unwrap();
     tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
+    // The traffic and admin listeners bind independently -- waiting on one
+    // is no guarantee the other is up yet, and this test scrapes admin
+    // later.
+    support::wait_until_listening(admin).await;
 
     let client = reqwest::Client::new();
     let first = client
@@ -119,6 +123,7 @@ async fn no_cache_section_means_every_request_reaches_the_backend() {
     .unwrap();
     tokio::spawn(lb_server::run(config, None));
     support::wait_until_listening(listen).await;
+    support::wait_until_listening(admin).await;
 
     let client = reqwest::Client::new();
     client
