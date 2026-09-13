@@ -27,6 +27,15 @@ pub struct CacheEntry {
     pub headers: HeaderMap,
     pub body: Bytes,
     expires_at: Instant,
+    accounted_size: usize,
+}
+
+fn accounted_size(key: &str, headers: &HeaderMap, body_len: usize) -> usize {
+    let headers_len: usize = headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len())
+        .sum();
+    key.len() + headers_len + body_len
 }
 
 /// Builds the cache key for a request: distinguishes virtual hosts sharing a
@@ -153,10 +162,10 @@ impl<C: Clock> ResponseCache<C> {
         body: Bytes,
         ttl: Duration,
     ) {
-        let size = body.len();
-        if size > self.max_entry_bytes {
+        if body.len() > self.max_entry_bytes {
             return;
         }
+        let size = accounted_size(&key, &headers, body.len());
         // A soft cap, not a hard allocator limit: a brief overshoot under
         // concurrent inserts racing this check is acceptable.
         if self.total_bytes.load(Ordering::Relaxed) + size > self.max_total_bytes {
@@ -168,10 +177,11 @@ impl<C: Clock> ResponseCache<C> {
             headers,
             body,
             expires_at,
+            accounted_size: size,
         };
         if let Some(old) = self.entries.insert(key, entry) {
             self.total_bytes
-                .fetch_sub(old.body.len(), Ordering::Relaxed);
+                .fetch_sub(old.accounted_size, Ordering::Relaxed);
         }
         self.total_bytes.fetch_add(size, Ordering::Relaxed);
     }
@@ -179,7 +189,7 @@ impl<C: Clock> ResponseCache<C> {
     fn remove(&self, key: &str) {
         if let Some((_, removed)) = self.entries.remove(key) {
             self.total_bytes
-                .fetch_sub(removed.body.len(), Ordering::Relaxed);
+                .fetch_sub(removed.accounted_size, Ordering::Relaxed);
         }
     }
 
@@ -426,8 +436,8 @@ mod tests {
     #[test]
     fn sweep_expired_reclaims_budget_for_a_full_cache() {
         let clock = FakeClock::new();
-        // Budget for exactly one 5-byte entry.
-        let cache = ResponseCache::new(5, 5, Duration::from_secs(60), clock.clone());
+        // Budget for exactly one entry.
+        let cache = ResponseCache::new(5, 11, Duration::from_secs(60), clock.clone());
         cache.put(
             "first".to_string(),
             StatusCode::OK,
@@ -457,5 +467,26 @@ mod tests {
             Duration::from_secs(10),
         );
         assert!(cache.get("second").is_some());
+    }
+
+    #[test]
+    fn a_zero_length_body_still_counts_toward_the_total_budget() {
+        let cache = ResponseCache::new(1024, 20, Duration::from_secs(60), FakeClock::new());
+        for i in 0..1000 {
+            cache.put(
+                format!("key-{i:016}"),
+                StatusCode::OK,
+                HeaderMap::new(),
+                Bytes::new(),
+                Duration::from_secs(60),
+            );
+        }
+        let stored = (0..1000)
+            .filter(|i| cache.get(&format!("key-{i:016}")).is_some())
+            .count();
+        assert!(
+            stored < 1000,
+            "a zero-length body must not bypass max_total_bytes"
+        );
     }
 }
