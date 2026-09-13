@@ -100,8 +100,12 @@ impl<C: Clock> CircuitBreaker<C> {
 
     pub fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::SeqCst);
-        self.state
-            .store(CircuitState::Closed.as_u8(), Ordering::SeqCst);
+        let _ = self.state.compare_exchange(
+            CircuitState::HalfOpen.as_u8(),
+            CircuitState::Closed.as_u8(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     pub fn record_failure(&self) {
@@ -194,6 +198,17 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
         cb.record_success();
         assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn a_stale_success_while_open_does_not_cancel_the_cooldown() {
+        let (cb, clock) = breaker(1, Duration::from_secs(5));
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
 
     #[test]
