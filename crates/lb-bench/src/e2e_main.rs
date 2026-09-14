@@ -99,6 +99,8 @@ fn write_config(path: &Path, listen: SocketAddr, backends: &[SocketAddr]) {
 name = "web"
 protocol = "http"
 listen = "{listen}"
+max_connections = 1000000
+max_connections_per_ip = 1000000
 
 {backends_toml}
   [listeners.health_check]
