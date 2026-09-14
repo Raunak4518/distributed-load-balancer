@@ -71,7 +71,7 @@ fn breakers_for(pool: &BackendPool) -> HashMap<lb_core::BackendId, CircuitBreake
         .map(|id| {
             (
                 id.clone(),
-                CircuitBreaker::new(3, Duration::from_secs(5), SystemClock),
+                CircuitBreaker::new(3, Duration::from_secs(5), 1, SystemClock),
             )
         })
         .collect()

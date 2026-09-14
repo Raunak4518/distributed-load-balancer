@@ -588,12 +588,22 @@ fn new_or_migrated_breaker(
     id: &BackendId,
     failure_threshold: u32,
     cooldown: Duration,
+    half_open_successes_required: u32,
 ) -> CircuitBreaker<SystemClock> {
     match previous.and_then(|p| p.breaker_snapshot(id)) {
-        Some(snapshot) => {
-            CircuitBreaker::from_snapshot(failure_threshold, cooldown, SystemClock, snapshot)
-        }
-        None => CircuitBreaker::new(failure_threshold, cooldown, SystemClock),
+        Some(snapshot) => CircuitBreaker::from_snapshot(
+            failure_threshold,
+            cooldown,
+            half_open_successes_required,
+            SystemClock,
+            snapshot,
+        ),
+        None => CircuitBreaker::new(
+            failure_threshold,
+            cooldown,
+            half_open_successes_required,
+            SystemClock,
+        ),
     }
 }
 
@@ -694,6 +704,7 @@ pub(crate) fn build_listener_core(
                 &b.id,
                 lc.health_check.failure_threshold,
                 Duration::from_millis(lc.health_check.cooldown_ms),
+                lc.health_check.half_open_successes_required,
             ),
         );
     }
@@ -706,6 +717,7 @@ pub(crate) fn build_listener_core(
                     &b.id,
                     route.health_check.failure_threshold,
                     Duration::from_millis(route.health_check.cooldown_ms),
+                    route.health_check.half_open_successes_required,
                 ),
             );
         }
@@ -719,6 +731,7 @@ pub(crate) fn build_listener_core(
                     &b.id,
                     canary.health_check.failure_threshold,
                     Duration::from_millis(canary.health_check.cooldown_ms),
+                    canary.health_check.half_open_successes_required,
                 ),
             );
         }

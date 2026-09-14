@@ -351,7 +351,7 @@ mod tests {
         for b in &backends {
             circuit_breakers.insert(
                 b.id.clone(),
-                CircuitBreaker::new(1, Duration::from_secs(60), FakeClock::new()),
+                CircuitBreaker::new(1, Duration::from_secs(60), 1, FakeClock::new()),
             );
         }
         Arc::new(TcpContext {

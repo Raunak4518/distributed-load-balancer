@@ -699,6 +699,14 @@ pub struct HealthCheckConfig {
     pub timeout_ms: u64,
     pub failure_threshold: u32,
     pub cooldown_ms: u64,
+    /// Consecutive successes required in `HalfOpen` before the circuit
+    /// closes. Defaults to 1, exactly preserving pre-existing behavior.
+    #[serde(default = "default_half_open_successes_required")]
+    pub half_open_successes_required: u32,
+}
+
+fn default_half_open_successes_required() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -2143,6 +2151,21 @@ mod tests {
         assert_eq!(l.header_read_timeout(), Duration::from_millis(5_000));
         assert_eq!(l.body_read_timeout(), Duration::from_millis(10_000));
         assert_eq!(l.rate_limit.max_tracked_keys, 100_000);
+        assert_eq!(l.health_check.half_open_successes_required, 1);
+    }
+
+    #[test]
+    fn parses_an_explicit_half_open_successes_required() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          half_open_successes_required = 3",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.listeners[0].health_check.half_open_successes_required,
+            3
+        );
     }
 
     #[test]

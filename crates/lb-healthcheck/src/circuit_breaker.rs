@@ -38,6 +38,7 @@ const NOT_OPENED: u64 = u64::MAX;
 pub struct CircuitBreakerSnapshot {
     creation: Instant,
     consecutive_failures: u32,
+    consecutive_successes: u32,
     state: u8,
     opened_at_nanos: u64,
 }
@@ -53,35 +54,46 @@ pub struct CircuitBreaker<C: Clock> {
     creation: Instant,
     failure_threshold: u32,
     cooldown: Duration,
+    half_open_successes_required: u32,
     consecutive_failures: AtomicU32,
+    consecutive_successes: AtomicU32,
     state: AtomicU8,
     opened_at_nanos: AtomicU64,
 }
 
 impl<C: Clock> CircuitBreaker<C> {
-    pub fn new(failure_threshold: u32, cooldown: Duration, clock: C) -> Self {
+    pub fn new(
+        failure_threshold: u32,
+        cooldown: Duration,
+        half_open_successes_required: u32,
+        clock: C,
+    ) -> Self {
         let creation = clock.now();
         CircuitBreaker {
             clock,
             creation,
             failure_threshold,
             cooldown,
+            half_open_successes_required,
             consecutive_failures: AtomicU32::new(0),
+            consecutive_successes: AtomicU32::new(0),
             state: AtomicU8::new(CircuitState::Closed.as_u8()),
             opened_at_nanos: AtomicU64::new(NOT_OPENED),
         }
     }
 
     /// Rebuilds a breaker for the same backend with `failure_threshold`/
-    /// `cooldown` taken fresh (an operator may have just changed either in
-    /// the same config edit that's carrying this state forward) but its live
-    /// state -- Open/HalfOpen/Closed, the failure count, and the cooldown
-    /// clock -- taken from `snapshot`. Used by config reload, so a backend
-    /// mid-cooldown when an unrelated field on its listener changes does not
+    /// `cooldown`/`half_open_successes_required` taken fresh (an operator may
+    /// have just changed any of these in the same config edit that's
+    /// carrying this state forward) but its live state -- Open/HalfOpen/
+    /// Closed, the failure/success counts, and the cooldown clock -- taken
+    /// from `snapshot`. Used by config reload, so a backend mid-cooldown or
+    /// mid-recovery when an unrelated field on its listener changes does not
     /// get a clean slate and go straight back into rotation.
     pub fn from_snapshot(
         failure_threshold: u32,
         cooldown: Duration,
+        half_open_successes_required: u32,
         clock: C,
         snapshot: CircuitBreakerSnapshot,
     ) -> Self {
@@ -90,7 +102,9 @@ impl<C: Clock> CircuitBreaker<C> {
             creation: snapshot.creation,
             failure_threshold,
             cooldown,
+            half_open_successes_required,
             consecutive_failures: AtomicU32::new(snapshot.consecutive_failures),
+            consecutive_successes: AtomicU32::new(snapshot.consecutive_successes),
             state: AtomicU8::new(snapshot.state),
             opened_at_nanos: AtomicU64::new(snapshot.opened_at_nanos),
         }
@@ -102,6 +116,7 @@ impl<C: Clock> CircuitBreaker<C> {
         CircuitBreakerSnapshot {
             creation: self.creation,
             consecutive_failures: self.consecutive_failures.load(Ordering::SeqCst),
+            consecutive_successes: self.consecutive_successes.load(Ordering::SeqCst),
             state: self.state.load(Ordering::SeqCst),
             opened_at_nanos: self.opened_at_nanos.load(Ordering::SeqCst),
         }
@@ -144,12 +159,22 @@ impl<C: Clock> CircuitBreaker<C> {
 
     pub fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::SeqCst);
-        let _ = self.state.compare_exchange(
-            CircuitState::HalfOpen.as_u8(),
-            CircuitState::Closed.as_u8(),
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+        if self.load_state() != CircuitState::HalfOpen {
+            // A success while Closed (nothing to recover from) or Open (see
+            // `a_stale_success_while_open_does_not_cancel_the_cooldown`) has
+            // no further effect.
+            return;
+        }
+        let successes = self.consecutive_successes.fetch_add(1, Ordering::SeqCst) + 1;
+        if successes >= self.half_open_successes_required {
+            let _ = self.state.compare_exchange(
+                CircuitState::HalfOpen.as_u8(),
+                CircuitState::Closed.as_u8(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            self.consecutive_successes.store(0, Ordering::SeqCst);
+        }
     }
 
     pub fn record_failure(&self) {
@@ -183,6 +208,7 @@ impl<C: Clock> CircuitBreaker<C> {
             let nanos = self.clock.now().duration_since(self.creation).as_nanos() as u64;
             self.opened_at_nanos.store(nanos, Ordering::SeqCst);
             self.consecutive_failures.store(0, Ordering::SeqCst);
+            self.consecutive_successes.store(0, Ordering::SeqCst);
         }
     }
 }
@@ -194,9 +220,22 @@ mod tests {
     use std::sync::Arc;
 
     fn breaker(threshold: u32, cooldown: Duration) -> (CircuitBreaker<FakeClock>, FakeClock) {
+        breaker_with_recovery(threshold, cooldown, 1)
+    }
+
+    fn breaker_with_recovery(
+        threshold: u32,
+        cooldown: Duration,
+        half_open_successes_required: u32,
+    ) -> (CircuitBreaker<FakeClock>, FakeClock) {
         let clock = FakeClock::new();
         (
-            CircuitBreaker::new(threshold, cooldown, clock.clone()),
+            CircuitBreaker::new(
+                threshold,
+                cooldown,
+                half_open_successes_required,
+                clock.clone(),
+            ),
             clock,
         )
     }
@@ -245,6 +284,60 @@ mod tests {
     }
 
     #[test]
+    fn stays_half_open_below_the_required_consecutive_successes() {
+        let (cb, clock) = breaker_with_recovery(1, Duration::from_secs(5), 3);
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        cb.record_success();
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen,
+            "only 2 of the 3 required consecutive successes landed"
+        );
+    }
+
+    #[test]
+    fn closes_after_exactly_n_consecutive_half_open_successes() {
+        let (cb, clock) = breaker_with_recovery(1, Duration::from_secs(5), 3);
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        cb.record_success();
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn an_intervening_failure_resets_the_half_open_success_streak() {
+        let (cb, clock) = breaker_with_recovery(1, Duration::from_secs(5), 3);
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        cb.record_success();
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "a failure mid-recovery re-trips the breaker"
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        cb.record_success();
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen,
+            "the earlier 2 successes before the failure must not count toward this recovery"
+        );
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
     fn a_stale_success_while_open_does_not_cancel_the_cooldown() {
         let (cb, clock) = breaker(1, Duration::from_secs(5));
         cb.record_failure();
@@ -278,6 +371,7 @@ mod tests {
         let cb = Arc::new(CircuitBreaker::new(
             50,
             Duration::from_secs(5),
+            1,
             FakeClock::new(),
         ));
         let handles: Vec<_> = (0..8)
@@ -304,8 +398,13 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
         clock.advance(Duration::from_secs(4));
 
-        let migrated =
-            CircuitBreaker::from_snapshot(1, Duration::from_secs(10), clock.clone(), cb.snapshot());
+        let migrated = CircuitBreaker::from_snapshot(
+            1,
+            Duration::from_secs(10),
+            1,
+            clock.clone(),
+            cb.snapshot(),
+        );
         assert_eq!(migrated.state(), CircuitState::Open);
         clock.advance(Duration::from_secs(5));
         assert_eq!(
@@ -325,12 +424,31 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
 
         let migrated =
-            CircuitBreaker::from_snapshot(3, Duration::from_secs(5), clock, cb.snapshot());
+            CircuitBreaker::from_snapshot(3, Duration::from_secs(5), 1, clock, cb.snapshot());
         migrated.record_failure();
         assert_eq!(
             migrated.state(),
             CircuitState::Open,
             "the third failure should trip it, since 2 were already carried over"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_preserves_a_half_open_breakers_success_count() {
+        let (cb, clock) = breaker_with_recovery(1, Duration::from_secs(5), 3);
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        cb.record_success();
+
+        let migrated =
+            CircuitBreaker::from_snapshot(1, Duration::from_secs(5), 3, clock, cb.snapshot());
+        migrated.record_success();
+        assert_eq!(
+            migrated.state(),
+            CircuitState::Closed,
+            "the third success should close it, since 2 were already carried over"
         );
     }
 }

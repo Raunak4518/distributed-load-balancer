@@ -175,6 +175,7 @@ mod tests {
             timeout_ms: 200,
             failure_threshold: 2,
             cooldown_ms: 300,
+            half_open_successes_required: 1,
         }
     }
 
@@ -293,6 +294,7 @@ mod tests {
                 timeout_ms: 50,
                 failure_threshold: 1,
                 cooldown_ms: 100,
+                half_open_successes_required: 1,
             },
             no_op_transport(),
             test_metrics(),
