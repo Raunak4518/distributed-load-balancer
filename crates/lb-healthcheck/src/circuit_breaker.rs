@@ -60,6 +60,10 @@ pub struct CircuitBreaker<C: Clock> {
     flap_backoff_multiplier: f64,
     max_cooldown: Duration,
     flap_streak_reset: Duration,
+    /// See `exceeds_latency_threshold`.
+    unhealthy_latency: Option<Duration>,
+    /// See `exceeds_concurrency_threshold`.
+    unhealthy_request_count: Option<usize>,
     consecutive_failures: AtomicU32,
     consecutive_successes: AtomicU32,
     state: AtomicU8,
@@ -82,6 +86,8 @@ impl<C: Clock> CircuitBreaker<C> {
         flap_backoff_multiplier: f64,
         max_cooldown: Duration,
         flap_streak_reset: Duration,
+        unhealthy_latency: Option<Duration>,
+        unhealthy_request_count: Option<usize>,
         clock: C,
     ) -> Self {
         let creation = clock.now();
@@ -94,6 +100,8 @@ impl<C: Clock> CircuitBreaker<C> {
             flap_backoff_multiplier,
             max_cooldown,
             flap_streak_reset,
+            unhealthy_latency,
+            unhealthy_request_count,
             consecutive_failures: AtomicU32::new(0),
             consecutive_successes: AtomicU32::new(0),
             state: AtomicU8::new(CircuitState::Closed.as_u8()),
@@ -120,6 +128,8 @@ impl<C: Clock> CircuitBreaker<C> {
         flap_backoff_multiplier: f64,
         max_cooldown: Duration,
         flap_streak_reset: Duration,
+        unhealthy_latency: Option<Duration>,
+        unhealthy_request_count: Option<usize>,
         clock: C,
         snapshot: CircuitBreakerSnapshot,
     ) -> Self {
@@ -132,6 +142,8 @@ impl<C: Clock> CircuitBreaker<C> {
             flap_backoff_multiplier,
             max_cooldown,
             flap_streak_reset,
+            unhealthy_latency,
+            unhealthy_request_count,
             consecutive_failures: AtomicU32::new(snapshot.consecutive_failures),
             consecutive_successes: AtomicU32::new(snapshot.consecutive_successes),
             state: AtomicU8::new(snapshot.state),
@@ -166,6 +178,24 @@ impl<C: Clock> CircuitBreaker<C> {
 
     pub fn is_open(&self) -> bool {
         matches!(self.state(), CircuitState::Open)
+    }
+
+    /// Passive health signal distinct from the active `HealthProbe`
+    /// (status-code/timeout only): a request this slow counts as a failure
+    /// for this breaker even when it otherwise reached the client fine.
+    /// Always `false` when `unhealthy_latency_ms` is not configured.
+    pub fn exceeds_latency_threshold(&self, latency: Duration) -> bool {
+        self.unhealthy_latency
+            .is_some_and(|threshold| latency >= threshold)
+    }
+
+    /// Passive health signal for load, not status: a backend already
+    /// carrying at least this many in-flight requests/connections counts
+    /// its next completed one as a failure for this breaker. Always `false`
+    /// when `unhealthy_request_count` is not configured.
+    pub fn exceeds_concurrency_threshold(&self, in_flight: usize) -> bool {
+        self.unhealthy_request_count
+            .is_some_and(|threshold| in_flight >= threshold)
     }
 
     /// The cooldown this breaker's *current* Open episode actually uses:
@@ -298,6 +328,8 @@ mod tests {
                 1.0,
                 Duration::from_secs(1_000_000_000),
                 Duration::from_secs(60),
+                None,
+                None,
                 clock.clone(),
             ),
             clock,
@@ -320,6 +352,29 @@ mod tests {
                 flap_backoff_multiplier,
                 max_cooldown,
                 flap_streak_reset,
+                None,
+                None,
+                clock.clone(),
+            ),
+            clock,
+        )
+    }
+
+    fn breaker_with_passive_thresholds(
+        unhealthy_latency: Option<Duration>,
+        unhealthy_request_count: Option<usize>,
+    ) -> (CircuitBreaker<FakeClock>, FakeClock) {
+        let clock = FakeClock::new();
+        (
+            CircuitBreaker::new(
+                1,
+                Duration::from_secs(5),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                unhealthy_latency,
+                unhealthy_request_count,
                 clock.clone(),
             ),
             clock,
@@ -570,6 +625,8 @@ mod tests {
             2.0,
             Duration::from_secs(1000),
             Duration::from_secs(60),
+            None,
+            None,
             clock.clone(),
             cb.snapshot(),
         );
@@ -582,6 +639,50 @@ mod tests {
         );
         clock.advance(Duration::from_secs(1));
         assert_eq!(migrated.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn exceeds_latency_threshold_is_always_false_when_unconfigured() {
+        let (cb, _clock) = breaker_with_passive_thresholds(None, None);
+        assert!(!cb.exceeds_latency_threshold(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn exceeds_latency_threshold_compares_against_the_configured_bound() {
+        let (cb, _clock) = breaker_with_passive_thresholds(Some(Duration::from_millis(100)), None);
+        assert!(!cb.exceeds_latency_threshold(Duration::from_millis(99)));
+        assert!(cb.exceeds_latency_threshold(Duration::from_millis(100)));
+        assert!(cb.exceeds_latency_threshold(Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn exceeds_concurrency_threshold_is_always_false_when_unconfigured() {
+        let (cb, _clock) = breaker_with_passive_thresholds(None, None);
+        assert!(!cb.exceeds_concurrency_threshold(1_000_000));
+    }
+
+    #[test]
+    fn exceeds_concurrency_threshold_compares_against_the_configured_bound() {
+        let (cb, _clock) = breaker_with_passive_thresholds(None, Some(10));
+        assert!(!cb.exceeds_concurrency_threshold(9));
+        assert!(cb.exceeds_concurrency_threshold(10));
+        assert!(cb.exceeds_concurrency_threshold(50));
+    }
+
+    /// A slow-but-successful response is a distinct failure mode from the
+    /// active-health-checked status codes/timeouts: this proves it actually
+    /// participates in the breaker's threshold/cooldown state machine, not
+    /// just the two standalone predicates above.
+    #[test]
+    fn a_latency_violation_trips_the_breaker_like_any_other_failure() {
+        let (cb, _clock) = breaker_with_passive_thresholds(Some(Duration::from_millis(200)), None);
+        assert_eq!(cb.state(), CircuitState::Closed);
+        if cb.exceeds_latency_threshold(Duration::from_millis(250)) {
+            cb.record_failure();
+        } else {
+            cb.record_success();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
     }
 
     /// The whole point of dropping the mutex: many threads hammering
@@ -598,6 +699,8 @@ mod tests {
             1.0,
             Duration::from_secs(1_000_000_000),
             Duration::from_secs(60),
+            None,
+            None,
             FakeClock::new(),
         ));
         let handles: Vec<_> = (0..8)
@@ -631,6 +734,8 @@ mod tests {
             1.0,
             Duration::from_secs(1_000_000_000),
             Duration::from_secs(60),
+            None,
+            None,
             clock.clone(),
             cb.snapshot(),
         );
@@ -659,6 +764,8 @@ mod tests {
             1.0,
             Duration::from_secs(1_000_000_000),
             Duration::from_secs(60),
+            None,
+            None,
             clock,
             cb.snapshot(),
         );
@@ -686,6 +793,8 @@ mod tests {
             1.0,
             Duration::from_secs(1_000_000_000),
             Duration::from_secs(60),
+            None,
+            None,
             clock,
             cb.snapshot(),
         );

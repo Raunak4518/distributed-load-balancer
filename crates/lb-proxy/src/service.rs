@@ -706,18 +706,31 @@ where
         };
         match forward(&client, outbound, ctx.forward_timeout).await {
             Ok(resp) => {
+                let elapsed = attempt_started.elapsed();
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_success.inc();
-                    bm.upstream_duration
-                        .observe(attempt_started.elapsed().as_secs_f64());
+                    bm.upstream_duration.observe(elapsed.as_secs_f64());
                 }
-                balancer.record_latency(&backend_id, attempt_started.elapsed());
+                balancer.record_latency(&backend_id, elapsed);
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
-                    breaker.record_success();
+                    // A response can reach the client successfully and still
+                    // count as a passive health-check failure: too slow, or
+                    // this backend was already carrying too much concurrent
+                    // load -- distinct failure modes from the active
+                    // HealthProbe's status-code/timeout-only view.
+                    if breaker.exceeds_latency_threshold(elapsed)
+                        || breaker.exceeds_concurrency_threshold(pool.active_count(&backend_id))
+                    {
+                        breaker.record_failure();
+                    } else {
+                        breaker.record_success();
+                    }
+                    // Propagate immediately (not just next request) so a
+                    // backend that just recovered -- or just tripped on a
+                    // passive signal above -- is reflected within this same
+                    // burst, not only on the next request.
+                    pool.set_circuit_open(&backend_id, breaker.is_open());
                 }
-                // Propagate immediately (not just next request) so a backend
-                // that just recovered is usable again within this same burst.
-                pool.set_circuit_open(&backend_id, false);
                 let (mut resp_parts, resp_body) = resp.into_parts();
                 // Direction: backend -> client. Strip before returning so a
                 // hop-by-hop header the backend sent us (describing its hop
@@ -1133,6 +1146,8 @@ mod tests {
                 1.0,
                 Duration::from_secs(1_000_000_000),
                 Duration::from_secs(60),
+                None,
+                None,
                 FakeClock::new(),
             ),
         );
@@ -1221,6 +1236,8 @@ mod tests {
                 1.0,
                 Duration::from_secs(1_000_000_000),
                 Duration::from_secs(60),
+                None,
+                None,
                 FakeClock::new(),
             ),
         );
@@ -1276,6 +1293,8 @@ mod tests {
                 1.0,
                 Duration::from_secs(1_000_000_000),
                 Duration::from_secs(60),
+                None,
+                None,
                 clock.clone(),
             ),
         );
@@ -1288,6 +1307,8 @@ mod tests {
                 1.0,
                 Duration::from_secs(1_000_000_000),
                 Duration::from_secs(60),
+                None,
+                None,
                 clock.clone(),
             ),
         );
@@ -1351,6 +1372,8 @@ mod tests {
                 1.0,
                 Duration::from_secs(1_000_000_000),
                 Duration::from_secs(60),
+                None,
+                None,
                 FakeClock::new(),
             ),
         );
@@ -1414,6 +1437,8 @@ mod tests {
                 1.0,
                 Duration::from_secs(1_000_000_000),
                 Duration::from_secs(60),
+                None,
+                None,
                 FakeClock::new(),
             ),
         );

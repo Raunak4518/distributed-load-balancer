@@ -179,6 +179,8 @@ mod tests {
             flap_backoff_multiplier: 1.0,
             max_flap_cooldown_ms: u64::MAX,
             flap_streak_reset_ms: 60_000,
+            unhealthy_latency_ms: None,
+            unhealthy_request_count: None,
         }
     }
 
@@ -301,6 +303,8 @@ mod tests {
                 flap_backoff_multiplier: 1.0,
                 max_flap_cooldown_ms: u64::MAX,
                 flap_streak_reset_ms: 60_000,
+                unhealthy_latency_ms: None,
+                unhealthy_request_count: None,
             },
             no_op_transport(),
             test_metrics(),

@@ -78,6 +78,8 @@ fn breakers_for(pool: &BackendPool) -> HashMap<lb_core::BackendId, CircuitBreake
                     1.0,
                     Duration::from_secs(1_000_000_000),
                     Duration::from_secs(60),
+                    None,
+                    None,
                     SystemClock,
                 ),
             )

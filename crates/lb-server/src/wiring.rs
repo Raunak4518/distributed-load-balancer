@@ -593,6 +593,8 @@ fn new_or_migrated_breaker(
     flap_backoff_multiplier: f64,
     max_flap_cooldown: Duration,
     flap_streak_reset: Duration,
+    unhealthy_latency: Option<Duration>,
+    unhealthy_request_count: Option<usize>,
 ) -> CircuitBreaker<SystemClock> {
     match previous.and_then(|p| p.breaker_snapshot(id)) {
         Some(snapshot) => CircuitBreaker::from_snapshot(
@@ -602,6 +604,8 @@ fn new_or_migrated_breaker(
             flap_backoff_multiplier,
             max_flap_cooldown,
             flap_streak_reset,
+            unhealthy_latency,
+            unhealthy_request_count,
             SystemClock,
             snapshot,
         ),
@@ -612,6 +616,8 @@ fn new_or_migrated_breaker(
             flap_backoff_multiplier,
             max_flap_cooldown,
             flap_streak_reset,
+            unhealthy_latency,
+            unhealthy_request_count,
             SystemClock,
         ),
     }
@@ -718,6 +724,10 @@ pub(crate) fn build_listener_core(
                 lc.health_check.flap_backoff_multiplier,
                 Duration::from_millis(lc.health_check.max_flap_cooldown_ms),
                 Duration::from_millis(lc.health_check.flap_streak_reset_ms),
+                lc.health_check
+                    .unhealthy_latency_ms
+                    .map(Duration::from_millis),
+                lc.health_check.unhealthy_request_count,
             ),
         );
     }
@@ -734,6 +744,11 @@ pub(crate) fn build_listener_core(
                     route.health_check.flap_backoff_multiplier,
                     Duration::from_millis(route.health_check.max_flap_cooldown_ms),
                     Duration::from_millis(route.health_check.flap_streak_reset_ms),
+                    route
+                        .health_check
+                        .unhealthy_latency_ms
+                        .map(Duration::from_millis),
+                    route.health_check.unhealthy_request_count,
                 ),
             );
         }
@@ -751,6 +766,11 @@ pub(crate) fn build_listener_core(
                     canary.health_check.flap_backoff_multiplier,
                     Duration::from_millis(canary.health_check.max_flap_cooldown_ms),
                     Duration::from_millis(canary.health_check.flap_streak_reset_ms),
+                    canary
+                        .health_check
+                        .unhealthy_latency_ms
+                        .map(Duration::from_millis),
+                    canary.health_check.unhealthy_request_count,
                 ),
             );
         }

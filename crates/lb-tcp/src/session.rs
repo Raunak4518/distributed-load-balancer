@@ -212,15 +212,24 @@ where
         let attempt_started = std::time::Instant::now();
         match establish(&ctx, &backend).await {
             Some(stream) => {
+                let elapsed = attempt_started.elapsed();
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_success.inc();
                 }
-                ctx.balancer
-                    .record_latency(&backend_id, attempt_started.elapsed());
+                ctx.balancer.record_latency(&backend_id, elapsed);
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
-                    breaker.record_success();
+                    // Connect-establishment latency, not full session
+                    // duration -- the same passive-health distinction
+                    // `service.rs` applies to a full request/response.
+                    if breaker.exceeds_latency_threshold(elapsed)
+                        || breaker.exceeds_concurrency_threshold(ctx.pool.active_count(&backend_id))
+                    {
+                        breaker.record_failure();
+                    } else {
+                        breaker.record_success();
+                    }
+                    ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
                 }
-                ctx.pool.set_circuit_open(&backend_id, false);
                 outbound = Some(stream);
                 break;
             }
@@ -358,6 +367,8 @@ mod tests {
                     1.0,
                     Duration::from_secs(1_000_000_000),
                     Duration::from_secs(60),
+                    None,
+                    None,
                     FakeClock::new(),
                 ),
             );

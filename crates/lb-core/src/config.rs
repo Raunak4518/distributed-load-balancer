@@ -718,6 +718,19 @@ pub struct HealthCheckConfig {
     /// flapping streak.
     #[serde(default = "default_flap_streak_reset_ms")]
     pub flap_streak_reset_ms: u64,
+    /// If set, a request this backend answers in at least this long counts
+    /// as a passive health-check failure against its circuit breaker, even
+    /// though the response itself reached the client successfully. Distinct
+    /// from active health checking (`HealthProbe`), which only ever sees
+    /// status codes/timeouts, never real request latency.
+    #[serde(default)]
+    pub unhealthy_latency_ms: Option<u64>,
+    /// If set, a backend with at least this many in-flight
+    /// requests/connections (`BackendPool::active_count`) counts its next
+    /// completed request as a passive health-check failure against its
+    /// circuit breaker, independent of that request's own latency or status.
+    #[serde(default)]
+    pub unhealthy_request_count: Option<usize>,
 }
 
 fn default_half_open_successes_required() -> u32 {
@@ -1007,6 +1020,16 @@ impl ListenerConfig {
                 "health_check.flap_backoff_multiplier must be >= 1.0".into(),
             ));
         }
+        if self.health_check.unhealthy_latency_ms == Some(0) {
+            return Err(invalid(
+                "health_check.unhealthy_latency_ms must be positive if set".into(),
+            ));
+        }
+        if self.health_check.unhealthy_request_count == Some(0) {
+            return Err(invalid(
+                "health_check.unhealthy_request_count must be positive if set".into(),
+            ));
+        }
 
         if self.max_connections() == 0 || self.max_connections_per_ip() == 0 {
             return Err(invalid(
@@ -1056,6 +1079,13 @@ impl ListenerConfig {
                             "each [[listeners.routes]] health_check.flap_backoff_multiplier must be >= 1.0".into(),
                         ));
                     }
+                    if route.health_check.unhealthy_latency_ms == Some(0)
+                        || route.health_check.unhealthy_request_count == Some(0)
+                    {
+                        return Err(invalid(
+                            "each [[listeners.routes]] health_check.unhealthy_latency_ms/unhealthy_request_count must be positive if set".into(),
+                        ));
+                    }
                 }
                 let mut canary_percent_total: u32 = 0;
                 for pool in &self.canary {
@@ -1072,6 +1102,13 @@ impl ListenerConfig {
                     if pool.health_check.flap_backoff_multiplier < 1.0 {
                         return Err(invalid(
                             "each [[listeners.canary]] health_check.flap_backoff_multiplier must be >= 1.0".into(),
+                        ));
+                    }
+                    if pool.health_check.unhealthy_latency_ms == Some(0)
+                        || pool.health_check.unhealthy_request_count == Some(0)
+                    {
+                        return Err(invalid(
+                            "each [[listeners.canary]] health_check.unhealthy_latency_ms/unhealthy_request_count must be positive if set".into(),
                         ));
                     }
                     if pool.percent == 0 || pool.percent > 99 {
@@ -2197,6 +2234,8 @@ mod tests {
         assert_eq!(l.health_check.flap_backoff_multiplier, 1.0);
         assert_eq!(l.health_check.max_flap_cooldown_ms, u64::MAX);
         assert_eq!(l.health_check.flap_streak_reset_ms, 60_000);
+        assert_eq!(l.health_check.unhealthy_latency_ms, None);
+        assert_eq!(l.health_check.unhealthy_request_count, None);
     }
 
     #[test]
@@ -2225,6 +2264,47 @@ mod tests {
         assert_eq!(hc.flap_backoff_multiplier, 2.0);
         assert_eq!(hc.max_flap_cooldown_ms, 60_000);
         assert_eq!(hc.flap_streak_reset_ms, 120_000);
+    }
+
+    #[test]
+    fn parses_explicit_passive_health_thresholds() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          unhealthy_latency_ms = 250\n          unhealthy_request_count = 20",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let hc = &cfg.listeners[0].health_check;
+        assert_eq!(hc.unhealthy_latency_ms, Some(250));
+        assert_eq!(hc.unhealthy_request_count, Some(20));
+    }
+
+    #[test]
+    fn rejects_a_zero_unhealthy_latency_ms() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          unhealthy_latency_ms = 0",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(
+            err.contains("unhealthy_latency_ms"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_zero_unhealthy_request_count() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          unhealthy_request_count = 0",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(
+            err.contains("unhealthy_request_count"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]
