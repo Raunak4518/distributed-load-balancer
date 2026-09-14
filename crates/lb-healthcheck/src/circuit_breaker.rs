@@ -41,6 +41,8 @@ pub struct CircuitBreakerSnapshot {
     consecutive_successes: u32,
     state: u8,
     opened_at_nanos: u64,
+    trip_streak: u32,
+    closed_since_nanos: u64,
 }
 
 /// No mutex anywhere in here: `state()` runs once per backend on every
@@ -55,17 +57,31 @@ pub struct CircuitBreaker<C: Clock> {
     failure_threshold: u32,
     cooldown: Duration,
     half_open_successes_required: u32,
+    flap_backoff_multiplier: f64,
+    max_cooldown: Duration,
+    flap_streak_reset: Duration,
     consecutive_failures: AtomicU32,
     consecutive_successes: AtomicU32,
     state: AtomicU8,
     opened_at_nanos: AtomicU64,
+    /// How many times this breaker has re-tripped `Open` since it last
+    /// stayed `Closed` for at least `flap_streak_reset` -- see
+    /// `effective_cooldown`/`try_trip`.
+    trip_streak: AtomicU32,
+    /// Nanoseconds since `creation` at which this breaker most recently
+    /// became `Closed` (or `0`, meaning "closed since creation").
+    closed_since_nanos: AtomicU64,
 }
 
 impl<C: Clock> CircuitBreaker<C> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         failure_threshold: u32,
         cooldown: Duration,
         half_open_successes_required: u32,
+        flap_backoff_multiplier: f64,
+        max_cooldown: Duration,
+        flap_streak_reset: Duration,
         clock: C,
     ) -> Self {
         let creation = clock.now();
@@ -75,25 +91,35 @@ impl<C: Clock> CircuitBreaker<C> {
             failure_threshold,
             cooldown,
             half_open_successes_required,
+            flap_backoff_multiplier,
+            max_cooldown,
+            flap_streak_reset,
             consecutive_failures: AtomicU32::new(0),
             consecutive_successes: AtomicU32::new(0),
             state: AtomicU8::new(CircuitState::Closed.as_u8()),
             opened_at_nanos: AtomicU64::new(NOT_OPENED),
+            trip_streak: AtomicU32::new(0),
+            closed_since_nanos: AtomicU64::new(0),
         }
     }
 
     /// Rebuilds a breaker for the same backend with `failure_threshold`/
-    /// `cooldown`/`half_open_successes_required` taken fresh (an operator may
-    /// have just changed any of these in the same config edit that's
-    /// carrying this state forward) but its live state -- Open/HalfOpen/
-    /// Closed, the failure/success counts, and the cooldown clock -- taken
-    /// from `snapshot`. Used by config reload, so a backend mid-cooldown or
-    /// mid-recovery when an unrelated field on its listener changes does not
-    /// get a clean slate and go straight back into rotation.
+    /// `cooldown`/`half_open_successes_required`/the flap-backoff settings
+    /// taken fresh (an operator may have just changed any of these in the
+    /// same config edit that's carrying this state forward) but its live
+    /// state -- Open/HalfOpen/Closed, the failure/success counts, the flap
+    /// streak, and the cooldown clock -- taken from `snapshot`. Used by
+    /// config reload, so a backend mid-cooldown or mid-recovery when an
+    /// unrelated field on its listener changes does not get a clean slate
+    /// and go straight back into rotation.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_snapshot(
         failure_threshold: u32,
         cooldown: Duration,
         half_open_successes_required: u32,
+        flap_backoff_multiplier: f64,
+        max_cooldown: Duration,
+        flap_streak_reset: Duration,
         clock: C,
         snapshot: CircuitBreakerSnapshot,
     ) -> Self {
@@ -103,10 +129,15 @@ impl<C: Clock> CircuitBreaker<C> {
             failure_threshold,
             cooldown,
             half_open_successes_required,
+            flap_backoff_multiplier,
+            max_cooldown,
+            flap_streak_reset,
             consecutive_failures: AtomicU32::new(snapshot.consecutive_failures),
             consecutive_successes: AtomicU32::new(snapshot.consecutive_successes),
             state: AtomicU8::new(snapshot.state),
             opened_at_nanos: AtomicU64::new(snapshot.opened_at_nanos),
+            trip_streak: AtomicU32::new(snapshot.trip_streak),
+            closed_since_nanos: AtomicU64::new(snapshot.closed_since_nanos),
         }
     }
 
@@ -119,6 +150,8 @@ impl<C: Clock> CircuitBreaker<C> {
             consecutive_successes: self.consecutive_successes.load(Ordering::SeqCst),
             state: self.state.load(Ordering::SeqCst),
             opened_at_nanos: self.opened_at_nanos.load(Ordering::SeqCst),
+            trip_streak: self.trip_streak.load(Ordering::SeqCst),
+            closed_since_nanos: self.closed_since_nanos.load(Ordering::SeqCst),
         }
     }
 
@@ -135,6 +168,17 @@ impl<C: Clock> CircuitBreaker<C> {
         matches!(self.state(), CircuitState::Open)
     }
 
+    /// The cooldown this breaker's *current* Open episode actually uses:
+    /// `cooldown` scaled by `flap_backoff_multiplier` raised to one less
+    /// than the current flap streak (so an isolated trip, streak 1, always
+    /// gets the plain configured cooldown), capped at `max_cooldown`.
+    fn effective_cooldown(&self) -> Duration {
+        let streak = self.trip_streak.load(Ordering::SeqCst).max(1);
+        let scaled =
+            self.cooldown.as_secs_f64() * self.flap_backoff_multiplier.powi(streak as i32 - 1);
+        Duration::from_secs_f64(scaled.min(self.max_cooldown.as_secs_f64()))
+    }
+
     fn maybe_transition_to_half_open(&self) {
         if self.load_state() != CircuitState::Open {
             return;
@@ -144,7 +188,7 @@ impl<C: Clock> CircuitBreaker<C> {
             return;
         }
         let opened_at = self.creation + Duration::from_nanos(opened_at_nanos);
-        if self.clock.now().duration_since(opened_at) >= self.cooldown {
+        if self.clock.now().duration_since(opened_at) >= self.effective_cooldown() {
             // Best-effort: if this loses the race, another thread already
             // made (or is making) the same transition, which is the outcome
             // this call wanted anyway -- no need to retry.
@@ -167,13 +211,20 @@ impl<C: Clock> CircuitBreaker<C> {
         }
         let successes = self.consecutive_successes.fetch_add(1, Ordering::SeqCst) + 1;
         if successes >= self.half_open_successes_required {
-            let _ = self.state.compare_exchange(
-                CircuitState::HalfOpen.as_u8(),
-                CircuitState::Closed.as_u8(),
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
+            let closed = self
+                .state
+                .compare_exchange(
+                    CircuitState::HalfOpen.as_u8(),
+                    CircuitState::Closed.as_u8(),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok();
             self.consecutive_successes.store(0, Ordering::SeqCst);
+            if closed {
+                let nanos = self.clock.now().duration_since(self.creation).as_nanos() as u64;
+                self.closed_since_nanos.store(nanos, Ordering::SeqCst);
+            }
         }
     }
 
@@ -209,6 +260,16 @@ impl<C: Clock> CircuitBreaker<C> {
             self.opened_at_nanos.store(nanos, Ordering::SeqCst);
             self.consecutive_failures.store(0, Ordering::SeqCst);
             self.consecutive_successes.store(0, Ordering::SeqCst);
+
+            let closed_since = self.closed_since_nanos.load(Ordering::SeqCst);
+            let closed_duration = Duration::from_nanos(nanos.saturating_sub(closed_since));
+            if closed_duration >= self.flap_streak_reset {
+                // Long enough healthy stretch since the last trip: this one
+                // starts a fresh flap streak rather than continuing the old
+                // one.
+                self.trip_streak.store(0, Ordering::SeqCst);
+            }
+            self.trip_streak.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -234,6 +295,31 @@ mod tests {
                 threshold,
                 cooldown,
                 half_open_successes_required,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                clock.clone(),
+            ),
+            clock,
+        )
+    }
+
+    fn breaker_with_flap_backoff(
+        threshold: u32,
+        cooldown: Duration,
+        flap_backoff_multiplier: f64,
+        max_cooldown: Duration,
+        flap_streak_reset: Duration,
+    ) -> (CircuitBreaker<FakeClock>, FakeClock) {
+        let clock = FakeClock::new();
+        (
+            CircuitBreaker::new(
+                threshold,
+                cooldown,
+                1,
+                flap_backoff_multiplier,
+                max_cooldown,
+                flap_streak_reset,
                 clock.clone(),
             ),
             clock,
@@ -361,6 +447,143 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
+    #[test]
+    fn a_lone_trip_uses_the_plain_cooldown() {
+        let (cb, clock) = breaker_with_flap_backoff(
+            1,
+            Duration::from_secs(5),
+            2.0,
+            Duration::from_secs(100),
+            Duration::from_secs(60),
+        );
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen,
+            "a first-ever trip must not be scaled by the flap-backoff multiplier"
+        );
+    }
+
+    #[test]
+    fn repeated_flapping_doubles_the_cooldown_each_time() {
+        let (cb, clock) = breaker_with_flap_backoff(
+            1,
+            Duration::from_secs(5),
+            2.0,
+            Duration::from_secs(1000),
+            Duration::from_secs(60),
+        );
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "a second re-trip within the flap-streak-reset window"
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "cooldown should now be 5s * 2^1 = 10s, only 5s have passed"
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn the_scaled_cooldown_is_capped_at_the_configured_ceiling() {
+        let (cb, clock) = breaker_with_flap_backoff(
+            1,
+            Duration::from_secs(5),
+            2.0,
+            Duration::from_secs(8),
+            Duration::from_secs(60),
+        );
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        // uncapped this would be 10s; the 8s ceiling applies instead
+        clock.advance(Duration::from_secs(7));
+        assert_eq!(cb.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn a_sustained_healthy_period_resets_the_flap_streak() {
+        let (cb, clock) = breaker_with_flap_backoff(
+            1,
+            Duration::from_secs(5),
+            2.0,
+            Duration::from_secs(1000),
+            Duration::from_secs(30),
+        );
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+
+        clock.advance(Duration::from_secs(31));
+        cb.record_failure();
+        assert_eq!(
+            cb.state(),
+            CircuitState::Open,
+            "a long enough healthy stretch means this trip starts a fresh streak"
+        );
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(
+            cb.state(),
+            CircuitState::HalfOpen,
+            "cooldown should be the plain 5s again, not doubled"
+        );
+    }
+
+    #[test]
+    fn from_snapshot_preserves_the_flap_streak() {
+        let (cb, clock) = breaker_with_flap_backoff(
+            1,
+            Duration::from_secs(5),
+            2.0,
+            Duration::from_secs(1000),
+            Duration::from_secs(60),
+        );
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        let migrated = CircuitBreaker::from_snapshot(
+            1,
+            Duration::from_secs(5),
+            1,
+            2.0,
+            Duration::from_secs(1000),
+            Duration::from_secs(60),
+            clock.clone(),
+            cb.snapshot(),
+        );
+        assert_eq!(migrated.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(9));
+        assert_eq!(
+            migrated.state(),
+            CircuitState::Open,
+            "the flap streak of 2 (10s cooldown) must survive the migration"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(migrated.state(), CircuitState::HalfOpen);
+    }
+
     /// The whole point of dropping the mutex: many threads hammering
     /// `record_failure`/`record_success` concurrently must never panic (no
     /// poisoning is even possible without a lock) and must leave the
@@ -372,6 +595,9 @@ mod tests {
             50,
             Duration::from_secs(5),
             1,
+            1.0,
+            Duration::from_secs(1_000_000_000),
+            Duration::from_secs(60),
             FakeClock::new(),
         ));
         let handles: Vec<_> = (0..8)
@@ -402,6 +628,9 @@ mod tests {
             1,
             Duration::from_secs(10),
             1,
+            1.0,
+            Duration::from_secs(1_000_000_000),
+            Duration::from_secs(60),
             clock.clone(),
             cb.snapshot(),
         );
@@ -423,8 +652,16 @@ mod tests {
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Closed);
 
-        let migrated =
-            CircuitBreaker::from_snapshot(3, Duration::from_secs(5), 1, clock, cb.snapshot());
+        let migrated = CircuitBreaker::from_snapshot(
+            3,
+            Duration::from_secs(5),
+            1,
+            1.0,
+            Duration::from_secs(1_000_000_000),
+            Duration::from_secs(60),
+            clock,
+            cb.snapshot(),
+        );
         migrated.record_failure();
         assert_eq!(
             migrated.state(),
@@ -442,8 +679,16 @@ mod tests {
         cb.record_success();
         cb.record_success();
 
-        let migrated =
-            CircuitBreaker::from_snapshot(1, Duration::from_secs(5), 3, clock, cb.snapshot());
+        let migrated = CircuitBreaker::from_snapshot(
+            1,
+            Duration::from_secs(5),
+            3,
+            1.0,
+            Duration::from_secs(1_000_000_000),
+            Duration::from_secs(60),
+            clock,
+            cb.snapshot(),
+        );
         migrated.record_success();
         assert_eq!(
             migrated.state(),

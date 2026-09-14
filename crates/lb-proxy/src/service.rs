@@ -1126,7 +1126,15 @@ mod tests {
         let mut breakers = HashMap::new();
         breakers.insert(
             backend.id.clone(),
-            CircuitBreaker::new(3, Duration::from_secs(5), 1, FakeClock::new()),
+            CircuitBreaker::new(
+                3,
+                Duration::from_secs(5),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                FakeClock::new(),
+            ),
         );
 
         let ctx = Arc::new(ProxyContext {
@@ -1206,7 +1214,15 @@ mod tests {
         let mut breakers = HashMap::new();
         breakers.insert(
             backend.id.clone(),
-            CircuitBreaker::new(3, Duration::from_secs(5), 1, FakeClock::new()),
+            CircuitBreaker::new(
+                3,
+                Duration::from_secs(5),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                FakeClock::new(),
+            ),
         );
 
         let ctx = Arc::new(ProxyContext {
@@ -1253,11 +1269,27 @@ mod tests {
         let mut breakers = HashMap::new();
         breakers.insert(
             dead.id.clone(),
-            CircuitBreaker::new(1, Duration::from_secs(60), 1, clock.clone()),
+            CircuitBreaker::new(
+                1,
+                Duration::from_secs(60),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                clock.clone(),
+            ),
         );
         breakers.insert(
             healthy.id.clone(),
-            CircuitBreaker::new(1, Duration::from_secs(60), 1, clock.clone()),
+            CircuitBreaker::new(
+                1,
+                Duration::from_secs(60),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                clock.clone(),
+            ),
         );
 
         let ctx = Arc::new(ProxyContext {
@@ -1312,7 +1344,15 @@ mod tests {
         let mut breakers = HashMap::new();
         breakers.insert(
             backend.id.clone(),
-            CircuitBreaker::new(3, Duration::from_secs(5), 1, FakeClock::new()),
+            CircuitBreaker::new(
+                3,
+                Duration::from_secs(5),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                FakeClock::new(),
+            ),
         );
 
         let ctx = Arc::new(ProxyContext {
@@ -1367,7 +1407,15 @@ mod tests {
         let mut breakers = HashMap::new();
         breakers.insert(
             backend.id.clone(),
-            CircuitBreaker::new(3, Duration::from_secs(5), 1, FakeClock::new()),
+            CircuitBreaker::new(
+                3,
+                Duration::from_secs(5),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                FakeClock::new(),
+            ),
         );
 
         let ctx = Arc::new(ProxyContext {

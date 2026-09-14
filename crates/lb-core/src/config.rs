@@ -703,10 +703,37 @@ pub struct HealthCheckConfig {
     /// closes. Defaults to 1, exactly preserving pre-existing behavior.
     #[serde(default = "default_half_open_successes_required")]
     pub half_open_successes_required: u32,
+    /// Each re-trip into `Open` since the backend last stayed `Closed` for
+    /// `flap_streak_reset_ms` multiplies its cooldown by this factor, up to
+    /// `max_flap_cooldown_ms`. Defaults to 1.0 (no growth), exactly
+    /// preserving pre-existing behavior.
+    #[serde(default = "default_flap_backoff_multiplier")]
+    pub flap_backoff_multiplier: f64,
+    /// Ceiling on the scaled cooldown from `flap_backoff_multiplier`.
+    /// Defaults to effectively unbounded.
+    #[serde(default = "default_max_flap_cooldown_ms")]
+    pub max_flap_cooldown_ms: u64,
+    /// How long a backend must stay `Closed` before its next trip is
+    /// treated as an isolated event rather than a continuation of its
+    /// flapping streak.
+    #[serde(default = "default_flap_streak_reset_ms")]
+    pub flap_streak_reset_ms: u64,
 }
 
 fn default_half_open_successes_required() -> u32 {
     1
+}
+
+fn default_flap_backoff_multiplier() -> f64 {
+    1.0
+}
+
+fn default_max_flap_cooldown_ms() -> u64 {
+    u64::MAX
+}
+
+fn default_flap_streak_reset_ms() -> u64 {
+    60_000
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -975,6 +1002,11 @@ impl ListenerConfig {
                 "rate_limit.max_tracked_keys must be positive".into(),
             ));
         }
+        if self.health_check.flap_backoff_multiplier < 1.0 {
+            return Err(invalid(
+                "health_check.flap_backoff_multiplier must be >= 1.0".into(),
+            ));
+        }
 
         if self.max_connections() == 0 || self.max_connections_per_ip() == 0 {
             return Err(invalid(
@@ -1019,6 +1051,11 @@ impl ListenerConfig {
                             "each [[listeners.routes]] needs health_check.path, same as the listener itself".into(),
                         ));
                     }
+                    if route.health_check.flap_backoff_multiplier < 1.0 {
+                        return Err(invalid(
+                            "each [[listeners.routes]] health_check.flap_backoff_multiplier must be >= 1.0".into(),
+                        ));
+                    }
                 }
                 let mut canary_percent_total: u32 = 0;
                 for pool in &self.canary {
@@ -1030,6 +1067,11 @@ impl ListenerConfig {
                     if pool.health_check.path.is_none() {
                         return Err(invalid(
                             "each [[listeners.canary]] needs health_check.path, same as the listener itself".into(),
+                        ));
+                    }
+                    if pool.health_check.flap_backoff_multiplier < 1.0 {
+                        return Err(invalid(
+                            "each [[listeners.canary]] health_check.flap_backoff_multiplier must be >= 1.0".into(),
                         ));
                     }
                     if pool.percent == 0 || pool.percent > 99 {
@@ -2152,6 +2194,9 @@ mod tests {
         assert_eq!(l.body_read_timeout(), Duration::from_millis(10_000));
         assert_eq!(l.rate_limit.max_tracked_keys, 100_000);
         assert_eq!(l.health_check.half_open_successes_required, 1);
+        assert_eq!(l.health_check.flap_backoff_multiplier, 1.0);
+        assert_eq!(l.health_check.max_flap_cooldown_ms, u64::MAX);
+        assert_eq!(l.health_check.flap_streak_reset_ms, 60_000);
     }
 
     #[test]
@@ -2165,6 +2210,34 @@ mod tests {
         assert_eq!(
             cfg.listeners[0].health_check.half_open_successes_required,
             3
+        );
+    }
+
+    #[test]
+    fn parses_explicit_flap_backoff_settings() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          flap_backoff_multiplier = 2.0\n          max_flap_cooldown_ms = 60000\n          flap_streak_reset_ms = 120000",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let hc = &cfg.listeners[0].health_check;
+        assert_eq!(hc.flap_backoff_multiplier, 2.0);
+        assert_eq!(hc.max_flap_cooldown_ms, 60_000);
+        assert_eq!(hc.flap_streak_reset_ms, 120_000);
+    }
+
+    #[test]
+    fn rejects_a_flap_backoff_multiplier_below_one() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          flap_backoff_multiplier = 0.5",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(
+            err.contains("flap_backoff_multiplier"),
+            "unhelpful error: {err}"
         );
     }
 

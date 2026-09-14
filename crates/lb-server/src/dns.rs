@@ -176,6 +176,9 @@ mod tests {
             failure_threshold: 2,
             cooldown_ms: 300,
             half_open_successes_required: 1,
+            flap_backoff_multiplier: 1.0,
+            max_flap_cooldown_ms: u64::MAX,
+            flap_streak_reset_ms: 60_000,
         }
     }
 
@@ -295,6 +298,9 @@ mod tests {
                 failure_threshold: 1,
                 cooldown_ms: 100,
                 half_open_successes_required: 1,
+                flap_backoff_multiplier: 1.0,
+                max_flap_cooldown_ms: u64::MAX,
+                flap_streak_reset_ms: 60_000,
             },
             no_op_transport(),
             test_metrics(),

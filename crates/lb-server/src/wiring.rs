@@ -583,18 +583,25 @@ fn seed_drained(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn new_or_migrated_breaker(
     previous: Option<&PreviousListenerState>,
     id: &BackendId,
     failure_threshold: u32,
     cooldown: Duration,
     half_open_successes_required: u32,
+    flap_backoff_multiplier: f64,
+    max_flap_cooldown: Duration,
+    flap_streak_reset: Duration,
 ) -> CircuitBreaker<SystemClock> {
     match previous.and_then(|p| p.breaker_snapshot(id)) {
         Some(snapshot) => CircuitBreaker::from_snapshot(
             failure_threshold,
             cooldown,
             half_open_successes_required,
+            flap_backoff_multiplier,
+            max_flap_cooldown,
+            flap_streak_reset,
             SystemClock,
             snapshot,
         ),
@@ -602,6 +609,9 @@ fn new_or_migrated_breaker(
             failure_threshold,
             cooldown,
             half_open_successes_required,
+            flap_backoff_multiplier,
+            max_flap_cooldown,
+            flap_streak_reset,
             SystemClock,
         ),
     }
@@ -705,6 +715,9 @@ pub(crate) fn build_listener_core(
                 lc.health_check.failure_threshold,
                 Duration::from_millis(lc.health_check.cooldown_ms),
                 lc.health_check.half_open_successes_required,
+                lc.health_check.flap_backoff_multiplier,
+                Duration::from_millis(lc.health_check.max_flap_cooldown_ms),
+                Duration::from_millis(lc.health_check.flap_streak_reset_ms),
             ),
         );
     }
@@ -718,6 +731,9 @@ pub(crate) fn build_listener_core(
                     route.health_check.failure_threshold,
                     Duration::from_millis(route.health_check.cooldown_ms),
                     route.health_check.half_open_successes_required,
+                    route.health_check.flap_backoff_multiplier,
+                    Duration::from_millis(route.health_check.max_flap_cooldown_ms),
+                    Duration::from_millis(route.health_check.flap_streak_reset_ms),
                 ),
             );
         }
@@ -732,6 +748,9 @@ pub(crate) fn build_listener_core(
                     canary.health_check.failure_threshold,
                     Duration::from_millis(canary.health_check.cooldown_ms),
                     canary.health_check.half_open_successes_required,
+                    canary.health_check.flap_backoff_multiplier,
+                    Duration::from_millis(canary.health_check.max_flap_cooldown_ms),
+                    Duration::from_millis(canary.health_check.flap_streak_reset_ms),
                 ),
             );
         }
