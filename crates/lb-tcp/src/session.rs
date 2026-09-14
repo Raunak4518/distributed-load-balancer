@@ -209,11 +209,14 @@ where
         // path's guard.
         let _active_guard = ctx.pool.track_active(&backend_id);
 
+        let attempt_started = std::time::Instant::now();
         match establish(&ctx, &backend).await {
             Some(stream) => {
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_success.inc();
                 }
+                ctx.balancer
+                    .record_latency(&backend_id, attempt_started.elapsed());
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     breaker.record_success();
                 }
@@ -229,6 +232,8 @@ where
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_failure.inc();
                 }
+                ctx.balancer
+                    .record_latency(&backend_id, attempt_started.elapsed());
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     breaker.record_failure();
                     ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
@@ -415,6 +420,58 @@ mod tests {
             ConnectionOutcome::Completed {
                 bytes_to_backend: 4,
                 bytes_to_client: 4
+            }
+        );
+    }
+
+    /// The balancer is consulted once, at connect time -- never again for the
+    /// life of this session. Proven here by mutating the pool out from under
+    /// an already-established connection (removing its backend entirely) and
+    /// showing the session keeps proxying bytes over the same socket anyway,
+    /// since `pump` only ever holds the already-connected stream, never a
+    /// reference back into the pool.
+    #[tokio::test]
+    async fn an_established_connection_survives_its_backend_leaving_the_pool() {
+        let backend_addr = spawn_echo_backend().await;
+        let ctx = context(
+            AllowAll,
+            FirstEligible,
+            vec![Backend::new("b1", backend_addr, 1, None)],
+        );
+        let pool = Arc::clone(&ctx.pool);
+
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let ctx_for_session = Arc::clone(&ctx);
+        let server = tokio::spawn(async move {
+            let (stream, peer) = front.accept().await.unwrap();
+            handle_connection(stream, peer, ctx_for_session).await
+        });
+
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
+        client.write_all(b"first").await.unwrap();
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"first");
+
+        pool.apply_resolved(vec![]);
+        assert!(
+            pool.all_backend_ids().is_empty(),
+            "the pool must genuinely no longer list this backend"
+        );
+
+        client.write_all(b"second").await.unwrap();
+        let mut buf2 = [0u8; 6];
+        client.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"second");
+
+        client.shutdown().await.unwrap();
+        let outcome = server.await.unwrap();
+        assert_eq!(
+            outcome,
+            ConnectionOutcome::Completed {
+                bytes_to_backend: 11,
+                bytes_to_client: 11
             }
         );
     }

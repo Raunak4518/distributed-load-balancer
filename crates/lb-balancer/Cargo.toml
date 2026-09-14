@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 lb-core = { path = "../lb-core" }
+
+[dev-dependencies]
+lb-core = { path = "../lb-core", features = ["test-util"] }

@@ -760,6 +760,11 @@ pub enum LoadBalancingStrategy {
     /// the same backend as long as the backend set doesn't change. Backend
     /// `weight` still applies, via virtual nodes on the ring.
     ConsistentHash,
+    /// Power-of-two-choices: samples two eligible backends at random and
+    /// picks whichever has the lower `decaying_latency_estimate * (pending +
+    /// 1)`. Adapts to real backend responsiveness and current load, unlike
+    /// the other four strategies, none of which look at latency at all.
+    PeakEwmaP2c,
 }
 
 impl Config {
@@ -3048,5 +3053,19 @@ listen = "0.0.0.0:443"
     fn backend_weight_defaults_to_one() {
         let cfg = Config::parse(VALID).unwrap();
         assert_eq!(cfg.listeners[0].backends[0].weight, 1);
+    }
+
+    #[test]
+    fn parses_peak_ewma_p2c_strategy() {
+        let text = VALID.replacen(
+            "strategy = \"round_robin\"",
+            "strategy = \"peak_ewma_p2c\"",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.listeners[0].load_balancing.strategy,
+            LoadBalancingStrategy::PeakEwmaP2c
+        );
     }
 }

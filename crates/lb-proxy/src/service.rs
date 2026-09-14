@@ -711,6 +711,7 @@ where
                     bm.upstream_duration
                         .observe(attempt_started.elapsed().as_secs_f64());
                 }
+                balancer.record_latency(&backend_id, attempt_started.elapsed());
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     breaker.record_success();
                 }
@@ -789,6 +790,7 @@ where
                         ForwardError::Connect => bm.requests_failure.inc(),
                     }
                 }
+                balancer.record_latency(&backend_id, attempt_started.elapsed());
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     breaker.record_failure();
                     // Propagate immediately so the retry attempt below (if any)

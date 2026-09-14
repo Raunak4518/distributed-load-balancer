@@ -1,5 +1,6 @@
 use crate::backend::BackendId;
 use crate::pool::BackendPool;
+use std::time::Duration;
 
 pub trait LoadBalancer: Send + Sync {
     /// `key` is whatever the caller already uses to key rate limiting
@@ -8,4 +9,13 @@ pub trait LoadBalancer: Send + Sync {
     /// also its sticky-routing identity. Strategies that don't need one
     /// (`RoundRobin`, `LeastConnections`, `WeightedRoundRobin`) ignore it.
     fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId>;
+
+    /// Feedback from one completed attempt against `id` -- called
+    /// unconditionally by both the HTTP and TCP data planes after every
+    /// attempt, success or failure alike, so a strategy that wants it never
+    /// has to be specially wired in. Default no-op: `RoundRobin`,
+    /// `LeastConnections`, `WeightedRoundRobin`, and `ConsistentHash` have no
+    /// use for it and need no change. `PeakEwmaP2c` is the one strategy that
+    /// overrides this.
+    fn record_latency(&self, _id: &BackendId, _latency: Duration) {}
 }
