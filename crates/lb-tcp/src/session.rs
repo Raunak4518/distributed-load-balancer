@@ -3,7 +3,7 @@ use lb_core::{
     Backend, BackendId, BackendPool, Clock, Decision, LoadBalancer, OutboundTransport, ProxyStream,
     RateLimiter,
 };
-use lb_healthcheck::CircuitBreaker;
+use lb_healthcheck::{CircuitBreaker, OutlierDetector};
 use lb_metrics::{BackendMetrics, IntGauge, ListenerMetrics};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -16,6 +16,9 @@ pub struct TcpContext<R: RateLimiter, C: Clock> {
     pub balancer: Arc<dyn LoadBalancer>,
     pub pool: Arc<BackendPool>,
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
+    /// See `lb_proxy::ProxyContext::outlier`. TCP has no routes/canary, so
+    /// there is only ever this one.
+    pub outlier: Option<Arc<OutlierDetector>>,
     pub connect_timeout: Duration,
     pub idle_timeout: Duration,
     /// Present only when this listener re-encrypts to its backends; `None`
@@ -217,6 +220,9 @@ where
                     bm.requests_success.inc();
                 }
                 ctx.balancer.record_latency(&backend_id, elapsed);
+                if let Some(outlier) = &ctx.outlier {
+                    outlier.record_outcome(&backend_id, true);
+                }
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     // Connect-establishment latency, not full session
                     // duration -- the same passive-health distinction
@@ -243,6 +249,9 @@ where
                 }
                 ctx.balancer
                     .record_latency(&backend_id, attempt_started.elapsed());
+                if let Some(outlier) = &ctx.outlier {
+                    outlier.record_outcome(&backend_id, false);
+                }
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     breaker.record_failure();
                     ctx.pool.set_circuit_open(&backend_id, breaker.is_open());
@@ -378,6 +387,7 @@ mod tests {
             balancer: Arc::new(balancer),
             pool,
             circuit_breakers,
+            outlier: None,
             connect_timeout: Duration::from_millis(500),
             idle_timeout: Duration::from_secs(5),
             backend_tls: None,

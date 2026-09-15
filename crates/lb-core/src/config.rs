@@ -731,6 +731,40 @@ pub struct HealthCheckConfig {
     /// circuit breaker, independent of that request's own latency or status.
     #[serde(default)]
     pub unhealthy_request_count: Option<usize>,
+    /// If set, this pool's backends are also compared statistically against
+    /// each other on a rolling basis -- see `lb_healthcheck::OutlierDetector`.
+    /// `None` (the default) leaves this off entirely: no background task is
+    /// spawned and no per-request bookkeeping happens.
+    #[serde(default)]
+    pub outlier_detection: Option<OutlierDetectionConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct OutlierDetectionConfig {
+    /// A backend needs at least this many recorded outcomes since the last
+    /// evaluation round to be judged at all that round.
+    #[serde(default = "default_outlier_min_volume")]
+    pub min_volume: u32,
+    /// The pool needs at least this many backends meeting `min_volume` in a
+    /// round before detection activates at all that round.
+    #[serde(default = "default_outlier_min_hosts")]
+    pub min_hosts: usize,
+    /// How many standard deviations below the pool's mean success rate
+    /// counts as an outlier.
+    #[serde(default = "default_outlier_stddev_factor")]
+    pub stddev_factor: f64,
+}
+
+fn default_outlier_min_volume() -> u32 {
+    20
+}
+
+fn default_outlier_min_hosts() -> usize {
+    3
+}
+
+fn default_outlier_stddev_factor() -> f64 {
+    1.9
 }
 
 fn default_half_open_successes_required() -> u32 {
@@ -1030,6 +1064,13 @@ impl ListenerConfig {
                 "health_check.unhealthy_request_count must be positive if set".into(),
             ));
         }
+        if let Some(od) = &self.health_check.outlier_detection {
+            if od.min_volume == 0 || od.min_hosts < 2 || od.stddev_factor <= 0.0 {
+                return Err(invalid(
+                    "health_check.outlier_detection requires min_volume > 0, min_hosts >= 2, and stddev_factor > 0.0".into(),
+                ));
+            }
+        }
 
         if self.max_connections() == 0 || self.max_connections_per_ip() == 0 {
             return Err(invalid(
@@ -1086,6 +1127,13 @@ impl ListenerConfig {
                             "each [[listeners.routes]] health_check.unhealthy_latency_ms/unhealthy_request_count must be positive if set".into(),
                         ));
                     }
+                    if let Some(od) = &route.health_check.outlier_detection {
+                        if od.min_volume == 0 || od.min_hosts < 2 || od.stddev_factor <= 0.0 {
+                            return Err(invalid(
+                                "each [[listeners.routes]] health_check.outlier_detection requires min_volume > 0, min_hosts >= 2, and stddev_factor > 0.0".into(),
+                            ));
+                        }
+                    }
                 }
                 let mut canary_percent_total: u32 = 0;
                 for pool in &self.canary {
@@ -1110,6 +1158,13 @@ impl ListenerConfig {
                         return Err(invalid(
                             "each [[listeners.canary]] health_check.unhealthy_latency_ms/unhealthy_request_count must be positive if set".into(),
                         ));
+                    }
+                    if let Some(od) = &pool.health_check.outlier_detection {
+                        if od.min_volume == 0 || od.min_hosts < 2 || od.stddev_factor <= 0.0 {
+                            return Err(invalid(
+                                "each [[listeners.canary]] health_check.outlier_detection requires min_volume > 0, min_hosts >= 2, and stddev_factor > 0.0".into(),
+                            ));
+                        }
                     }
                     if pool.percent == 0 || pool.percent > 99 {
                         return Err(invalid(
@@ -2236,6 +2291,7 @@ mod tests {
         assert_eq!(l.health_check.flap_streak_reset_ms, 60_000);
         assert_eq!(l.health_check.unhealthy_latency_ms, None);
         assert_eq!(l.health_check.unhealthy_request_count, None);
+        assert_eq!(l.health_check.outlier_detection, None);
     }
 
     #[test]
@@ -2305,6 +2361,73 @@ mod tests {
             err.contains("unhealthy_request_count"),
             "unhelpful error: {err}"
         );
+    }
+
+    #[test]
+    fn parses_explicit_outlier_detection_settings() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n\n          [listeners.health_check.outlier_detection]\n          min_volume = 50\n          min_hosts = 4\n          stddev_factor = 2.5",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let od = cfg.listeners[0]
+            .health_check
+            .outlier_detection
+            .expect("configured");
+        assert_eq!(od.min_volume, 50);
+        assert_eq!(od.min_hosts, 4);
+        assert_eq!(od.stddev_factor, 2.5);
+    }
+
+    #[test]
+    fn outlier_detection_fields_default_when_the_section_is_present_but_empty() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n\n          [listeners.health_check.outlier_detection]",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        let od = cfg.listeners[0]
+            .health_check
+            .outlier_detection
+            .expect("configured");
+        assert_eq!(od.min_volume, 20);
+        assert_eq!(od.min_hosts, 3);
+        assert_eq!(od.stddev_factor, 1.9);
+    }
+
+    #[test]
+    fn rejects_an_outlier_detection_min_hosts_below_two() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n\n          [listeners.health_check.outlier_detection]\n          min_hosts = 1",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("outlier_detection"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn rejects_an_outlier_detection_zero_min_volume() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n\n          [listeners.health_check.outlier_detection]\n          min_volume = 0",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("outlier_detection"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn rejects_a_non_positive_outlier_stddev_factor() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n\n          [listeners.health_check.outlier_detection]\n          stddev_factor = 0.0",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(err.contains("outlier_detection"), "unhelpful error: {err}");
     }
 
     #[test]

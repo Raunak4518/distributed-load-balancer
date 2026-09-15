@@ -181,6 +181,7 @@ mod tests {
             flap_streak_reset_ms: 60_000,
             unhealthy_latency_ms: None,
             unhealthy_request_count: None,
+            outlier_detection: None,
         }
     }
 
@@ -305,6 +306,7 @@ mod tests {
                 flap_streak_reset_ms: 60_000,
                 unhealthy_latency_ms: None,
                 unhealthy_request_count: None,
+                outlier_detection: None,
             },
             no_op_transport(),
             test_metrics(),

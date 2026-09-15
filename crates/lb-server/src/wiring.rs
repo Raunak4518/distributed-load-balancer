@@ -7,7 +7,8 @@ use lb_core::{
     ListenerConfig, LoadBalancer, LoadBalancingStrategy, LoggingConfig, Protocol, SystemClock,
 };
 use lb_healthcheck::{
-    spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, TcpConnectProbe,
+    spawn_active_checker, spawn_outlier_detector, ActiveCheckConfig, CircuitBreaker, HttpProbe,
+    OutlierConfig, OutlierDetector, TcpConnectProbe,
 };
 use lb_metrics::Metrics;
 use lb_proxy::{spawn_cache_sweeper, CompiledRoute, ProxyContext, ResponseCache, StickyRuntime};
@@ -457,6 +458,11 @@ pub fn build_app(
 pub(crate) struct ListenerCore {
     pub(crate) backends: Vec<Backend>,
     pub(crate) pool: Arc<BackendPool>,
+    /// `Some` exactly when `lc.health_check.outlier_detection` is set --
+    /// the same instance already living inside `kind`'s `ProxyContext`/
+    /// `TcpContext`, kept here too so `spawn_listener_tasks` can spawn its
+    /// periodic recompute task without reaching into `kind`.
+    pub(crate) outlier: Option<Arc<OutlierDetector>>,
     pub(crate) kind: ListenerCoreKind,
     /// One entry per `[[listeners.routes]]` rule, in declaration order --
     /// always empty for a TCP listener (routes are HTTP-only, rejected at
@@ -481,6 +487,8 @@ pub(crate) struct ListenerCore {
 pub(crate) struct RoutePool {
     pub(crate) backends: Vec<Backend>,
     pub(crate) pool: Arc<BackendPool>,
+    /// See `ListenerCore::outlier` -- this route's own, independent instance.
+    pub(crate) outlier: Option<Arc<OutlierDetector>>,
     /// A route's own `health_check`, independent of the listener's default
     /// one -- a route may probe a different path/interval than the backends
     /// it falls back to.
@@ -497,6 +505,9 @@ pub(crate) struct RoutePool {
 pub(crate) struct CanaryPool {
     pub(crate) backends: Vec<Backend>,
     pub(crate) pool: Arc<BackendPool>,
+    /// See `ListenerCore::outlier` -- this canary pool's own, independent
+    /// instance.
+    pub(crate) outlier: Option<Arc<OutlierDetector>>,
     pub(crate) health_check: HealthCheckConfig,
 }
 
@@ -623,6 +634,35 @@ fn new_or_migrated_breaker(
     }
 }
 
+/// `None` when `health_check.outlier_detection` is unset (the default) --
+/// the ordinary case, costing nothing beyond this one check.
+///
+/// `eject_ticks` is derived from the *existing* `cooldown_ms`/`interval_ms`
+/// (rounded up, floored at 1 recompute round) rather than a new config
+/// field: an ejected backend staying out for roughly the same duration the
+/// circuit breaker's own cooldown already uses is the least surprising
+/// default, and it keeps outlier detection's entire config surface to the
+/// one `[listeners.health_check.outlier_detection]` section.
+fn build_outlier_detector(
+    backends: &[Backend],
+    health_check: &HealthCheckConfig,
+) -> Option<Arc<OutlierDetector>> {
+    let od = health_check.outlier_detection.as_ref()?;
+    let eject_ticks = health_check
+        .cooldown_ms
+        .div_ceil(health_check.interval_ms.max(1))
+        .max(1) as u32;
+    Some(Arc::new(OutlierDetector::new(
+        backends.iter().map(|b| b.id.clone()),
+        OutlierConfig {
+            min_volume: od.min_volume,
+            min_hosts: od.min_hosts,
+            stddev_factor: od.stddev_factor,
+            eject_ticks,
+        },
+    )))
+}
+
 /// Builds one listener's pool, rate limiter, circuit breakers, and
 /// protocol-specific context. Infallible: the one fallible step for a
 /// listener (`build_backend_connector`, real file I/O) has already happened
@@ -646,13 +686,20 @@ pub(crate) fn build_listener_core(
         .collect();
     let pool = Arc::new(BackendPool::new(backends.clone()));
     seed_drained(&pool, &backends, previous);
+    let outlier = build_outlier_detector(&backends, &lc.health_check);
 
     // Built once per route, the same way the default `backends`/`pool` above
     // are -- `Config::validate()` already guarantees every id here is unique
     // across the default backends and every route's, so the flat
     // `circuit_breakers`/`backend_metrics` maps built below stay correct with
     // no per-pool scoping key.
-    let route_pools: Vec<(&lb_core::RouteConfig, Vec<Backend>, Arc<BackendPool>)> = lc
+    #[allow(clippy::type_complexity)]
+    let route_pools: Vec<(
+        &lb_core::RouteConfig,
+        Vec<Backend>,
+        Arc<BackendPool>,
+        Option<Arc<OutlierDetector>>,
+    )> = lc
         .routes
         .iter()
         .map(|r| {
@@ -663,11 +710,18 @@ pub(crate) fn build_listener_core(
                 .collect();
             let route_pool = Arc::new(BackendPool::new(route_backends.clone()));
             seed_drained(&route_pool, &route_backends, previous);
-            (r, route_backends, route_pool)
+            let route_outlier = build_outlier_detector(&route_backends, &r.health_check);
+            (r, route_backends, route_pool, route_outlier)
         })
         .collect();
     // Same construction as `route_pools` above, for `[[listeners.canary]]`.
-    let canary_pools: Vec<(&lb_core::CanaryPoolConfig, Vec<Backend>, Arc<BackendPool>)> = lc
+    #[allow(clippy::type_complexity)]
+    let canary_pools: Vec<(
+        &lb_core::CanaryPoolConfig,
+        Vec<Backend>,
+        Arc<BackendPool>,
+        Option<Arc<OutlierDetector>>,
+    )> = lc
         .canary
         .iter()
         .map(|c| {
@@ -678,14 +732,15 @@ pub(crate) fn build_listener_core(
                 .collect();
             let canary_pool = Arc::new(BackendPool::new(canary_backends.clone()));
             seed_drained(&canary_pool, &canary_backends, previous);
-            (c, canary_backends, canary_pool)
+            let canary_outlier = build_outlier_detector(&canary_backends, &c.health_check);
+            (c, canary_backends, canary_pool, canary_outlier)
         })
         .collect();
     let all_backends = || {
         backends
             .iter()
-            .chain(route_pools.iter().flat_map(|(_, bs, _)| bs.iter()))
-            .chain(canary_pools.iter().flat_map(|(_, bs, _)| bs.iter()))
+            .chain(route_pools.iter().flat_map(|(_, bs, _, _)| bs.iter()))
+            .chain(canary_pools.iter().flat_map(|(_, bs, _, _)| bs.iter()))
     };
 
     // Pins the L7 forwarding client's TCP dial to each backend's configured
@@ -731,7 +786,7 @@ pub(crate) fn build_listener_core(
             ),
         );
     }
-    for (route, route_backends, _) in &route_pools {
+    for (route, route_backends, _, _) in &route_pools {
         for b in route_backends {
             circuit_breakers.insert(
                 b.id.clone(),
@@ -753,7 +808,7 @@ pub(crate) fn build_listener_core(
             );
         }
     }
-    for (canary, canary_backends, _) in &canary_pools {
+    for (canary, canary_backends, _, _) in &canary_pools {
         for b in canary_backends {
             circuit_breakers.insert(
                 b.id.clone(),
@@ -845,11 +900,12 @@ pub(crate) fn build_listener_core(
             // empty or nothing matches.
             let compiled_routes: Vec<CompiledRoute> = route_pools
                 .iter()
-                .map(|(route, _, route_pool)| CompiledRoute {
+                .map(|(route, _, route_pool, route_outlier)| CompiledRoute {
                     path_prefix: route.path_prefix.clone(),
                     host: route.host.clone(),
                     pool: Arc::clone(route_pool),
                     balancer: build_balancer(&route.load_balancing.strategy),
+                    outlier: route_outlier.clone(),
                 })
                 .collect();
             // One `CompiledCanaryPool` per `[[listeners.canary]]` pool, in
@@ -857,11 +913,14 @@ pub(crate) fn build_listener_core(
             // walks this `Vec` only for a request that matched no route.
             let compiled_canary: Vec<lb_proxy::CompiledCanaryPool> = canary_pools
                 .iter()
-                .map(|(canary, _, canary_pool)| lb_proxy::CompiledCanaryPool {
-                    percent: canary.percent,
-                    pool: Arc::clone(canary_pool),
-                    balancer: build_balancer(&canary.load_balancing.strategy),
-                })
+                .map(
+                    |(canary, _, canary_pool, canary_outlier)| lb_proxy::CompiledCanaryPool {
+                        percent: canary.percent,
+                        pool: Arc::clone(canary_pool),
+                        balancer: build_balancer(&canary.load_balancing.strategy),
+                        outlier: canary_outlier.clone(),
+                    },
+                )
                 .collect();
             ListenerCoreKind::Http(Box::new(ProxyContext {
                 rate_limiter,
@@ -888,6 +947,7 @@ pub(crate) fn build_listener_core(
                 }),
                 waf: lc.waf.as_ref().map(|w| w.mode),
                 circuit_breakers,
+                outlier: outlier.clone(),
                 client,
                 per_backend_client,
                 backend_tls: backend_tls.is_some(),
@@ -930,6 +990,7 @@ pub(crate) fn build_listener_core(
                 balancer: build_balancer(&lc.load_balancing.strategy),
                 pool: Arc::clone(&pool),
                 circuit_breakers,
+                outlier: outlier.clone(),
                 connect_timeout: lc.connect_timeout(),
                 idle_timeout: lc.idle_timeout(),
                 backend_tls: outbound,
@@ -943,17 +1004,19 @@ pub(crate) fn build_listener_core(
 
     let routes: Vec<RoutePool> = route_pools
         .into_iter()
-        .map(|(route, backends, pool)| RoutePool {
+        .map(|(route, backends, pool, outlier)| RoutePool {
             backends,
             pool,
+            outlier,
             health_check: route.health_check.clone(),
         })
         .collect();
     let canary: Vec<CanaryPool> = canary_pools
         .into_iter()
-        .map(|(canary, backends, pool)| CanaryPool {
+        .map(|(canary, backends, pool, outlier)| CanaryPool {
             backends,
             pool,
+            outlier,
             health_check: canary.health_check.clone(),
         })
         .collect();
@@ -961,6 +1024,7 @@ pub(crate) fn build_listener_core(
     ListenerCore {
         backends,
         pool,
+        outlier,
         kind,
         routes,
         canary,
@@ -1019,6 +1083,7 @@ pub(crate) fn spawn_listener_tasks(
                 &mut tasks,
                 metrics,
                 &transport,
+                core.outlier.as_ref(),
             );
             // Every `[[listeners.routes]]` rule gets the same probe
             // transport as the default backends above (same client, same
@@ -1033,6 +1098,7 @@ pub(crate) fn spawn_listener_tasks(
                     &mut tasks,
                     metrics,
                     &transport,
+                    route.outlier.as_ref(),
                 );
             }
             // Same reasoning as routes above, for `[[listeners.canary]]`.
@@ -1045,6 +1111,7 @@ pub(crate) fn spawn_listener_tasks(
                     &mut tasks,
                     metrics,
                     &transport,
+                    canary.outlier.as_ref(),
                 );
             }
         }
@@ -1075,6 +1142,7 @@ pub(crate) fn spawn_listener_tasks(
                 &mut tasks,
                 metrics,
                 &transport,
+                core.outlier.as_ref(),
             );
         }
     }
@@ -1192,6 +1260,7 @@ pub(crate) enum ProbeTransport {
 /// `lc.protocol` instead would mean building the client and the transport
 /// here too, and then they would be *this* function's, not the listener's,
 /// which is precisely the divergence the whole design exists to prevent.
+#[allow(clippy::too_many_arguments)]
 fn spawn_health_checkers(
     listener_name: &str,
     health_check: &HealthCheckConfig,
@@ -1200,9 +1269,21 @@ fn spawn_health_checkers(
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
     metrics: &Metrics,
     transport: &ProbeTransport,
+    outlier: Option<&Arc<OutlierDetector>>,
 ) {
     let interval = Duration::from_millis(health_check.interval_ms);
     let timeout = Duration::from_millis(health_check.timeout_ms);
+
+    // Same cadence as the per-backend probes above, not a new operator-
+    // facing timer -- see `spawn_outlier_detector`'s own docs for why a
+    // pool-wide computation cannot just reuse one backend's own tick.
+    if let Some(detector) = outlier {
+        tasks.push(spawn_outlier_detector(
+            Arc::clone(pool),
+            Arc::clone(detector),
+            interval,
+        ));
+    }
 
     for b in backends {
         let config = ActiveCheckConfig {

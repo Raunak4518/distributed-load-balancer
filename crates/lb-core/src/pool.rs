@@ -15,6 +15,11 @@ struct BackendState {
     /// probe undo it. A third, orthogonal flag is what makes "drained" survive
     /// health checks the way "circuit open" already survives them.
     manually_drained: AtomicBool,
+    /// Set by `OutlierDetector::recompute` (lb-healthcheck): this backend's
+    /// success rate fell too far below its peers' this round, independent
+    /// of `circuit_open` -- see that type's docs for why this is a distinct
+    /// signal rather than folded into the breaker.
+    outlier_ejected: AtomicBool,
     /// In-flight requests/connections currently dialed to this backend --
     /// what `LeastConnections` compares. Incremented/decremented only
     /// through `ActiveConnGuard`, never directly, so a count can't leak on
@@ -40,6 +45,7 @@ impl PoolState {
                     active_healthy: AtomicBool::new(true),
                     circuit_open: AtomicBool::new(false),
                     manually_drained: AtomicBool::new(false),
+                    outlier_ejected: AtomicBool::new(false),
                     active_conns: AtomicUsize::new(0),
                 }),
             );
@@ -73,6 +79,25 @@ impl BackendPool {
         if let Some(s) = self.inner.load().states.get(id) {
             s.circuit_open.store(open, Ordering::SeqCst);
         }
+    }
+
+    /// Written by `OutlierDetector::recompute` (lb-healthcheck) -- see
+    /// `BackendState::outlier_ejected`.
+    pub fn set_outlier_ejected(&self, id: &BackendId, ejected: bool) {
+        if let Some(s) = self.inner.load().states.get(id) {
+            s.outlier_ejected.store(ejected, Ordering::SeqCst);
+        }
+    }
+
+    /// The outlier-ejection flag alone, `false` for an unknown id -- see
+    /// `is_active_healthy` for why the individual flags are exposed
+    /// separately from `is_eligible`.
+    pub fn is_outlier_ejected(&self, id: &BackendId) -> bool {
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .is_some_and(|s| s.outlier_ejected.load(Ordering::SeqCst))
     }
 
     /// Operator-requested drain, e.g. the admin API's `POST .../drain` --
@@ -125,6 +150,7 @@ impl BackendPool {
             s.active_healthy.load(Ordering::SeqCst)
                 && !s.circuit_open.load(Ordering::SeqCst)
                 && !s.manually_drained.load(Ordering::SeqCst)
+                && !s.outlier_ejected.load(Ordering::SeqCst)
         })
     }
 
@@ -138,6 +164,7 @@ impl BackendPool {
                     s.active_healthy.load(Ordering::SeqCst)
                         && !s.circuit_open.load(Ordering::SeqCst)
                         && !s.manually_drained.load(Ordering::SeqCst)
+                        && !s.outlier_ejected.load(Ordering::SeqCst)
                 })
             })
             .cloned()
@@ -189,6 +216,9 @@ impl BackendPool {
                     manually_drained: AtomicBool::new(
                         existing.manually_drained.load(Ordering::SeqCst),
                     ),
+                    outlier_ejected: AtomicBool::new(
+                        existing.outlier_ejected.load(Ordering::SeqCst),
+                    ),
                     // A persisting backend's in-flight work didn't go
                     // anywhere just because the pool was refreshed.
                     active_conns: AtomicUsize::new(existing.active_conns.load(Ordering::SeqCst)),
@@ -198,6 +228,7 @@ impl BackendPool {
                     active_healthy: AtomicBool::new(true),
                     circuit_open: AtomicBool::new(false),
                     manually_drained: AtomicBool::new(false),
+                    outlier_ejected: AtomicBool::new(false),
                     active_conns: AtomicUsize::new(0),
                 }),
             };
@@ -255,6 +286,39 @@ mod tests {
         let pool = pool_of(&["b1", "b2"]);
         pool.set_circuit_open(&BackendId::new("b2"), true);
         assert_eq!(pool.eligible_backends(), vec![BackendId::new("b1")]);
+    }
+
+    #[test]
+    fn outlier_ejection_removes_from_eligible() {
+        let pool = pool_of(&["b1", "b2"]);
+        pool.set_outlier_ejected(&BackendId::new("b2"), true);
+        assert_eq!(pool.eligible_backends(), vec![BackendId::new("b1")]);
+        assert!(pool.is_outlier_ejected(&BackendId::new("b2")));
+        assert!(!pool.is_outlier_ejected(&BackendId::new("b1")));
+    }
+
+    #[test]
+    fn clearing_outlier_ejection_restores_eligibility() {
+        let pool = pool_of(&["b1"]);
+        let id = BackendId::new("b1");
+        pool.set_outlier_ejected(&id, true);
+        assert!(!pool.is_eligible(&id));
+        pool.set_outlier_ejected(&id, false);
+        assert!(pool.is_eligible(&id));
+    }
+
+    #[test]
+    fn apply_resolved_preserves_outlier_ejection_for_a_persisting_backend() {
+        let pool = pool_of(&["b1", "b2"]);
+        let id = BackendId::new("b1");
+        pool.set_outlier_ejected(&id, true);
+
+        pool.apply_resolved(vec![
+            Backend::new("b1", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("b2", "127.0.0.1:9000".parse().unwrap(), 1, None),
+        ]);
+
+        assert!(!pool.is_eligible(&id));
     }
 
     /// The two flags are independently observable, not just folded into

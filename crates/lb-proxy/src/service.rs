@@ -12,7 +12,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use lb_core::{
     BackendId, BackendPool, Clock, Decision, LoadBalancer, RateLimitKeySource, RateLimiter, WafMode,
 };
-use lb_healthcheck::CircuitBreaker;
+use lb_healthcheck::{CircuitBreaker, OutlierDetector};
 use lb_metrics::{BackendMetrics, ListenerMetrics, StatusClass};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -74,6 +74,11 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// unambiguously names one backend in one pool (`pool` or exactly one
     /// `routes[i].pool`) regardless of how many pools this context holds.
     pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
+    /// `Some` only when `health_check.outlier_detection` is configured for
+    /// the *default* pool above -- see `lb_healthcheck::OutlierDetector`.
+    /// `routes`/`canary` carry their own, independent of this one, since
+    /// outlier detection is inherently pool-relative.
+    pub outlier: Option<Arc<OutlierDetector>>,
     pub client: ProxyClient,
     /// Set only for a `dns_discovery` + `backend_tls` HTTP listener, where
     /// several backends share one `server_name` and so cannot safely share
@@ -152,6 +157,8 @@ pub struct CompiledRoute {
     pub host: Option<String>,
     pub pool: Arc<BackendPool>,
     pub balancer: Arc<dyn LoadBalancer>,
+    /// See `ProxyContext::outlier` -- this route's own, independent instance.
+    pub outlier: Option<Arc<OutlierDetector>>,
 }
 
 /// One `[[listeners.canary]]` pool -- see `ProxyContext::canary`. Mirrors
@@ -165,6 +172,9 @@ pub struct CompiledCanaryPool {
     pub percent: u8,
     pub pool: Arc<BackendPool>,
     pub balancer: Arc<dyn LoadBalancer>,
+    /// See `ProxyContext::outlier` -- this canary pool's own, independent
+    /// instance.
+    pub outlier: Option<Arc<OutlierDetector>>,
 }
 
 /// `path` must be the path component alone (no query string) -- a route's
@@ -215,20 +225,25 @@ fn resolve_route<'a, R: RateLimiter, C: Clock>(
 /// pattern as `lb_balancer::RoundRobin`'s own cursor), bucketed by
 /// cumulative `percent` -- exact long-run convergence to the configured
 /// split, no `rand` dependency.
+#[allow(clippy::type_complexity)]
 fn resolve_default_or_canary_pool<'a, R: RateLimiter, C: Clock>(
     ctx: &'a ProxyContext<R, C>,
     sticky_pin: Option<&BackendId>,
-) -> (&'a Arc<BackendPool>, &'a Arc<dyn LoadBalancer>) {
+) -> (
+    &'a Arc<BackendPool>,
+    &'a Arc<dyn LoadBalancer>,
+    Option<&'a Arc<OutlierDetector>>,
+) {
     if ctx.canary.is_empty() {
-        return (&ctx.pool, &ctx.balancer);
+        return (&ctx.pool, &ctx.balancer, ctx.outlier.as_ref());
     }
     if let Some(id) = sticky_pin {
         if ctx.pool.all_backend_ids().contains(id) {
-            return (&ctx.pool, &ctx.balancer);
+            return (&ctx.pool, &ctx.balancer, ctx.outlier.as_ref());
         }
         for c in &ctx.canary {
             if c.pool.all_backend_ids().contains(id) {
-                return (&c.pool, &c.balancer);
+                return (&c.pool, &c.balancer, c.outlier.as_ref());
             }
         }
     }
@@ -240,10 +255,10 @@ fn resolve_default_or_canary_pool<'a, R: RateLimiter, C: Clock>(
     for c in &ctx.canary {
         cumulative += c.percent as u32;
         if (bucket as u32) < cumulative {
-            return (&c.pool, &c.balancer);
+            return (&c.pool, &c.balancer, c.outlier.as_ref());
         }
     }
-    (&ctx.pool, &ctx.balancer)
+    (&ctx.pool, &ctx.balancer, ctx.outlier.as_ref())
 }
 
 /// Sampled per-request access logging.
@@ -601,8 +616,12 @@ where
     // match always wins outright; only the fallback case is subject to
     // `[[listeners.canary]]`'s weighted split.
     let route = resolve_route(&ctx, req.uri().path(), req.headers());
-    let (pool, balancer): (&Arc<BackendPool>, &Arc<dyn LoadBalancer>) = match route {
-        Some(r) => (&r.pool, &r.balancer),
+    let (pool, balancer, outlier): (
+        &Arc<BackendPool>,
+        &Arc<dyn LoadBalancer>,
+        Option<&Arc<OutlierDetector>>,
+    ) = match route {
+        Some(r) => (&r.pool, &r.balancer, r.outlier.as_ref()),
         None => resolve_default_or_canary_pool(&ctx, sticky_pin.as_ref()),
     };
 
@@ -712,6 +731,15 @@ where
                     bm.upstream_duration.observe(elapsed.as_secs_f64());
                 }
                 balancer.record_latency(&backend_id, elapsed);
+                // A 5xx status is a transport-level "success" (`forward`
+                // completed) but not a real one -- the outlier detector's
+                // "success rate" tracks what actually reached the client,
+                // the same status-based definition Envoy's own success-rate
+                // outlier detection uses, deliberately independent of the
+                // passive latency/concurrency thresholds just below.
+                if let Some(outlier) = outlier {
+                    outlier.record_outcome(&backend_id, !resp.status().is_server_error());
+                }
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     // A response can reach the client successfully and still
                     // count as a passive health-check failure: too slow, or
@@ -804,6 +832,9 @@ where
                     }
                 }
                 balancer.record_latency(&backend_id, attempt_started.elapsed());
+                if let Some(outlier) = outlier {
+                    outlier.record_outcome(&backend_id, false);
+                }
                 if let Some(breaker) = ctx.circuit_breaker(&backend_id) {
                     breaker.record_failure();
                     // Propagate immediately so the retry attempt below (if any)
@@ -1078,6 +1109,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1111,6 +1143,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1163,6 +1196,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1200,6 +1234,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1253,6 +1288,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1324,6 +1360,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1389,6 +1426,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1454,6 +1492,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: breakers,
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1602,6 +1641,7 @@ mod tests {
                 host: route_host.map(str::to_string),
                 pool: route_pool,
                 balancer: Arc::new(FixedPick(route_backend.id.clone())),
+                outlier: None,
             }],
             canary: Vec::new(),
             canary_cursor: std::sync::atomic::AtomicUsize::new(0),
@@ -1609,6 +1649,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1694,12 +1735,14 @@ mod tests {
                     host: None,
                     pool: Arc::new(BackendPool::new(vec![first_backend.clone()])),
                     balancer: Arc::new(FixedPick(first_backend.id.clone())),
+                    outlier: None,
                 },
                 CompiledRoute {
                     path_prefix: Some("/api".to_string()),
                     host: None,
                     pool: Arc::new(BackendPool::new(vec![second_backend.clone()])),
                     balancer: Arc::new(FixedPick(second_backend.id.clone())),
+                    outlier: None,
                 },
             ],
             canary: Vec::new(),
@@ -1708,6 +1751,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1745,6 +1789,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1769,13 +1814,14 @@ mod tests {
             percent,
             pool: Arc::new(BackendPool::new(vec![backend.clone()])),
             balancer: Arc::new(FixedPick(backend.id)),
+            outlier: None,
         }
     }
 
     #[test]
     fn no_canary_configured_always_uses_the_default_pool() {
         let ctx = ctx_with_canary(Vec::new());
-        let (pool, _) = resolve_default_or_canary_pool(&ctx, None);
+        let (pool, _, _) = resolve_default_or_canary_pool(&ctx, None);
         assert!(Arc::ptr_eq(pool, &ctx.pool));
     }
 
@@ -1785,7 +1831,7 @@ mod tests {
         let mut canary_hits = 0;
         let mut default_hits = 0;
         for _ in 0..100 {
-            let (pool, _) = resolve_default_or_canary_pool(&ctx, None);
+            let (pool, _, _) = resolve_default_or_canary_pool(&ctx, None);
             if Arc::ptr_eq(pool, &ctx.canary[0].pool) {
                 canary_hits += 1;
             } else if Arc::ptr_eq(pool, &ctx.pool) {
@@ -1801,7 +1847,7 @@ mod tests {
         let ctx = ctx_with_canary(vec![canary_pool("canary-1", 9303, 5)]);
         let pinned = ctx.canary[0].pool.all_backend_ids()[0].clone();
 
-        let (pool, _) = resolve_default_or_canary_pool(&ctx, Some(&pinned));
+        let (pool, _, _) = resolve_default_or_canary_pool(&ctx, Some(&pinned));
 
         assert!(Arc::ptr_eq(pool, &ctx.canary[0].pool));
         assert_eq!(
@@ -1816,7 +1862,7 @@ mod tests {
         let ctx = ctx_with_canary(vec![canary_pool("canary-1", 9304, 99)]);
         let pinned = ctx.pool.all_backend_ids()[0].clone();
 
-        let (pool, _) = resolve_default_or_canary_pool(&ctx, Some(&pinned));
+        let (pool, _, _) = resolve_default_or_canary_pool(&ctx, Some(&pinned));
 
         assert!(Arc::ptr_eq(pool, &ctx.pool));
         assert_eq!(
@@ -1865,6 +1911,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2037,6 +2084,7 @@ mod tests {
             cache: Some(cache),
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2082,6 +2130,7 @@ mod tests {
             cache: Some(test_cache()),
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2123,6 +2172,7 @@ mod tests {
             cache: Some(test_cache()),
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2163,6 +2213,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2200,6 +2251,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Block),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2244,6 +2296,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Log),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2287,6 +2340,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2410,6 +2464,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2472,6 +2527,7 @@ mod tests {
             cache: None,
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
