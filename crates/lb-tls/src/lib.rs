@@ -1,4 +1,5 @@
 mod acceptor;
+mod acme;
 mod certs;
 mod connector;
 mod error;
@@ -8,6 +9,7 @@ mod resolver;
 mod transport;
 
 pub use acceptor::{install_crypto_provider, HandshakeError, TlsAcceptor};
+pub use acme::{account_for, obtain_certificate_http01, AcmeChallengeStore, AcmeError, AcmeTrust};
 pub use certs::{load_certificate, LoadedCert};
 pub use connector::BackendConnector;
 pub use error::TlsError;

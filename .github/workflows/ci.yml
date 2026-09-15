@@ -23,6 +23,38 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install Pebble ACME test server
+        run: |
+          go install github.com/letsencrypt/pebble/v2/cmd/pebble@latest
+          go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@latest
+
+      - name: Start Pebble ACME test server
+        run: |
+          mkdir -p /tmp/pebble/certs/localhost
+          curl -sL -o /tmp/pebble/config/pebble-config.json https://raw.githubusercontent.com/letsencrypt/pebble/main/test/config/pebble-config.json --create-dirs
+          sed -i 's#test/certs/localhost/cert.pem#certs/localhost/cert.pem#; s#test/certs/localhost/key.pem#certs/localhost/key.pem#' /tmp/pebble/config/pebble-config.json
+          curl -sL -o /tmp/pebble/certs/localhost/cert.pem https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/localhost/cert.pem
+          curl -sL -o /tmp/pebble/certs/localhost/key.pem https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/localhost/key.pem
+          curl -sL -o /tmp/pebble/pebble.minica.pem https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem
+
+          "$(go env GOPATH)/bin/pebble-challtestsrv" -http01 "" -https01 "" -tlsalpn01 "" -doh "" -dnsserver :8053 -management :8055 > /tmp/pebble/challtestsrv.log 2>&1 &
+          sleep 1
+          (cd /tmp/pebble && "$(go env GOPATH)/bin/pebble" -config config/pebble-config.json -dnsserver 127.0.0.1:8053 > /tmp/pebble/pebble.log 2>&1 &)
+          for i in $(seq 1 30); do
+            curl -sk https://127.0.0.1:14000/dir > /dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -sk https://127.0.0.1:14000/dir
+
+          echo "PEBBLE_DIRECTORY_URL=https://127.0.0.1:14000/dir" >> "$GITHUB_ENV"
+          echo "PEBBLE_CA_PEM=/tmp/pebble/pebble.minica.pem" >> "$GITHUB_ENV"
+          echo "PEBBLE_HTTP01_PORT=5002" >> "$GITHUB_ENV"
+
       - name: Format
         run: cargo fmt --all -- --check
 
