@@ -684,7 +684,10 @@ pub(crate) fn build_listener_core(
         .iter()
         .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
         .collect();
-    let pool = Arc::new(BackendPool::new(backends.clone()));
+    let pool = Arc::new(BackendPool::with_max_ejected_fraction(
+        backends.clone(),
+        lc.health_check.max_ejected_fraction,
+    ));
     seed_drained(&pool, &backends, previous);
     let outlier = build_outlier_detector(&backends, &lc.health_check);
 
@@ -708,7 +711,10 @@ pub(crate) fn build_listener_core(
                 .iter()
                 .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
                 .collect();
-            let route_pool = Arc::new(BackendPool::new(route_backends.clone()));
+            let route_pool = Arc::new(BackendPool::with_max_ejected_fraction(
+                route_backends.clone(),
+                r.health_check.max_ejected_fraction,
+            ));
             seed_drained(&route_pool, &route_backends, previous);
             let route_outlier = build_outlier_detector(&route_backends, &r.health_check);
             (r, route_backends, route_pool, route_outlier)
@@ -730,7 +736,10 @@ pub(crate) fn build_listener_core(
                 .iter()
                 .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
                 .collect();
-            let canary_pool = Arc::new(BackendPool::new(canary_backends.clone()));
+            let canary_pool = Arc::new(BackendPool::with_max_ejected_fraction(
+                canary_backends.clone(),
+                c.health_check.max_ejected_fraction,
+            ));
             seed_drained(&canary_pool, &canary_backends, previous);
             let canary_outlier = build_outlier_detector(&canary_backends, &c.health_check);
             (c, canary_backends, canary_pool, canary_outlier)

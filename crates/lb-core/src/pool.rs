@@ -56,12 +56,21 @@ impl PoolState {
 
 pub struct BackendPool {
     inner: ArcSwap<PoolState>,
+    max_ejected_fraction: Option<f64>,
 }
 
 impl BackendPool {
     pub fn new(backends: Vec<Backend>) -> Self {
+        Self::with_max_ejected_fraction(backends, None)
+    }
+
+    pub fn with_max_ejected_fraction(
+        backends: Vec<Backend>,
+        max_ejected_fraction: Option<f64>,
+    ) -> Self {
         BackendPool {
             inner: ArcSwap::from_pointee(PoolState::from_backends(backends)),
+            max_ejected_fraction,
         }
     }
 
@@ -76,17 +85,50 @@ impl BackendPool {
     }
 
     pub fn set_circuit_open(&self, id: &BackendId, open: bool) {
-        if let Some(s) = self.inner.load().states.get(id) {
-            s.circuit_open.store(open, Ordering::SeqCst);
+        let snapshot = self.inner.load();
+        let Some(s) = snapshot.states.get(id) else {
+            return;
+        };
+        if open && self.exceeds_ejection_ceiling(&snapshot, id) {
+            return;
         }
+        s.circuit_open.store(open, Ordering::SeqCst);
     }
 
-    /// Written by `OutlierDetector::recompute` (lb-healthcheck) -- see
-    /// `BackendState::outlier_ejected`.
     pub fn set_outlier_ejected(&self, id: &BackendId, ejected: bool) {
-        if let Some(s) = self.inner.load().states.get(id) {
-            s.outlier_ejected.store(ejected, Ordering::SeqCst);
+        let snapshot = self.inner.load();
+        let Some(s) = snapshot.states.get(id) else {
+            return;
+        };
+        if ejected && self.exceeds_ejection_ceiling(&snapshot, id) {
+            return;
         }
+        s.outlier_ejected.store(ejected, Ordering::SeqCst);
+    }
+
+    fn exceeds_ejection_ceiling(&self, snapshot: &PoolState, id: &BackendId) -> bool {
+        let Some(max_fraction) = self.max_ejected_fraction else {
+            return false;
+        };
+        let Some(state) = snapshot.states.get(id) else {
+            return false;
+        };
+        if state.circuit_open.load(Ordering::SeqCst) || state.outlier_ejected.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        let total = snapshot.order.len();
+        if total == 0 {
+            return false;
+        }
+        let currently_ejected = snapshot
+            .states
+            .values()
+            .filter(|s| {
+                s.circuit_open.load(Ordering::SeqCst) || s.outlier_ejected.load(Ordering::SeqCst)
+            })
+            .count();
+        (currently_ejected + 1) as f64 / total as f64 > max_fraction
     }
 
     /// The outlier-ejection flag alone, `false` for an unknown id -- see
@@ -265,6 +307,14 @@ mod tests {
         BackendPool::new(backends)
     }
 
+    fn pool_with_ceiling(ids: &[&str], max_ejected_fraction: f64) -> BackendPool {
+        let backends = ids
+            .iter()
+            .map(|id| Backend::new(*id, "127.0.0.1:9000".parse().unwrap(), 1, None))
+            .collect();
+        BackendPool::with_max_ejected_fraction(backends, Some(max_ejected_fraction))
+    }
+
     #[test]
     fn all_backends_start_eligible() {
         let pool = pool_of(&["b1", "b2"]);
@@ -295,6 +345,61 @@ mod tests {
         assert_eq!(pool.eligible_backends(), vec![BackendId::new("b1")]);
         assert!(pool.is_outlier_ejected(&BackendId::new("b2")));
         assert!(!pool.is_outlier_ejected(&BackendId::new("b1")));
+    }
+
+    #[test]
+    fn a_ceiling_refuses_a_circuit_trip_that_would_exceed_it() {
+        let pool = pool_with_ceiling(&["b1", "b2", "b3"], 0.34);
+        pool.set_circuit_open(&BackendId::new("b1"), true);
+        assert!(pool.is_circuit_open(&BackendId::new("b1")));
+        pool.set_circuit_open(&BackendId::new("b2"), true);
+        assert!(!pool.is_circuit_open(&BackendId::new("b2")));
+        assert!(pool.is_eligible(&BackendId::new("b2")));
+    }
+
+    #[test]
+    fn a_ceiling_refuses_an_outlier_ejection_that_would_exceed_it() {
+        let pool = pool_with_ceiling(&["b1", "b2", "b3"], 0.34);
+        pool.set_outlier_ejected(&BackendId::new("b1"), true);
+        assert!(pool.is_outlier_ejected(&BackendId::new("b1")));
+        pool.set_outlier_ejected(&BackendId::new("b2"), true);
+        assert!(!pool.is_outlier_ejected(&BackendId::new("b2")));
+    }
+
+    #[test]
+    fn a_ceiling_counts_circuit_open_and_outlier_ejected_together() {
+        let pool = pool_with_ceiling(&["b1", "b2", "b3"], 0.34);
+        pool.set_circuit_open(&BackendId::new("b1"), true);
+        pool.set_outlier_ejected(&BackendId::new("b2"), true);
+        assert!(pool.is_circuit_open(&BackendId::new("b1")));
+        assert!(!pool.is_outlier_ejected(&BackendId::new("b2")));
+    }
+
+    #[test]
+    fn a_ceiling_never_blocks_recovery() {
+        let pool = pool_with_ceiling(&["b1", "b2", "b3"], 0.4);
+        pool.set_circuit_open(&BackendId::new("b1"), true);
+        assert!(pool.is_circuit_open(&BackendId::new("b1")));
+        pool.set_circuit_open(&BackendId::new("b1"), false);
+        assert!(!pool.is_circuit_open(&BackendId::new("b1")));
+    }
+
+    #[test]
+    fn a_ceiling_does_not_double_count_a_backend_already_ejected() {
+        let pool = pool_with_ceiling(&["b1", "b2", "b3"], 0.34);
+        pool.set_circuit_open(&BackendId::new("b1"), true);
+        assert!(pool.is_circuit_open(&BackendId::new("b1")));
+        pool.set_circuit_open(&BackendId::new("b1"), true);
+        assert!(pool.is_circuit_open(&BackendId::new("b1")));
+    }
+
+    #[test]
+    fn without_a_ceiling_every_backend_can_be_ejected() {
+        let pool = pool_of(&["b1", "b2", "b3"]);
+        for id in ["b1", "b2", "b3"] {
+            pool.set_circuit_open(&BackendId::new(id), true);
+        }
+        assert!(pool.eligible_backends().is_empty());
     }
 
     #[test]

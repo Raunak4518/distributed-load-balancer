@@ -182,6 +182,7 @@ mod tests {
             unhealthy_latency_ms: None,
             unhealthy_request_count: None,
             outlier_detection: None,
+            max_ejected_fraction: None,
         }
     }
 
@@ -307,6 +308,7 @@ mod tests {
                 unhealthy_latency_ms: None,
                 unhealthy_request_count: None,
                 outlier_detection: None,
+                max_ejected_fraction: None,
             },
             no_op_transport(),
             test_metrics(),

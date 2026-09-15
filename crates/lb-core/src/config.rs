@@ -737,6 +737,8 @@ pub struct HealthCheckConfig {
     /// spawned and no per-request bookkeeping happens.
     #[serde(default)]
     pub outlier_detection: Option<OutlierDetectionConfig>,
+    #[serde(default)]
+    pub max_ejected_fraction: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -1071,6 +1073,13 @@ impl ListenerConfig {
                 ));
             }
         }
+        if let Some(f) = self.health_check.max_ejected_fraction {
+            if !(0.0..=1.0).contains(&f) {
+                return Err(invalid(
+                    "health_check.max_ejected_fraction must be between 0.0 and 1.0".into(),
+                ));
+            }
+        }
 
         if self.max_connections() == 0 || self.max_connections_per_ip() == 0 {
             return Err(invalid(
@@ -1134,6 +1143,13 @@ impl ListenerConfig {
                             ));
                         }
                     }
+                    if let Some(f) = route.health_check.max_ejected_fraction {
+                        if !(0.0..=1.0).contains(&f) {
+                            return Err(invalid(
+                                "each [[listeners.routes]] health_check.max_ejected_fraction must be between 0.0 and 1.0".into(),
+                            ));
+                        }
+                    }
                 }
                 let mut canary_percent_total: u32 = 0;
                 for pool in &self.canary {
@@ -1163,6 +1179,13 @@ impl ListenerConfig {
                         if od.min_volume == 0 || od.min_hosts < 2 || od.stddev_factor <= 0.0 {
                             return Err(invalid(
                                 "each [[listeners.canary]] health_check.outlier_detection requires min_volume > 0, min_hosts >= 2, and stddev_factor > 0.0".into(),
+                            ));
+                        }
+                    }
+                    if let Some(f) = pool.health_check.max_ejected_fraction {
+                        if !(0.0..=1.0).contains(&f) {
+                            return Err(invalid(
+                                "each [[listeners.canary]] health_check.max_ejected_fraction must be between 0.0 and 1.0".into(),
                             ));
                         }
                     }
@@ -2292,6 +2315,7 @@ mod tests {
         assert_eq!(l.health_check.unhealthy_latency_ms, None);
         assert_eq!(l.health_check.unhealthy_request_count, None);
         assert_eq!(l.health_check.outlier_detection, None);
+        assert_eq!(l.health_check.max_ejected_fraction, None);
     }
 
     #[test]
@@ -2428,6 +2452,48 @@ mod tests {
         );
         let err = Config::parse(&text).unwrap_err().to_string();
         assert!(err.contains("outlier_detection"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn parses_an_explicit_max_ejected_fraction() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          max_ejected_fraction = 0.34",
+            1,
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.listeners[0].health_check.max_ejected_fraction,
+            Some(0.34)
+        );
+    }
+
+    #[test]
+    fn rejects_a_max_ejected_fraction_above_one() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          max_ejected_fraction = 1.5",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(
+            err.contains("max_ejected_fraction"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_negative_max_ejected_fraction() {
+        let text = VALID.replacen(
+            "cooldown_ms = 5000",
+            "cooldown_ms = 5000\n          max_ejected_fraction = -0.1",
+            1,
+        );
+        let err = Config::parse(&text).unwrap_err().to_string();
+        assert!(
+            err.contains("max_ejected_fraction"),
+            "unhelpful error: {err}"
+        );
     }
 
     #[test]
