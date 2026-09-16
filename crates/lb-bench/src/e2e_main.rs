@@ -30,6 +30,7 @@ const STRATEGIES: &[&str] = &[
 enum Cli {
     Run { strategy: &'static str },
     CompareAll,
+    Heterogeneous,
     Help,
 }
 
@@ -39,6 +40,7 @@ fn parse_args(args: &[String]) -> Cli {
             strategy: STRATEGIES[0],
         },
         [flag] if flag == "--compare-all-strategies" => Cli::CompareAll,
+        [flag] if flag == "--heterogeneous" => Cli::Heterogeneous,
         [flag] if flag == "--help" || flag == "-h" => Cli::Help,
         [flag, name] if flag == "--strategy" => {
             match STRATEGIES.iter().copied().find(|s| *s == name.as_str()) {
@@ -57,6 +59,7 @@ fn print_help() {
     println!("    lb-bench-e2e");
     println!("    lb-bench-e2e --strategy <STRATEGY>");
     println!("    lb-bench-e2e --compare-all-strategies");
+    println!("    lb-bench-e2e --heterogeneous");
     println!("    lb-bench-e2e --help");
     println!();
     println!("STRATEGY one of: {}", STRATEGIES.join(", "));
@@ -69,11 +72,20 @@ fn build_client() -> ProxyClient {
     Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector)
 }
 
-async fn spawn_backend() -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
+struct SpawnedBackend {
+    addr: SocketAddr,
+    count: Arc<AtomicU64>,
+    delay_ms: Arc<AtomicU64>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let count = Arc::new(AtomicU64::new(0));
+    let delay_ms = Arc::new(AtomicU64::new(initial_delay_ms));
     let count_for_task = Arc::clone(&count);
+    let delay_for_task = Arc::clone(&delay_ms);
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -82,9 +94,11 @@ async fn spawn_backend() -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle
             let _ = stream.set_nodelay(true);
             let io = TokioIo::new(stream);
             let count = Arc::clone(&count_for_task);
+            let delay_ms = Arc::clone(&delay_for_task);
             tokio::spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let count = Arc::clone(&count);
+                    let delay_ms = Arc::clone(&delay_ms);
                     async move {
                         if req.uri().path() == "/health" {
                             return Ok::<_, Infallible>(
@@ -93,6 +107,10 @@ async fn spawn_backend() -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle
                                     .body(Full::new(Bytes::new()))
                                     .unwrap(),
                             );
+                        }
+                        let delay = delay_ms.load(Ordering::Relaxed);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
                         count.fetch_add(1, Ordering::Relaxed);
                         Ok::<_, Infallible>(
@@ -107,7 +125,12 @@ async fn spawn_backend() -> (SocketAddr, Arc<AtomicU64>, tokio::task::JoinHandle
             });
         }
     });
-    (addr, count, handle)
+    SpawnedBackend {
+        addr,
+        count,
+        delay_ms,
+        handle,
+    }
 }
 
 fn lb_server_path() -> PathBuf {
@@ -454,6 +477,23 @@ async fn failure_scenario(
     println!();
 }
 
+async fn start_lb_server_for(strategy: &str, backend_addrs: &[SocketAddr]) -> (Child, SocketAddr) {
+    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let listener = TcpListener::bind(listen).await.unwrap();
+    let listen = listener.local_addr().unwrap();
+    drop(listener);
+
+    let config_dir = std::env::temp_dir().join("lb-bench-e2e");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    write_config(&config_path, listen, backend_addrs, strategy);
+
+    let child = spawn_lb_server(&config_path).await;
+    wait_until_listening(listen).await;
+
+    (child, listen)
+}
+
 async fn start_harness(
     strategy: &str,
 ) -> (
@@ -465,23 +505,12 @@ async fn start_harness(
     let mut backend_handles = Vec::new();
     let mut backend_addrs = Vec::new();
     for _ in 0..4 {
-        let (addr, _count, handle) = spawn_backend().await;
-        backend_addrs.push(addr);
-        backend_handles.push(handle);
+        let backend = spawn_backend(0).await;
+        backend_addrs.push(backend.addr);
+        backend_handles.push(backend.handle);
     }
 
-    let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let listener = TcpListener::bind(listen).await.unwrap();
-    let listen = listener.local_addr().unwrap();
-    drop(listener);
-
-    let config_dir = std::env::temp_dir().join("lb-bench-e2e");
-    std::fs::create_dir_all(&config_dir).unwrap();
-    let config_path = config_dir.join("config.toml");
-    write_config(&config_path, listen, &backend_addrs, strategy);
-
-    let child = spawn_lb_server(&config_path).await;
-    wait_until_listening(listen).await;
+    let (child, listen) = start_lb_server_for(strategy, &backend_addrs).await;
 
     (child, backend_handles, listen, backend_addrs)
 }
@@ -563,6 +592,154 @@ async fn compare_all_strategies() {
     println!();
 }
 
+const HETEROGENEOUS_DELAYS_MS: [u64; 4] = [10, 20, 100, 500];
+const HETEROGENEOUS_STRATEGIES: &[&str] = &["round_robin", "least_connections", "peak_ewma_p2c"];
+
+async fn heterogeneous_static_comparison() {
+    println!(
+        "=== Heterogeneous backends: fixed latency profile (A={}ms B={}ms C={}ms D={}ms) ===",
+        HETEROGENEOUS_DELAYS_MS[0],
+        HETEROGENEOUS_DELAYS_MS[1],
+        HETEROGENEOUS_DELAYS_MS[2],
+        HETEROGENEOUS_DELAYS_MS[3]
+    );
+    println!(
+        "{:<22} | {:>6} | {:>6} | {:>6} | {:>6} | {:>10} | {:>7} | {:>7} | {:>7} | {:>7}",
+        "strategy",
+        "A req%",
+        "B req%",
+        "C req%",
+        "D req%",
+        "req/s",
+        "p50ms",
+        "p95ms",
+        "p99ms",
+        "p999ms"
+    );
+    let client = build_client();
+    for strategy in HETEROGENEOUS_STRATEGIES {
+        let mut backends = Vec::with_capacity(4);
+        for delay in HETEROGENEOUS_DELAYS_MS {
+            backends.push(spawn_backend(delay).await);
+        }
+        let addrs: Vec<SocketAddr> = backends.iter().map(|b| b.addr).collect();
+        let (mut child, listen) = start_lb_server_for(strategy, &addrs).await;
+
+        let result = run_closed_loop(
+            &client,
+            listen,
+            64,
+            Duration::from_secs(8),
+            Duration::from_secs(2),
+            false,
+        )
+        .await;
+
+        let counts: Vec<u64> = backends
+            .iter()
+            .map(|b| b.count.load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum::<u64>().max(1);
+        let pct: Vec<f64> = counts
+            .iter()
+            .map(|c| 100.0 * *c as f64 / total as f64)
+            .collect();
+        let mut sorted = result.latencies_ns.clone();
+        sorted.sort_unstable();
+        let rps = result.total as f64 / result.wall.as_secs_f64();
+        println!(
+            "{:<22} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>10.0} | {:>7.2} | {:>7.2} | {:>7.2} | {:>7.2}",
+            strategy,
+            pct[0],
+            pct[1],
+            pct[2],
+            pct[3],
+            rps,
+            ms(percentile(&sorted, 0.50)),
+            ms(percentile(&sorted, 0.95)),
+            ms(percentile(&sorted, 0.99)),
+            ms(percentile(&sorted, 0.999)),
+        );
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        for backend in backends {
+            backend.handle.abort();
+        }
+    }
+    println!();
+}
+
+async fn heterogeneous_dynamic_adaptation() {
+    println!(
+        "=== Heterogeneous backends: dynamic conditions (backend C slows to 300ms at t=10s, recovers at t=20s) ==="
+    );
+    for strategy in ["round_robin", "peak_ewma_p2c"] {
+        println!("--- strategy={strategy} ---");
+        let mut backends = Vec::with_capacity(4);
+        for _ in 0..4 {
+            backends.push(spawn_backend(10).await);
+        }
+        let addrs: Vec<SocketAddr> = backends.iter().map(|b| b.addr).collect();
+        let (mut child, listen) = start_lb_server_for(strategy, &addrs).await;
+        let client = build_client();
+        let c_delay = Arc::clone(&backends[2].delay_ms);
+
+        let load = run_closed_loop(
+            &client,
+            listen,
+            64,
+            Duration::from_secs(30),
+            Duration::from_secs(0),
+            false,
+        );
+
+        let controller = async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            c_delay.store(300, Ordering::Relaxed);
+            println!("      -- t=10s: backend C latency raised to 300ms --");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            c_delay.store(10, Ordering::Relaxed);
+            println!("      -- t=20s: backend C latency restored to 10ms --");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        };
+
+        let sampler = async {
+            println!(
+                "      {:>5} | {:>6} | {:>6} | {:>6} | {:>6}",
+                "t", "A", "B", "C", "D"
+            );
+            let mut last = [0u64; 4];
+            for sec in 1..=30u64 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let now: Vec<u64> = backends
+                    .iter()
+                    .map(|b| b.count.load(Ordering::Relaxed))
+                    .collect();
+                let deltas: Vec<u64> = now
+                    .iter()
+                    .zip(last.iter())
+                    .map(|(n, l)| n.saturating_sub(*l))
+                    .collect();
+                last.copy_from_slice(&now);
+                println!(
+                    "      {:>4}s | {:>6} | {:>6} | {:>6} | {:>6}",
+                    sec, deltas[0], deltas[1], deltas[2], deltas[3]
+                );
+            }
+        };
+
+        let (_, _, _) = tokio::join!(load, controller, sampler);
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        for backend in backends {
+            backend.handle.abort();
+        }
+        println!();
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -571,6 +748,11 @@ async fn main() {
         Cli::CompareAll => {
             print_methodology();
             compare_all_strategies().await;
+        }
+        Cli::Heterogeneous => {
+            print_methodology();
+            heterogeneous_static_comparison().await;
+            heterogeneous_dynamic_adaptation().await;
         }
         Cli::Run { strategy } => {
             print_methodology();
