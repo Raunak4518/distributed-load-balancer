@@ -988,8 +988,8 @@ mod tests {
         addr
     }
 
-    async fn spawn_counting_malformed_response_backend() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>)
-    {
+    async fn spawn_counting_malformed_response_backend(
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));

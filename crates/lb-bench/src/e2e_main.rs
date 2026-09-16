@@ -989,7 +989,9 @@ async fn spawn_amplification_backend(fail_pct: u64) -> (SocketAddr, Arc<AtomicU6
                 };
                 if buf[..n].starts_with(b"GET /health") {
                     let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
                         .await;
                     return;
                 }
@@ -999,7 +1001,9 @@ async fn spawn_amplification_backend(fail_pct: u64) -> (SocketAddr, Arc<AtomicU6
                     let _ = stream.write_all(b"not a valid http response\r\n\r\n").await;
                 } else {
                     let _ = stream
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
                         .await;
                 }
             });
@@ -1016,9 +1020,7 @@ const AMPLIFICATION_MODES: [(&str, Option<(f64, u32)>); 3] = [
 ];
 
 async fn retry_amplification_matrix() {
-    println!(
-        "=== Backend amplification under retries (concurrency=32, 4s + 1s warmup) ==="
-    );
+    println!("=== Backend amplification under retries (concurrency=32, 4s + 1s warmup) ===");
     println!(
         "Every failed attempt is a genuine transport-level failure (the backend answers with an \
          unparsable response), which is the only failure kind lb-proxy's retry loop reacts to -- \

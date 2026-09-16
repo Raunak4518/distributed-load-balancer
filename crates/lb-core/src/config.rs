@@ -1615,7 +1615,10 @@ mod tests {
 
     #[test]
     fn retry_budget_is_off_by_default_and_parses_when_set() {
-        assert_eq!(Config::parse(VALID).unwrap().listeners[0].retry_budget, None);
+        assert_eq!(
+            Config::parse(VALID).unwrap().listeners[0].retry_budget,
+            None
+        );
 
         let text = VALID.replace(
             "          [listeners.load_balancing]\n          strategy = \"round_robin\"\n\n        [[listeners]]\n        name = \"postgres\"",
