@@ -27,3 +27,7 @@ path = "src/main.rs"
 [[bin]]
 name = "lb-bench-e2e"
 path = "src/e2e_main.rs"
+
+[[bin]]
+name = "lb-bench-cluster"
+path = "src/cluster_main.rs"
