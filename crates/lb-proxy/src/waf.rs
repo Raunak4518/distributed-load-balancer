@@ -37,6 +37,8 @@ const XSS_TOKENS: &[&str] = &[
 
 const PATH_TRAVERSAL_TOKENS: &[&str] = &["../", "..\\", "%2e%2e%2f", "%2e%2e/", "..%2f"];
 
+pub const INSPECTED_HEADERS: &[&str] = &["user-agent", "referer", "cookie"];
+
 /// The first built-in rule (checked in a fixed order: SQL injection, then
 /// XSS, then path traversal) whose token list matches anywhere in `target`
 /// (a request's path, or path+query), or `None` if nothing matched.
@@ -107,6 +109,11 @@ mod tests {
             matched_rule("/api/users?redirect=javascript:alert(1)"),
             Some(WafRule::Xss)
         );
+    }
+
+    #[test]
+    fn inspected_headers_are_user_agent_referer_and_cookie() {
+        assert_eq!(INSPECTED_HEADERS, &["user-agent", "referer", "cookie"]);
     }
 
     #[test]

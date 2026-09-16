@@ -68,6 +68,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// listener fact at wiring time (`RateLimitKeySource` is stored the
     /// same way, for the same reason).
     pub waf: Option<WafMode>,
+    pub waf_inspect_headers: bool,
     /// Flat, not scoped per pool: correct because `Config::validate()`
     /// requires every backend id to be unique across the default backends
     /// *and every route's* within one listener, so a `BackendId` here
@@ -570,7 +571,19 @@ where
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or_else(|| req.uri().path());
-        if let Some(rule) = waf::matched_rule(target) {
+        let matched = waf::matched_rule(target).or_else(|| {
+            if ctx.waf_inspect_headers {
+                waf::INSPECTED_HEADERS.iter().find_map(|name| {
+                    req.headers()
+                        .get(*name)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(waf::matched_rule)
+                })
+            } else {
+                None
+            }
+        });
+        if let Some(rule) = matched {
             ctx.metrics.record_waf_block(rule);
             tracing::warn!(rule = rule.as_label(), mode = ?mode, "waf rule matched");
             if mode == WafMode::Block {
@@ -1101,6 +1114,36 @@ mod tests {
         Response::from_parts(parts, bytes)
     }
 
+    async fn run_through_proxy_with_header<R, C>(
+        ctx: Arc<ProxyContext<R, C>>,
+        name: header::HeaderName,
+        value: &str,
+    ) -> Response<Bytes>
+    where
+        R: RateLimiter + 'static,
+        C: Clock + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone(), "127.0.0.1".parse().unwrap()));
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+
+        let client = build_client(None, HashMap::new(), false, None);
+        let req = Request::builder()
+            .uri(format!("http://{addr}/"))
+            .header(name, value)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        Response::from_parts(parts, bytes)
+    }
+
     fn empty_pool() -> Arc<BackendPool> {
         Arc::new(BackendPool::new(vec![]))
     }
@@ -1129,6 +1172,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1164,6 +1208,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1218,6 +1263,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1257,6 +1303,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1312,6 +1359,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1385,6 +1433,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1452,6 +1501,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1519,6 +1569,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1677,6 +1728,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1815,6 +1867,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1854,6 +1907,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1977,6 +2031,7 @@ mod tests {
             sticky,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2151,6 +2206,7 @@ mod tests {
             sticky: None,
             cache: Some(cache),
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2198,6 +2254,7 @@ mod tests {
             sticky: None,
             cache: Some(test_cache()),
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2241,6 +2298,7 @@ mod tests {
             sticky: None,
             cache: Some(test_cache()),
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2283,6 +2341,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2322,6 +2381,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: Some(WafMode::Block),
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2368,6 +2428,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: Some(WafMode::Log),
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2398,6 +2459,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waf_header_inspection_is_off_by_default() {
+        let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let metrics = test_metrics();
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: Some(WafMode::Block),
+            waf_inspect_headers: false,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: metrics.clone(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let resp = run_through_proxy_with_cookie(ctx, Some("session=' or '1'='1")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), "hello");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(metrics.waf_blocked_sql_injection.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn waf_inspect_headers_blocks_a_malicious_cookie() {
+        let metrics = test_metrics();
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(PanicIfPicked),
+            pool: empty_pool(),
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: Some(WafMode::Block),
+            waf_inspect_headers: true,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: metrics.clone(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let resp = run_through_proxy_with_cookie(ctx, Some("session=' or '1'='1")).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(metrics.waf_blocked_sql_injection.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn waf_inspect_headers_blocks_a_malicious_user_agent() {
+        let metrics = test_metrics();
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(PanicIfPicked),
+            pool: empty_pool(),
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: Some(WafMode::Block),
+            waf_inspect_headers: true,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: metrics.clone(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let resp =
+            run_through_proxy_with_header(ctx, header::USER_AGENT, "<script>alert(1)</script>")
+                .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(metrics.waf_blocked_xss.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn waf_inspect_headers_ignores_headers_outside_the_fixed_set() {
+        let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let metrics = test_metrics();
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: Some(WafMode::Block),
+            waf_inspect_headers: true,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: metrics.clone(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let resp = run_through_proxy_with_header(
+            ctx,
+            header::HeaderName::from_static("x-forwarded-for"),
+            "' or '1'='1",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.body(), "hello");
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(metrics.waf_blocked_sql_injection.get(), 0);
+    }
+
+    #[tokio::test]
     async fn no_waf_config_means_malicious_looking_paths_still_reach_the_backend() {
         let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
         let backend = Backend::new("b1", backend_addr, 1, None);
@@ -2413,6 +2649,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2538,6 +2775,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2602,6 +2840,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,

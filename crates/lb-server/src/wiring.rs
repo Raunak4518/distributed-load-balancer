@@ -989,6 +989,7 @@ pub(crate) fn build_listener_core(
                     ))
                 }),
                 waf: lc.waf.as_ref().map(|w| w.mode),
+                waf_inspect_headers: lc.waf.as_ref().is_some_and(|w| w.inspect_headers),
                 circuit_breakers,
                 outlier: outlier.clone(),
                 acme_challenges: Some(Arc::clone(acme_challenges)),
