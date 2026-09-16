@@ -220,6 +220,52 @@ async fn a_single_source_cannot_exceed_its_per_ip_budget() {
     assert!(String::from_utf8_lossy(&buf[..n]).contains("200"));
 }
 
+async fn connect_from(listen: SocketAddr, source_octet: u8) -> TcpStream {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket
+        .bind(SocketAddr::from(([127, 0, 0, source_octet], 0)))
+        .unwrap();
+    socket.connect(listen).await.unwrap()
+}
+
+#[tokio::test]
+async fn exhausting_the_global_cap_stops_accepting_until_a_slot_frees() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let config = Config::parse(&hardened_config(listen, backend, 3, 2, 5_000, 5_000)).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    let mut held = vec![
+        connect_from(listen, 1).await,
+        connect_from(listen, 2).await,
+        connect_from(listen, 3).await,
+    ];
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut extra = connect_from(listen, 4).await;
+    let mut buf = [0u8; 1];
+    let stuck = tokio::time::timeout(Duration::from_millis(300), extra.read(&mut buf)).await;
+    assert!(
+        stuck.is_err(),
+        "a connection over the global cap got a response before any slot freed, \
+         even though its own source IP was nowhere near its per-IP budget"
+    );
+
+    held.remove(0);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    extra
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(3), extra.read(&mut buf))
+        .await
+        .expect("no response after a global slot was freed")
+        .expect("read failed");
+    assert!(n > 0, "no bytes after freeing a global slot");
+}
+
 /// The write-side counterpart of the slowloris tests above: a client that
 /// reads its response, then simply stops draining its socket, must not be
 /// able to hold the connection open forever either.
