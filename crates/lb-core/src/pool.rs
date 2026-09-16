@@ -1,7 +1,7 @@
 use crate::backend::{Backend, BackendId};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 struct BackendState {
@@ -57,6 +57,7 @@ impl PoolState {
 pub struct BackendPool {
     inner: ArcSwap<PoolState>,
     max_ejected_fraction: Option<f64>,
+    version: AtomicU64,
 }
 
 impl BackendPool {
@@ -71,7 +72,12 @@ impl BackendPool {
         BackendPool {
             inner: ArcSwap::from_pointee(PoolState::from_backends(backends)),
             max_ejected_fraction,
+            version: AtomicU64::new(0),
         }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::SeqCst)
     }
 
     pub fn backend(&self, id: &BackendId) -> Option<Backend> {
@@ -277,6 +283,7 @@ impl BackendPool {
             states.insert(order.last().unwrap().clone(), state);
         }
         self.inner.store(Arc::new(PoolState { order, states }));
+        self.version.fetch_add(1, Ordering::SeqCst);
     }
 }
 
