@@ -3,8 +3,9 @@ use instant_acme::{
     Error as AcmeProtocolError, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::RwLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 #[derive(Debug)]
 pub enum AcmeError {
@@ -174,6 +175,129 @@ pub async fn obtain_certificate_http01(
     let cert_chain_pem = order.poll_certificate(&RetryPolicy::default()).await?;
 
     Ok((cert_chain_pem, private_key_pem))
+}
+
+pub fn ensure_bootstrap_certificate(
+    cert_file: &Path,
+    key_file: &Path,
+    hostname: &str,
+) -> Result<(), AcmeError> {
+    if cert_file.exists() && key_file.exists() {
+        return Ok(());
+    }
+    let key_pair = rcgen::KeyPair::generate()
+        .map_err(|e| AcmeError::Io(std::io::Error::other(e.to_string())))?;
+    let mut params = rcgen::CertificateParams::new([hostname.to_string()])
+        .map_err(|e| AcmeError::Io(std::io::Error::other(e.to_string())))?;
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(2);
+    params.not_after = now - time::Duration::days(1);
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| AcmeError::Io(std::io::Error::other(e.to_string())))?;
+    if let Some(parent) = cert_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = key_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cert_file, cert.pem())?;
+    std::fs::write(key_file, key_pair.serialize_pem())?;
+    Ok(())
+}
+
+pub fn needs_renewal(cert_file: &Path, renew_before: Duration) -> bool {
+    let Ok(pem) = std::fs::read_to_string(cert_file) else {
+        return true;
+    };
+    let mut reader = std::io::Cursor::new(pem.as_bytes());
+    let Some(Ok(der)) = rustls_pemfile::certs(&mut reader).next() else {
+        return true;
+    };
+    use x509_parser::prelude::FromDer;
+    let Ok((_, cert)) = x509_parser::certificate::X509Certificate::from_der(der.as_ref()) else {
+        return true;
+    };
+    let not_after = cert.validity().not_after.timestamp();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    not_after - now < renew_before.as_secs() as i64
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn renew_once(
+    trust: AcmeTrust<'_>,
+    directory_url: &str,
+    contact_email: &str,
+    account_key_file: &Path,
+    domain: &str,
+    cert_file: &Path,
+    key_file: &Path,
+    challenges: &AcmeChallengeStore,
+) -> Result<(), AcmeError> {
+    let account = account_for(trust, directory_url, contact_email, account_key_file).await?;
+    let (cert_chain_pem, private_key_pem) =
+        obtain_certificate_http01(&account, domain, challenges).await?;
+
+    if let Some(parent) = cert_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = key_file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cert_file, cert_chain_pem)?;
+    std::fs::write(key_file, private_key_pem)?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_acme_renewer(
+    directory_url: String,
+    contact_email: String,
+    account_key_file: PathBuf,
+    domain: String,
+    cert_file: PathBuf,
+    key_file: PathBuf,
+    renew_before: Duration,
+    check_interval: Duration,
+    custom_root_pem: Option<PathBuf>,
+    challenges: Arc<AcmeChallengeStore>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(check_interval);
+        loop {
+            ticker.tick().await;
+            if !needs_renewal(&cert_file, renew_before) {
+                continue;
+            }
+            let trust = match &custom_root_pem {
+                Some(path) => AcmeTrust::CustomRootPem(path),
+                None => AcmeTrust::SystemRoots,
+            };
+            match renew_once(
+                trust,
+                &directory_url,
+                &contact_email,
+                &account_key_file,
+                &domain,
+                &cert_file,
+                &key_file,
+                &challenges,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(domain = %domain, "acme certificate obtained");
+                }
+                Err(err) => {
+                    tracing::error!(domain = %domain, error = %err, "acme certificate renewal failed");
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]

@@ -131,6 +131,7 @@ mod tests {
             cert_file,
             key_file,
             hostnames: names.iter().map(|s| s.to_string()).collect(),
+            acme: None,
         }
     }
 
@@ -228,6 +229,7 @@ mod tests {
             cert_file: "/nonexistent/nope.crt".into(),
             key_file: "/nonexistent/nope.key".into(),
             hostnames: vec![],
+            acme: None,
         };
         match load_certificate(&c) {
             Err(TlsError::Io { path, .. }) => assert!(path.contains("nope.crt")),

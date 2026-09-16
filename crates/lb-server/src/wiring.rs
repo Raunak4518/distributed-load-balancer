@@ -212,6 +212,7 @@ pub struct WiredApp {
 /// `reload::apply_reload`.
 pub struct ReloadState {
     pub metrics: Arc<Metrics>,
+    pub acme_challenges: Arc<lb_tls::AcmeChallengeStore>,
     pub cluster_node: Option<Arc<AppClusterNode>>,
     pub listeners: HashMap<String, ListenerReloadHandle>,
     /// This listener's health checkers, DNS poller, and rate-limit sweeper —
@@ -286,6 +287,7 @@ pub fn build_app(
     // One registry per process. Handles are resolved from it once per
     // listener/backend below — never on the request path.
     let metrics = Arc::new(Metrics::new().expect("metric names are valid and unique"));
+    let acme_challenges = Arc::new(lb_tls::AcmeChallengeStore::new());
 
     // Built here for the same reason as the acceptors above: an unreadable
     // `ca_file` is operator input, and must fail startup rather than turn
@@ -336,6 +338,7 @@ pub fn build_app(
             config.cluster.as_ref(),
             &config.logging,
             &metrics,
+            &acme_challenges,
             None,
         );
         pools.push(Arc::clone(&core.pool));
@@ -369,6 +372,22 @@ pub fn build_app(
                 tls_cfg.reload_interval(),
                 Arc::clone(&listener_metrics),
             ));
+            for cert in &tls_cfg.certificates {
+                if let Some(acme) = &cert.acme {
+                    tls_reload_tasks.push(lb_tls::spawn_acme_renewer(
+                        acme.directory_url.clone(),
+                        acme.contact_email.clone(),
+                        acme.account_key_file.clone(),
+                        cert.hostnames[0].clone(),
+                        cert.cert_file.clone(),
+                        cert.key_file.clone(),
+                        Duration::from_secs(acme.renew_before_days as u64 * 86_400),
+                        Duration::from_secs(acme.check_interval_secs),
+                        acme.ca_bundle_file.clone(),
+                        Arc::clone(&acme_challenges),
+                    ));
+                }
+            }
         }
 
         let runtime = match core.kind {
@@ -442,6 +461,7 @@ pub fn build_app(
         pools,
         reload: Arc::new(ReloadState {
             metrics,
+            acme_challenges,
             cluster_node,
             listeners: reload_listeners,
             tasks: Arc::new(tokio::sync::Mutex::new(reload_tasks)),
@@ -670,6 +690,7 @@ fn build_outlier_detector(
 /// reload (`reload::apply_reload`, which must resolve every changed
 /// listener's connector *before* rebuilding or swapping in any of them — see
 /// its module docs for why that ordering is load-bearing).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_listener_core(
     lc: &ListenerConfig,
     backend_tls: Option<Arc<lb_tls::BackendConnector>>,
@@ -677,6 +698,7 @@ pub(crate) fn build_listener_core(
     cluster_cfg: Option<&ClusterConfig>,
     logging: &LoggingConfig,
     metrics: &Metrics,
+    acme_challenges: &Arc<lb_tls::AcmeChallengeStore>,
     previous: Option<&PreviousListenerState>,
 ) -> ListenerCore {
     let backends: Vec<Backend> = lc
@@ -957,6 +979,7 @@ pub(crate) fn build_listener_core(
                 waf: lc.waf.as_ref().map(|w| w.mode),
                 circuit_breakers,
                 outlier: outlier.clone(),
+                acme_challenges: Some(Arc::clone(acme_challenges)),
                 client,
                 per_backend_client,
                 backend_tls: backend_tls.is_some(),
@@ -1171,6 +1194,24 @@ fn build_tls_acceptor(
     let Some(tls_cfg) = &lc.tls else {
         return Ok(None);
     };
+    for cert in &tls_cfg.certificates {
+        if cert.acme.is_some() {
+            lb_tls::ensure_bootstrap_certificate(
+                &cert.cert_file,
+                &cert.key_file,
+                &cert.hostnames[0],
+            )
+            .map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "listener '{}' could not write a bootstrap certificate for '{}': {err}",
+                        lc.name, cert.name
+                    ),
+                )
+            })?;
+        }
+    }
     // The listener's protocol decides what we are willing to speak inside
     // the tunnel. Order is preference: a client offering both gets HTTP/2.
     // TCP listeners advertise nothing -- at L4 we do not know the

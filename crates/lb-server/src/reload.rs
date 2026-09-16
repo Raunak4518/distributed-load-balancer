@@ -163,6 +163,7 @@ pub async fn apply_reload(
             new_config.cluster.as_ref(),
             &new_config.logging,
             &reload.metrics,
+            &reload.acme_challenges,
             previous.as_ref(),
         );
         let tasks = wiring::spawn_listener_tasks(lc, &core, &reload.metrics);

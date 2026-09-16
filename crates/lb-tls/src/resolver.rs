@@ -130,6 +130,7 @@ mod tests {
                     cert_file,
                     key_file,
                     hostnames: hosts.iter().map(|s| s.to_string()).collect(),
+                    acme: None,
                 })
                 .unwrap()
             })

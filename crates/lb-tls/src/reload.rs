@@ -161,6 +161,7 @@ mod tests {
             cert_file,
             key_file,
             hostnames: names.iter().map(|s| s.to_string()).collect(),
+            acme: None,
         }
     }
 

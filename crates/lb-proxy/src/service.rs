@@ -79,6 +79,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// `routes`/`canary` carry their own, independent of this one, since
     /// outlier detection is inherently pool-relative.
     pub outlier: Option<Arc<OutlierDetector>>,
+    pub acme_challenges: Option<Arc<lb_tls::AcmeChallengeStore>>,
     pub client: ProxyClient,
     /// Set only for a `dns_discovery` + `backend_tls` HTTP listener, where
     /// several backends share one `server_name` and so cannot safely share
@@ -529,6 +530,26 @@ where
     R: RateLimiter,
     C: Clock,
 {
+    if let Some(challenges) = &ctx.acme_challenges {
+        if let Some(token) = req
+            .uri()
+            .path()
+            .strip_prefix("/.well-known/acme-challenge/")
+        {
+            return Ok(match challenges.get(token) {
+                Some(key_authorization) => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(
+                        Full::new(Bytes::from(key_authorization))
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+                None => simple_response(StatusCode::NOT_FOUND, "not found"),
+            });
+        }
+    }
+
     let key = extract_key(&req, &ctx.rate_limit_key, peer_ip);
     if let Decision::Deny { retry_after } = ctx.rate_limiter.check(&key) {
         ctx.metrics.ratelimit_rejected_local.inc();
@@ -1110,6 +1131,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1144,6 +1166,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1197,6 +1220,7 @@ mod tests {
             waf: None,
             circuit_breakers: breakers,
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1235,6 +1259,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1289,6 +1314,7 @@ mod tests {
             waf: None,
             circuit_breakers: breakers,
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1361,6 +1387,7 @@ mod tests {
             waf: None,
             circuit_breakers: breakers,
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1427,6 +1454,7 @@ mod tests {
             waf: None,
             circuit_breakers: breakers,
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1493,6 +1521,7 @@ mod tests {
             waf: None,
             circuit_breakers: breakers,
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1650,6 +1679,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1752,6 +1782,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1790,6 +1821,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -1912,6 +1944,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2085,6 +2118,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2131,6 +2165,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2173,6 +2208,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2214,6 +2250,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2252,6 +2289,7 @@ mod tests {
             waf: Some(WafMode::Block),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2297,6 +2335,7 @@ mod tests {
             waf: Some(WafMode::Log),
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2341,6 +2380,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2465,6 +2505,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,
@@ -2528,6 +2569,7 @@ mod tests {
             waf: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
+            acme_challenges: None,
             client: build_client(None, HashMap::new(), false, None),
             per_backend_client: None,
             backend_tls: false,

@@ -322,6 +322,7 @@ mod tests {
                 cert_file: cert.clone(),
                 key_file: key,
                 hostnames: vec!["backend.internal".to_string()],
+                acme: None,
             }],
             handshake_timeout_ms: Some(5_000),
             min_version: None,

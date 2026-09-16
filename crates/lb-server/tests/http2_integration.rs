@@ -307,6 +307,7 @@ async fn spawn_tls_backend_recording(
             cert_file: cert.to_path_buf(),
             key_file: key.to_path_buf(),
             hostnames: vec!["backend.internal".into()],
+            acme: None,
         }],
         handshake_timeout_ms: Some(5_000),
         min_version: None,

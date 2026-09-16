@@ -96,6 +96,7 @@ tokio = { version = "1", features = [
 socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `native-tls-alpn` is what makes the test client offer `h2` at all: reqwest's
 # ALPN request is `#[cfg(feature = "native-tls-alpn")]`, and that feature is
 # not in its defaults, so a plain `reqwest = "0.12"` client negotiates nothing
@@ -133,6 +134,7 @@ rustls = { version = "0.23", default-features = false, features = [
     "tls12",
     "logging",
 ] }
+x509-parser = "0.16"
 # Raw HTTP/2, for the two attacks in `http2_integration.rs` that no HTTP
 # client will perform: cancelling a request the instant it is made (Rapid
 # Reset, CVE-2023-44487), and opening more concurrent streams than the server

@@ -42,7 +42,7 @@ jobs:
           curl -sL -o /tmp/pebble/certs/localhost/key.pem https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/localhost/key.pem
           curl -sL -o /tmp/pebble/pebble.minica.pem https://raw.githubusercontent.com/letsencrypt/pebble/main/test/certs/pebble.minica.pem
 
-          "$(go env GOPATH)/bin/pebble-challtestsrv" -http01 "" -https01 "" -tlsalpn01 "" -doh "" -dnsserver :8053 -management :8055 > /tmp/pebble/challtestsrv.log 2>&1 &
+          "$(go env GOPATH)/bin/pebble-challtestsrv" -http01 "" -https01 "" -tlsalpn01 "" -doh "" -dnsserver :8053 -management :8055 -defaultIPv6 "" > /tmp/pebble/challtestsrv.log 2>&1 &
           sleep 1
           (cd /tmp/pebble && "$(go env GOPATH)/bin/pebble" -config config/pebble-config.json -dnsserver 127.0.0.1:8053 > /tmp/pebble/pebble.log 2>&1 &)
           for i in $(seq 1 30); do

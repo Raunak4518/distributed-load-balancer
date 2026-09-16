@@ -641,6 +641,29 @@ pub struct CertificateConfig {
     pub key_file: PathBuf,
     #[serde(default)]
     pub hostnames: Vec<String>,
+    #[serde(default)]
+    pub acme: Option<AcmeCertConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AcmeCertConfig {
+    pub directory_url: String,
+    pub contact_email: String,
+    pub account_key_file: PathBuf,
+    #[serde(default = "default_acme_renew_before_days")]
+    pub renew_before_days: u32,
+    #[serde(default = "default_acme_check_interval_secs")]
+    pub check_interval_secs: u64,
+    #[serde(default)]
+    pub ca_bundle_file: Option<PathBuf>,
+}
+
+fn default_acme_renew_before_days() -> u32 {
+    30
+}
+
+fn default_acme_check_interval_secs() -> u64 {
+    43_200
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1373,6 +1396,28 @@ impl ListenerConfig {
                 return Err(invalid(
                     "[listeners.tls] needs at least one certificate".into(),
                 ));
+            }
+            for cert in &tls.certificates {
+                if let Some(acme) = &cert.acme {
+                    if cert.hostnames.len() != 1 {
+                        return Err(invalid(format!(
+                            "certificate '{}' has acme configured but does not have exactly one hostname -- multi-domain acme certificates are not supported yet",
+                            cert.name
+                        )));
+                    }
+                    if acme.directory_url.trim().is_empty() {
+                        return Err(invalid(format!(
+                            "certificate '{}' acme.directory_url must not be empty",
+                            cert.name
+                        )));
+                    }
+                    if acme.contact_email.trim().is_empty() {
+                        return Err(invalid(format!(
+                            "certificate '{}' acme.contact_email must not be empty",
+                            cert.name
+                        )));
+                    }
+                }
             }
         }
         if let Some(h2) = &self.http2 {

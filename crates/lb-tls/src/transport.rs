@@ -102,6 +102,7 @@ mod tests {
                 cert_file: cert.to_path_buf(),
                 key_file: key.to_path_buf(),
                 hostnames: vec![hostname.to_string()],
+                acme: None,
             }],
             handshake_timeout_ms: Some(5_000),
             min_version: None,
