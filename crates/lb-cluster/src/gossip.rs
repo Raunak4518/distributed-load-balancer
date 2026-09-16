@@ -1,12 +1,59 @@
 use crate::coordinator::{ClusterNode, MergeOutcome};
 use crate::protocol::{encode, read_message};
+use dashmap::DashMap;
 use lb_core::Clock;
 use lb_tls::PeerTls;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+const MAX_CONCURRENT_CONNECTIONS_PER_PEER: usize = 4;
+const PEER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PeerConnLimiter {
+    counts: DashMap<IpAddr, usize>,
+}
+
+impl PeerConnLimiter {
+    fn new() -> Arc<Self> {
+        Arc::new(PeerConnLimiter {
+            counts: DashMap::new(),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<PeerConnGuard> {
+        let mut entry = self.counts.entry(ip).or_insert(0);
+        if *entry >= MAX_CONCURRENT_CONNECTIONS_PER_PEER {
+            return None;
+        }
+        *entry += 1;
+        drop(entry);
+        Some(PeerConnGuard {
+            limiter: Arc::clone(self),
+            ip,
+        })
+    }
+}
+
+struct PeerConnGuard {
+    limiter: Arc<PeerConnLimiter>,
+    ip: IpAddr,
+}
+
+impl Drop for PeerConnGuard {
+    fn drop(&mut self) {
+        let mut now_zero = false;
+        if let Some(mut count) = self.limiter.counts.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            now_zero = *count == 0;
+        }
+        if now_zero {
+            self.limiter.counts.remove_if(&self.ip, |_, v| *v == 0);
+        }
+    }
+}
 
 /// Accepts peer connections and merges the counters they push.
 ///
@@ -23,6 +70,7 @@ pub fn spawn_peer_listener<C>(
 where
     C: Clock + 'static,
 {
+    let conn_limiter = PeerConnLimiter::new();
     tokio::spawn(async move {
         loop {
             let Ok((stream, peer)) = listener.accept().await else {
@@ -30,9 +78,13 @@ where
                 // the life of the process.
                 continue;
             };
+            let Some(guard) = conn_limiter.try_acquire(peer.ip()) else {
+                continue;
+            };
             let node = Arc::clone(&node);
             let tls = tls.clone();
             tokio::spawn(async move {
+                let _guard = guard;
                 match tls {
                     Some(tls) => match tls.accept(stream).await {
                         Ok(tls_stream) => handle_peer_connection(node, tls_stream, peer).await,
@@ -52,14 +104,28 @@ where
     })
 }
 
-async fn handle_peer_connection<C, S>(node: Arc<ClusterNode<C>>, mut stream: S, peer: SocketAddr)
+async fn handle_peer_connection<C, S>(node: Arc<ClusterNode<C>>, stream: S, peer: SocketAddr)
 where
     C: Clock,
     S: AsyncRead + Unpin,
 {
+    handle_peer_connection_with_timeout(node, stream, peer, PEER_READ_TIMEOUT).await
+}
+
+async fn handle_peer_connection_with_timeout<C, S>(
+    node: Arc<ClusterNode<C>>,
+    mut stream: S,
+    peer: SocketAddr,
+    read_timeout: Duration,
+) where
+    C: Clock,
+    S: AsyncRead + Unpin,
+{
     loop {
-        match read_message(&mut stream, node.secret()).await {
-            Ok(msg) => {
+        let attempt =
+            tokio::time::timeout(read_timeout, read_message(&mut stream, node.secret())).await;
+        match attempt {
+            Ok(Ok(msg)) => {
                 if node.merge_message(&msg) == MergeOutcome::OwnNodeIdEcho {
                     tracing::error!(
                         peer = %peer,
@@ -71,13 +137,17 @@ where
             }
             // A failed tag is worth surfacing: it means either a
             // misconfigured secret or someone probing the peer port.
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(Err(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                 tracing::warn!(peer = %peer, "rejected an unauthenticated peer message");
                 return;
             }
             // Includes clean EOF when the peer closes after pushing. A bad
             // frame closes only this connection, never the listener.
-            Err(_) => return,
+            Ok(Err(_)) => return,
+            Err(_) => {
+                tracing::warn!(peer = %peer, "closed a peer connection that never completed a frame within the read timeout");
+                return;
+            }
         }
     }
 }
@@ -159,6 +229,7 @@ mod tests {
     use crate::ListenerCoordinator;
     use lb_core::test_util::FakeClock;
     use lb_core::ClusterCoordinator;
+    use tokio::io::AsyncReadExt;
 
     const SECRET: &[u8] = b"cluster-test-secret";
 
@@ -166,6 +237,127 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         (listener, addr)
+    }
+
+    #[test]
+    fn peer_conn_limiter_admits_up_to_the_cap_then_refuses() {
+        let limiter = PeerConnLimiter::new();
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let _guards: Vec<_> = (0..MAX_CONCURRENT_CONNECTIONS_PER_PEER)
+            .map(|_| limiter.try_acquire(ip).expect("within cap"))
+            .collect();
+        assert!(limiter.try_acquire(ip).is_none());
+    }
+
+    #[test]
+    fn peer_conn_limiter_releases_a_slot_on_drop() {
+        let limiter = PeerConnLimiter::new();
+        let ip = IpAddr::from([127, 0, 0, 1]);
+        let mut guards: Vec<_> = (0..MAX_CONCURRENT_CONNECTIONS_PER_PEER)
+            .map(|_| limiter.try_acquire(ip).unwrap())
+            .collect();
+        assert!(limiter.try_acquire(ip).is_none());
+        guards.pop();
+        assert!(limiter.try_acquire(ip).is_some());
+    }
+
+    #[test]
+    fn peer_conn_limiter_tracks_sources_independently() {
+        let limiter = PeerConnLimiter::new();
+        let a = IpAddr::from([127, 0, 0, 1]);
+        let b = IpAddr::from([127, 0, 0, 2]);
+        let _guards: Vec<_> = (0..MAX_CONCURRENT_CONNECTIONS_PER_PEER)
+            .map(|_| limiter.try_acquire(a).unwrap())
+            .collect();
+        assert!(limiter.try_acquire(a).is_none());
+        assert!(limiter.try_acquire(b).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_peer_listener_caps_concurrent_connections_from_one_source() {
+        let clock = FakeClock::new();
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
+
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS_PER_PEER {
+            held.push(TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut extra = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_millis(500), extra.read(&mut buf))
+            .await
+            .expect("a connection past the per-source cap should be closed promptly, not hang")
+            .unwrap();
+        assert_eq!(n, 0, "a connection past the per-source cap was not refused");
+
+        held.pop();
+
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 10);
+        assert!(coord.try_admit("k"));
+        let framed = encode(&sender.snapshot_message(), SECRET).unwrap();
+
+        let mut converged = false;
+        for _ in 0..50 {
+            if let Ok(mut s) = TcpStream::connect(addr).await {
+                let _ = s.write_all(&framed).await;
+                let _ = s.shutdown().await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if receiver
+                .store()
+                .total_in_window("web\u{1}k", clock.unix_secs())
+                == 1
+            {
+                converged = true;
+                break;
+            }
+        }
+        assert!(converged, "listener stayed capped after a slot was freed");
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_never_completes_a_frame_is_closed_after_the_read_timeout() {
+        let clock = FakeClock::new();
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let (listener, addr) = bound_listener().await;
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let mut stalled = TcpStream::connect(addr).await.unwrap();
+        let (server_stream, peer_addr) = accept.await.unwrap();
+
+        handle_peer_connection_with_timeout(
+            receiver,
+            server_stream,
+            peer_addr,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut buf))
+            .await
+            .expect("connection should be closed after the read timeout, not hang")
+            .unwrap();
+        assert_eq!(n, 0, "connection was not closed after the read timeout");
     }
 
     // The clock alone is not unique: Windows' system time has ~15.6 ms
