@@ -12,6 +12,11 @@ pub async fn wait_for_shutdown_signal() {
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        let mut ctrl_break =
+            tokio::signal::windows::ctrl_break().expect("failed to install CTRL_BREAK handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = ctrl_break.recv() => {}
+        }
     }
 }
