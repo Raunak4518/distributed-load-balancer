@@ -110,7 +110,7 @@ reqwest = { version = "0.12", features = ["native-tls-alpn"] }
 # `first_byte.rs` test a 300ms deadline and a 30s idle period without waiting
 # for either. Dev-only: resolver 2 keeps it out of the `cargo build` graph, so
 # the shipped binary has no test clock in it.
-tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread", "process"] }
 bytes = "1"
 http-body-util = "0.1"
 # Test certificates are generated at run time; none are committed. Left on
