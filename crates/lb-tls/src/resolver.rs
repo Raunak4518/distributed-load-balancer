@@ -218,4 +218,41 @@ mod tests {
         // Exact uppercase pattern must match lowercase SNI.
         assert!(s.resolve(Some("b.example.com")).is_some());
     }
+
+    #[test]
+    fn an_sni_with_an_embedded_null_byte_does_not_match_the_prefix_before_it() {
+        let s = store(&[("a", &["a.example.com"]), ("other", &["other.test"])]);
+        assert!(s.resolve(Some("a.example.com\0evil.com")).is_none());
+    }
+
+    #[test]
+    fn an_sni_with_an_embedded_null_byte_does_not_match_a_wildcard_either() {
+        let s = store(&[("w", &["*.example.com"]), ("other", &["other.test"])]);
+        assert!(s.resolve(Some("a.example.com\0evil.com")).is_none());
+    }
+
+    #[test]
+    fn wildcard_matching_is_case_insensitive_on_the_requested_sni() {
+        let s = store(&[("w", &["*.example.com"]), ("other", &["other.test"])]);
+        assert!(s.resolve(Some("A.EXAMPLE.COM")).is_some());
+    }
+
+    #[test]
+    fn a_leading_dot_before_the_wildcard_suffix_does_not_match_as_an_empty_label() {
+        let s = store(&[("w", &["*.example.com"]), ("other", &["other.test"])]);
+        assert!(s.resolve(Some(".example.com")).is_none());
+    }
+
+    #[test]
+    fn a_trailing_dot_on_the_requested_sni_does_not_match() {
+        let s = store(&[("a", &["a.example.com"]), ("b", &["b.example.com"])]);
+        assert!(s.resolve(Some("a.example.com.")).is_none());
+    }
+
+    #[test]
+    fn a_punycode_label_matches_like_any_other_ascii_label() {
+        let s = store(&[("w", &["*.xn--mnchen-3ya.de"]), ("other", &["other.test"])]);
+        assert!(s.resolve(Some("www.xn--mnchen-3ya.de")).is_some());
+        assert!(s.resolve(Some("xn--mnchen-3ya.de")).is_none());
+    }
 }
