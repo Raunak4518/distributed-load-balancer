@@ -401,6 +401,9 @@ pub struct WafConfig {
     /// what the built-in rules would have caught before enforcing them.
     #[serde(default)]
     pub mode: WafMode,
+
+    #[serde(default)]
+    pub inspect_headers: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -1979,6 +1982,28 @@ mod tests {
         let cfg = Config::parse(&text).expect("valid config should parse");
         let waf = cfg.listeners[0].waf.as_ref().expect("waf should parse");
         assert_eq!(waf.mode, WafMode::Block);
+    }
+
+    #[test]
+    fn waf_header_inspection_defaults_to_off() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.waf]",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let waf = cfg.listeners[0].waf.as_ref().expect("waf should parse");
+        assert!(!waf.inspect_headers);
+    }
+
+    #[test]
+    fn parses_waf_inspect_headers() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n\n          [listeners.waf]\n          inspect_headers = true",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        let waf = cfg.listeners[0].waf.as_ref().expect("waf should parse");
+        assert!(waf.inspect_headers);
     }
 
     #[test]
