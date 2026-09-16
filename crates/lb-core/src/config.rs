@@ -656,6 +656,10 @@ pub struct AcmeCertConfig {
     pub check_interval_secs: u64,
     #[serde(default)]
     pub ca_bundle_file: Option<PathBuf>,
+    #[serde(default)]
+    pub fallback_directory_url: Option<String>,
+    #[serde(default)]
+    pub staging_directory_url: Option<String>,
 }
 
 fn default_acme_renew_before_days() -> u32 {
@@ -1414,6 +1418,26 @@ impl ListenerConfig {
                     if acme.contact_email.trim().is_empty() {
                         return Err(invalid(format!(
                             "certificate '{}' acme.contact_email must not be empty",
+                            cert.name
+                        )));
+                    }
+                    if acme
+                        .fallback_directory_url
+                        .as_ref()
+                        .is_some_and(|u| u.trim().is_empty())
+                    {
+                        return Err(invalid(format!(
+                            "certificate '{}' acme.fallback_directory_url must not be empty if set",
+                            cert.name
+                        )));
+                    }
+                    if acme
+                        .staging_directory_url
+                        .as_ref()
+                        .is_some_and(|u| u.trim().is_empty())
+                    {
+                        return Err(invalid(format!(
+                            "certificate '{}' acme.staging_directory_url must not be empty if set",
                             cert.name
                         )));
                     }

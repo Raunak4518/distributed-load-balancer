@@ -10,8 +10,9 @@ mod transport;
 
 pub use acceptor::{install_crypto_provider, HandshakeError, TlsAcceptor};
 pub use acme::{
-    account_for, ensure_bootstrap_certificate, needs_renewal, obtain_certificate_http01,
-    renew_once, spawn_acme_renewer, AcmeChallengeStore, AcmeError, AcmeTrust,
+    account_for, ensure_bootstrap_certificate, needs_renewal, next_backoff,
+    obtain_certificate_http01, renew_once, retry_issuance, spawn_acme_renewer, AcmeChallengeStore,
+    AcmeError, AcmeRetryPolicy, AcmeTrust,
 };
 pub use certs::{load_certificate, LoadedCert};
 pub use connector::BackendConnector;

@@ -15,6 +15,7 @@ pub enum AcmeError {
     ChallengeUnavailable,
     AuthorizationFailed(String),
     OrderNotReady(OrderStatus),
+    GaveUp,
 }
 
 impl std::fmt::Display for AcmeError {
@@ -28,6 +29,7 @@ impl std::fmt::Display for AcmeError {
                 write!(f, "authorization failed with status {status}")
             }
             AcmeError::OrderNotReady(status) => write!(f, "order not ready: {status:?}"),
+            AcmeError::GaveUp => write!(f, "gave up retrying after exhausting the retry window"),
         }
     }
 }
@@ -229,7 +231,7 @@ pub fn needs_renewal(cert_file: &Path, renew_before: Duration) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub async fn renew_once(
     trust: AcmeTrust<'_>,
-    directory_url: &str,
+    directory_url: String,
     contact_email: &str,
     account_key_file: &Path,
     domain: &str,
@@ -237,7 +239,7 @@ pub async fn renew_once(
     key_file: &Path,
     challenges: &AcmeChallengeStore,
 ) -> Result<(), AcmeError> {
-    let account = account_for(trust, directory_url, contact_email, account_key_file).await?;
+    let account = account_for(trust, &directory_url, contact_email, account_key_file).await?;
     let (cert_chain_pem, private_key_pem) =
         obtain_certificate_http01(&account, domain, challenges).await?;
 
@@ -253,6 +255,75 @@ pub async fn renew_once(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct AcmeRetryPolicy {
+    pub fallback_directory_url: Option<String>,
+    pub staging_directory_url: Option<String>,
+    pub immediate_retry_delay: Duration,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+    pub give_up_after: Duration,
+}
+
+impl Default for AcmeRetryPolicy {
+    fn default() -> Self {
+        AcmeRetryPolicy {
+            fallback_directory_url: None,
+            staging_directory_url: None,
+            immediate_retry_delay: Duration::from_secs(10),
+            initial_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_secs(3_600),
+            give_up_after: Duration::from_secs(30 * 86_400),
+        }
+    }
+}
+
+pub fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
+}
+
+pub async fn retry_issuance<F, Fut>(
+    policy: &AcmeRetryPolicy,
+    primary_directory_url: &str,
+    mut attempt: F,
+) -> Result<(), AcmeError>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), AcmeError>>,
+{
+    if attempt(primary_directory_url.to_string()).await.is_ok() {
+        return Ok(());
+    }
+
+    tokio::time::sleep(policy.immediate_retry_delay).await;
+    if attempt(primary_directory_url.to_string()).await.is_ok() {
+        return Ok(());
+    }
+
+    if let Some(fallback) = &policy.fallback_directory_url {
+        if attempt(fallback.clone()).await.is_ok() {
+            return Ok(());
+        }
+    }
+
+    let started = tokio::time::Instant::now();
+    let mut backoff = policy.initial_backoff;
+    let retry_url = policy
+        .staging_directory_url
+        .clone()
+        .unwrap_or_else(|| primary_directory_url.to_string());
+    loop {
+        if started.elapsed() >= policy.give_up_after {
+            return Err(AcmeError::GaveUp);
+        }
+        tokio::time::sleep(backoff).await;
+        if attempt(retry_url.clone()).await.is_ok() {
+            return Ok(());
+        }
+        backoff = next_backoff(backoff, policy.max_backoff);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_acme_renewer(
     directory_url: String,
@@ -264,6 +335,7 @@ pub fn spawn_acme_renewer(
     renew_before: Duration,
     check_interval: Duration,
     custom_root_pem: Option<PathBuf>,
+    retry_policy: AcmeRetryPolicy,
     challenges: Arc<AcmeChallengeStore>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -273,22 +345,24 @@ pub fn spawn_acme_renewer(
             if !needs_renewal(&cert_file, renew_before) {
                 continue;
             }
-            let trust = match &custom_root_pem {
-                Some(path) => AcmeTrust::CustomRootPem(path),
-                None => AcmeTrust::SystemRoots,
-            };
-            match renew_once(
-                trust,
-                &directory_url,
-                &contact_email,
-                &account_key_file,
-                &domain,
-                &cert_file,
-                &key_file,
-                &challenges,
-            )
-            .await
-            {
+            let outcome = retry_issuance(&retry_policy, &directory_url, |url| {
+                let trust = match &custom_root_pem {
+                    Some(path) => AcmeTrust::CustomRootPem(path),
+                    None => AcmeTrust::SystemRoots,
+                };
+                renew_once(
+                    trust,
+                    url,
+                    &contact_email,
+                    &account_key_file,
+                    &domain,
+                    &cert_file,
+                    &key_file,
+                    &challenges,
+                )
+            })
+            .await;
+            match outcome {
                 Ok(()) => {
                     tracing::info!(domain = %domain, "acme certificate obtained");
                 }
@@ -329,5 +403,159 @@ mod tests {
     fn removing_an_unknown_token_does_not_panic() {
         let store = AcmeChallengeStore::new();
         store.remove("ghost");
+    }
+
+    #[test]
+    fn next_backoff_doubles_up_to_the_cap() {
+        let max = Duration::from_secs(3600);
+        assert_eq!(
+            next_backoff(Duration::from_secs(60), max),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(1800), max),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(3600), max),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(2400), max),
+            Duration::from_secs(3600)
+        );
+    }
+
+    fn fast_policy() -> AcmeRetryPolicy {
+        AcmeRetryPolicy {
+            fallback_directory_url: Some("https://fallback.example/dir".to_string()),
+            staging_directory_url: Some("https://staging.example/dir".to_string()),
+            immediate_retry_delay: Duration::from_secs(1),
+            initial_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_secs(3_600),
+            give_up_after: Duration::from_secs(30 * 86_400),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_first_try_success_needs_no_retry() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let result = retry_issuance(&fast_policy(), "https://primary.example/dir", |url| {
+            calls.lock().unwrap().push(url);
+            std::future::ready(Ok(()))
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(*calls.lock().unwrap(), vec!["https://primary.example/dir"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_immediate_retry_reuses_the_primary_issuer() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let n = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_issuance(&fast_policy(), "https://primary.example/dir", |url| {
+            calls.lock().unwrap().push(url);
+            let attempt = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(if attempt == 0 {
+                Err(AcmeError::GaveUp)
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "https://primary.example/dir".to_string(),
+                "https://primary.example/dir".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_fallback_issuer_is_tried_after_the_primary_fails_twice() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let n = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_issuance(&fast_policy(), "https://primary.example/dir", |url| {
+            calls.lock().unwrap().push(url);
+            let attempt = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(if attempt < 2 {
+                Err(AcmeError::GaveUp)
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "https://primary.example/dir".to_string(),
+                "https://primary.example/dir".to_string(),
+                "https://fallback.example/dir".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_retries_use_the_staging_directory() {
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let n = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_issuance(&fast_policy(), "https://primary.example/dir", |url| {
+            calls.lock().unwrap().push(url);
+            let attempt = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(if attempt < 4 {
+                Err(AcmeError::GaveUp)
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert!(result.is_ok());
+        let seen = calls.lock().unwrap();
+        assert_eq!(seen[0], "https://primary.example/dir");
+        assert_eq!(seen[1], "https://primary.example/dir");
+        assert_eq!(seen[2], "https://fallback.example/dir");
+        assert_eq!(seen[3], "https://staging.example/dir");
+        assert_eq!(seen[4], "https://staging.example/dir");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn giving_up_stops_after_the_configured_window() {
+        let policy = AcmeRetryPolicy {
+            give_up_after: Duration::from_secs(150),
+            ..fast_policy()
+        };
+        let result = retry_issuance(&policy, "https://primary.example/dir", |_url| {
+            std::future::ready(Err(AcmeError::GaveUp))
+        })
+        .await;
+        assert!(matches!(result, Err(AcmeError::GaveUp)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_fallback_or_staging_url_backoff_retries_the_primary() {
+        let policy = AcmeRetryPolicy {
+            fallback_directory_url: None,
+            staging_directory_url: None,
+            ..fast_policy()
+        };
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let n = std::sync::atomic::AtomicU32::new(0);
+        let result = retry_issuance(&policy, "https://primary.example/dir", |url| {
+            calls.lock().unwrap().push(url);
+            let attempt = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(if attempt < 3 {
+                Err(AcmeError::GaveUp)
+            } else {
+                Ok(())
+            })
+        })
+        .await;
+        assert!(result.is_ok());
+        for url in calls.lock().unwrap().iter() {
+            assert_eq!(url, "https://primary.example/dir");
+        }
     }
 }

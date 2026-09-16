@@ -384,6 +384,11 @@ pub fn build_app(
                         Duration::from_secs(acme.renew_before_days as u64 * 86_400),
                         Duration::from_secs(acme.check_interval_secs),
                         acme.ca_bundle_file.clone(),
+                        lb_tls::AcmeRetryPolicy {
+                            fallback_directory_url: acme.fallback_directory_url.clone(),
+                            staging_directory_url: acme.staging_directory_url.clone(),
+                            ..Default::default()
+                        },
                         Arc::clone(&acme_challenges),
                     ));
                 }
