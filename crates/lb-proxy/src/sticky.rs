@@ -221,6 +221,61 @@ mod tests {
     }
 
     #[test]
+    fn a_percent_encoded_embedded_null_byte_decodes_into_the_backend_id() {
+        let headers = headers_with_cookie("lb_sticky=web1%00evil");
+        assert_eq!(
+            read_sticky_backend(&headers, "lb_sticky"),
+            Some(BackendId::new("web1\0evil"))
+        );
+    }
+
+    #[test]
+    fn a_decoded_null_byte_does_not_collide_with_the_plain_prefix_backend_id() {
+        let headers = headers_with_cookie("lb_sticky=web1%00evil");
+        assert_ne!(
+            read_sticky_backend(&headers, "lb_sticky"),
+            Some(BackendId::new("web1"))
+        );
+    }
+
+    #[test]
+    fn an_oversized_cookie_value_is_still_decoded_rather_than_rejected() {
+        let huge = "a".repeat(100_000);
+        let headers = headers_with_cookie(&format!("lb_sticky={huge}"));
+        assert_eq!(
+            read_sticky_backend(&headers, "lb_sticky"),
+            Some(BackendId::new(huge))
+        );
+    }
+
+    #[test]
+    fn an_empty_cookie_value_decodes_to_an_empty_backend_id() {
+        let headers = headers_with_cookie("lb_sticky=");
+        assert_eq!(
+            read_sticky_backend(&headers, "lb_sticky"),
+            Some(BackendId::new(""))
+        );
+    }
+
+    #[test]
+    fn a_percent_encoded_semicolon_does_not_get_read_as_a_pair_separator() {
+        let headers = headers_with_cookie("lb_sticky=web1%3Bweb2");
+        assert_eq!(
+            read_sticky_backend(&headers, "lb_sticky"),
+            Some(BackendId::new("web1;web2"))
+        );
+    }
+
+    #[test]
+    fn a_case_varied_backend_id_is_not_folded_to_match_a_different_casing() {
+        let headers = headers_with_cookie("lb_sticky=Web1");
+        assert_ne!(
+            read_sticky_backend(&headers, "lb_sticky"),
+            Some(BackendId::new("web1"))
+        );
+    }
+
+    #[test]
     fn max_age_is_present_only_when_configured() {
         let id = BackendId::new("web1");
         let session_cookie = StickyRuntime {
