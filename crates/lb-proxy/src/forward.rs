@@ -31,6 +31,7 @@ pub type ProxyClient =
 /// actually need to tune; these two guard resource usage, not behavior.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const POOL_MAX_IDLE_PER_HOST: usize = 32;
 
 /// How much of a health-check response body we are willing to read.
 ///
@@ -113,6 +114,7 @@ pub fn build_client(
     };
     let mut builder = Client::builder(TokioExecutor::new());
     builder.pool_idle_timeout(POOL_IDLE_TIMEOUT);
+    builder.pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST);
     if backend_h2c {
         // Prior knowledge: no Upgrade dance, no ALPN -- the client just
         // starts every connection with the HTTP/2 preface. Only sound for a
@@ -272,6 +274,8 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use std::convert::Infallible;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::net::TcpListener;
 
     async fn spawn_fixed_response_backend(status: StatusCode) -> SocketAddr {
@@ -541,6 +545,80 @@ mod tests {
         assert_eq!(
             backend_scheme_and_authority(&backend(None, "10.0.0.5:8443".parse().unwrap()), true),
             None
+        );
+    }
+
+    async fn spawn_connection_counting_backend(
+        status: StatusCode,
+        response_delay: Duration,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connections_clone = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                connections_clone.fetch_add(1, Ordering::SeqCst);
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        tokio::time::sleep(response_delay).await;
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        (addr, connections)
+    }
+
+    async fn round_trip(client: ProxyClient, addr: SocketAddr) {
+        let req = Request::builder()
+            .uri(format!("http://{addr}/"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = forward(&client, req, Duration::from_secs(2)).await.unwrap();
+        resp.into_body().collect().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pool_max_idle_per_host_caps_the_idle_connections_kept_per_backend() {
+        let response_delay = Duration::from_millis(150);
+        let (addr, connections) =
+            spawn_connection_counting_backend(StatusCode::OK, response_delay).await;
+        let client = build_client(None, HashMap::new(), false, None);
+        let request_count = POOL_MAX_IDLE_PER_HOST + 1;
+
+        let mut handles = Vec::new();
+        for _ in 0..request_count {
+            handles.push(tokio::spawn(round_trip(client.clone(), addr)));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..request_count {
+            handles.push(tokio::spawn(round_trip(client.clone(), addr)));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            request_count + 1,
+            "expected exactly one connection above POOL_MAX_IDLE_PER_HOST to be \
+             evicted from the idle pool and redialed on the next burst"
         );
     }
 }
