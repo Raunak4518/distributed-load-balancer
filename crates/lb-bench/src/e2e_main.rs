@@ -430,7 +430,6 @@ fn sample_process(pid: u32) -> Option<ProcessSample> {
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             mem_mb = rest
-                .trim()
                 .split_whitespace()
                 .next()
                 .and_then(|kb| kb.parse::<f64>().ok())
