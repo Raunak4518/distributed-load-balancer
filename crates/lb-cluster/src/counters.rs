@@ -21,7 +21,7 @@ pub struct CounterStore {
     snapshot_cursor: AtomicUsize,
 }
 
-const MAX_TRACKED_KEYS: usize = 100_000;
+pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
 
 const MAX_SNAPSHOT_BUCKET_ENTRIES: usize = 5_000;
 
@@ -222,7 +222,7 @@ impl CounterStore {
     }
 
     #[cfg(test)]
-    fn key_count(&self) -> usize {
+    pub(crate) fn key_count(&self) -> usize {
         self.keys.len()
     }
 }

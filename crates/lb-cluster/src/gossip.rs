@@ -226,6 +226,7 @@ async fn write_and_close<S: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{KeyEntry, SyncMessage};
     use crate::ListenerCoordinator;
     use lb_core::test_util::FakeClock;
     use lb_core::ClusterCoordinator;
@@ -789,6 +790,64 @@ mod tests {
         assert!(
             converged,
             "listener stopped working after a malformed frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cluster_wide_key_spray_over_the_network_stays_capped() {
+        let clock = FakeClock::new();
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
+
+        let now = clock.unix_secs();
+        let total_keys = crate::counters::MAX_TRACKED_KEYS + 500;
+        let batch_size = 35_000;
+        let mut start = 0;
+        while start < total_keys {
+            let end = (start + batch_size).min(total_keys);
+            let entries: Vec<KeyEntry> = (start..end)
+                .map(|i| KeyEntry {
+                    key: format!("spray-{i}"),
+                    buckets: vec![(now, 1)],
+                })
+                .collect();
+            let msg = SyncMessage {
+                node_id: "attacker".to_string(),
+                entries,
+            };
+            let framed = encode(&msg, SECRET).unwrap();
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(&framed).await.unwrap();
+            s.shutdown().await.unwrap();
+            start = end;
+        }
+
+        let mut final_count = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            final_count = receiver.store().key_count();
+            if final_count >= crate::counters::MAX_TRACKED_KEYS {
+                break;
+            }
+        }
+        assert_eq!(
+            final_count,
+            crate::counters::MAX_TRACKED_KEYS,
+            "a key spray over the real network path was not capped at MAX_TRACKED_KEYS"
+        );
+
+        clock.advance(Duration::from_secs(30));
+        receiver.prune();
+        assert_eq!(
+            receiver.store().key_count(),
+            0,
+            "prune did not clear a fully-capped store once every key aged out"
         );
     }
 }
