@@ -1,6 +1,7 @@
 use lb_core::{BackendId, BackendPool, LoadBalancer};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, RwLock};
 
 /// Virtual nodes per unit of `weight` (so a weight-3 backend claims 3x the
 /// ring real estate of a weight-1 one, same idea `WeightedRoundRobin` uses).
@@ -10,32 +11,76 @@ const VIRTUAL_NODES_PER_WEIGHT_UNIT: u32 = 10;
 /// ring-building work can get regardless of a config typo.
 const MAX_WEIGHT: u32 = 100;
 
-/// Hashes the caller's key onto a ring built fresh from the *currently
-/// eligible* backends on every `pick()` call — not cached. Two things make
-/// that the right trade-off here, not a shortcut:
+/// Caches the ring built from *every* backend (not just eligible ones) and
+/// rebuilds it only when `BackendPool::version()` changes -- i.e. on real
+/// membership/weight changes (`apply_resolved`), never on a health/circuit/
+/// drain/outlier flip. Those flip far more often than membership changes and
+/// must stay cheap, so `pick()` never hashes or sorts on the request path
+/// once the ring is warm: it just clones the cached `Arc<Ring>` (a refcount
+/// bump) and binary-searches it.
 ///
-/// - A backend's virtual-node hash points depend only on its own id, never
-///   on which other backends are present. So building the ring from
-///   `eligible_backends()` directly (excluding a down backend's points
-///   entirely) produces *exactly* the same routing decision as building
-///   from every backend and skipping down ones during lookup would — the
-///   keys that would have landed on the down backend's points simply fall
-///   through to whichever backend's point is hash-adjacent, which is the
-///   textbook "minimal remapping" property consistent hashing exists for.
-///   Building from `eligible_backends()` gets that for free, with a plain
-///   binary search instead of a skip-forward loop.
-/// - Rebuilding avoids a whole class of cache-invalidation bugs a
-///   persistent ring would need to get right (exactly when to rebuild on a
-///   health flap vs. a real membership change). At the backend counts this
-///   project targets, sorting a few hundred `u64`s per request is
-///   negligible next to the network I/O the request itself does — a
-///   deliberate trade-off, not an oversight.
+/// Because the ring is built from every backend, a currently-ineligible
+/// backend still owns its points. `pick()` walks forward from the binary
+/// search's landing point (wrapping, bounded by the ring's length so it
+/// always terminates) and skips any point whose backend
+/// `pool.is_eligible()` reports down -- reproducing the same "minimal
+/// remapping" property the old rebuild-from-eligible-only design got from
+/// simply omitting a down backend's points: a key that would have landed on
+/// a down backend's point falls through to the next hash-adjacent one.
+///
+/// Published through `RwLock<Arc<Ring>>` rather than a plain `Mutex`: reads
+/// (the overwhelmingly common case, since membership rarely changes) only
+/// clone an `Arc` under a read lock, so concurrent `pick()` calls never
+/// block each other. A rebuild swaps the `Arc` under a brief write lock and
+/// never mutates the old `Ring` in place, so a reader either sees the ring
+/// from before the swap or the one from after -- never a partially built one.
 #[derive(Default)]
-pub struct ConsistentHash;
+pub struct ConsistentHash {
+    cached: RwLock<Arc<Ring>>,
+}
+
+#[derive(Default)]
+struct Ring {
+    pool_ptr: usize,
+    version: u64,
+    points: Vec<(u64, BackendId)>,
+}
 
 impl ConsistentHash {
     pub fn new() -> Self {
-        ConsistentHash
+        ConsistentHash::default()
+    }
+
+    fn ring_for(&self, pool: &BackendPool) -> Arc<Ring> {
+        let pool_ptr = pool as *const BackendPool as usize;
+        let version = pool.version();
+
+        let cached = Arc::clone(&self.cached.read().unwrap_or_else(|e| e.into_inner()));
+        if cached.pool_ptr == pool_ptr && cached.version == version {
+            return cached;
+        }
+
+        let mut points: Vec<(u64, BackendId)> = Vec::new();
+        for id in pool.all_backend_ids() {
+            let weight = pool
+                .backend(&id)
+                .map(|b| b.weight)
+                .unwrap_or(1)
+                .min(MAX_WEIGHT);
+            for v in 0..(weight * VIRTUAL_NODES_PER_WEIGHT_UNIT) {
+                let point = hash_str(&format!("{}\0{v}", id.0));
+                points.push((point, id.clone()));
+            }
+        }
+        points.sort_by_key(|(h, _)| *h);
+
+        let fresh = Arc::new(Ring {
+            pool_ptr,
+            version,
+            points,
+        });
+        *self.cached.write().unwrap_or_else(|e| e.into_inner()) = Arc::clone(&fresh);
+        fresh
     }
 }
 
@@ -47,26 +92,22 @@ fn hash_str(s: &str) -> u64 {
 
 impl LoadBalancer for ConsistentHash {
     fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
-        let mut ring: Vec<(u64, BackendId)> = Vec::new();
-        for id in pool.eligible_backends() {
-            let weight = pool
-                .backend(&id)
-                .map(|b| b.weight)
-                .unwrap_or(1)
-                .min(MAX_WEIGHT);
-            for v in 0..(weight * VIRTUAL_NODES_PER_WEIGHT_UNIT) {
-                let point = hash_str(&format!("{}\0{v}", id.0));
-                ring.push((point, id.clone()));
-            }
-        }
-        if ring.is_empty() {
+        let ring = self.ring_for(pool);
+        let len = ring.points.len();
+        if len == 0 {
             return None;
         }
-        ring.sort_by_key(|(h, _)| *h);
 
         let target = hash_str(key);
-        let idx = ring.partition_point(|(h, _)| *h < target) % ring.len();
-        Some(ring[idx].1.clone())
+        let start = ring.points.partition_point(|(h, _)| *h < target) % len;
+        for offset in 0..len {
+            let idx = (start + offset) % len;
+            let (_, id) = &ring.points[idx];
+            if pool.is_eligible(id) {
+                return Some(id.clone());
+            }
+        }
+        None
     }
 }
 
@@ -165,6 +206,105 @@ mod tests {
             assert_eq!(
                 ch.pick(&pool, &format!("client-{i}")),
                 Some(BackendId::new("active"))
+            );
+        }
+    }
+
+    #[test]
+    fn the_ring_is_reused_across_picks_when_the_pool_is_unchanged() {
+        let pool = pool_of(&["b1", "b2", "b3"]);
+        let ch = ConsistentHash::new();
+        let first = ch.ring_for(&pool);
+        let second = ch.ring_for(&pool);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn the_ring_does_not_rebuild_on_an_eligibility_flip() {
+        let pool = pool_of(&["b1", "b2"]);
+        let ch = ConsistentHash::new();
+        let first = ch.ring_for(&pool);
+        pool.set_active_healthy(&BackendId::new("b1"), false);
+        let second = ch.ring_for(&pool);
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn the_ring_rebuilds_after_a_membership_change() {
+        let pool = pool_of(&["b1", "b2"]);
+        let ch = ConsistentHash::new();
+        let first = ch.ring_for(&pool);
+        pool.apply_resolved(vec![
+            Backend::new("b1", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("b2", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("b3", "127.0.0.1:9000".parse().unwrap(), 1, None),
+        ]);
+        let second = ch.ring_for(&pool);
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(second.points.len(), first.points.len() + 10);
+    }
+
+    #[test]
+    fn concurrent_picks_survive_concurrent_membership_changes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pool = Arc::new(pool_of(&["b1", "b2", "b3"]));
+        let ch = Arc::new(ConsistentHash::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let updater = {
+            let pool = Arc::clone(&pool);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut toggle = false;
+                while !stop.load(Ordering::Relaxed) {
+                    toggle = !toggle;
+                    let backends = if toggle {
+                        vec![
+                            Backend::new("b1", "127.0.0.1:9000".parse().unwrap(), 1, None),
+                            Backend::new("b2", "127.0.0.1:9000".parse().unwrap(), 3, None),
+                        ]
+                    } else {
+                        vec![
+                            Backend::new("b1", "127.0.0.1:9000".parse().unwrap(), 1, None),
+                            Backend::new("b2", "127.0.0.1:9000".parse().unwrap(), 1, None),
+                            Backend::new("b3", "127.0.0.1:9000".parse().unwrap(), 1, None),
+                        ]
+                    };
+                    pool.apply_resolved(backends);
+                }
+            })
+        };
+
+        let pickers: Vec<_> = (0..4)
+            .map(|t| {
+                let pool = Arc::clone(&pool);
+                let ch = Arc::clone(&ch);
+                std::thread::spawn(move || {
+                    for i in 0..5000 {
+                        let key = format!("client-{t}-{i}");
+                        let _ = ch.pick(&pool, &key);
+                    }
+                })
+            })
+            .collect();
+
+        for p in pickers {
+            p.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        updater.join().unwrap();
+
+        pool.apply_resolved(vec![Backend::new(
+            "only",
+            "127.0.0.1:9000".parse().unwrap(),
+            1,
+            None,
+        )]);
+        for i in 0..20 {
+            assert_eq!(
+                ch.pick(&pool, &format!("final-{i}")),
+                Some(BackendId::new("only"))
             );
         }
     }
