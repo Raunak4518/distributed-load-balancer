@@ -8,3 +8,6 @@ docs/superpowers
 
 # graphify generated output (graph.json, graph.html, report)
 graphify-out/
+
+# lb-bench-e2e persisted benchmark results
+/results/

@@ -17,6 +17,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 
+mod results;
+
+use std::sync::OnceLock;
+
+static RESULTS: OnceLock<results::ResultsWriter> = OnceLock::new();
+
+fn results() -> &'static results::ResultsWriter {
+    RESULTS.get_or_init(results::ResultsWriter::new)
+}
+
 type ProxyClient = Client<HttpConnector, Full<Bytes>>;
 
 const STRATEGIES: &[&str] = &[
@@ -419,6 +429,14 @@ fn print_row(
     let ctxsw_str = ctxsw
         .map(|c| c.to_string())
         .unwrap_or_else(|| "n/a".to_string());
+    let scenario = format!("throughput_matrix/conc={concurrency}");
+    results().record(&scenario, "req_s", rps);
+    results().record(&scenario, "total", result.total);
+    results().record(&scenario, "err_pct", err_pct);
+    results().record(&scenario, "p50_ms", ms(percentile(&sorted, 0.50)));
+    results().record(&scenario, "p95_ms", ms(percentile(&sorted, 0.95)));
+    results().record(&scenario, "p99_ms", ms(percentile(&sorted, 0.99)));
+    results().record(&scenario, "p999_ms", ms(percentile(&sorted, 0.999)));
     println!(
         "{:>6} | {:>10.0} | {:>8} | {:>7.2}% | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8} | {:>8} | {:>7} | {:>6} | {:>8}",
         concurrency,
@@ -713,15 +731,27 @@ async fn failure_scenario(
     let (result, _) = tokio::join!(run, kill);
 
     println!();
+    let err_pct = 100.0 * result.errors as f64 / result.total.max(1) as f64;
+    results().record("failure_scenario", "total_requests", result.total);
+    results().record("failure_scenario", "errors", result.errors);
+    results().record("failure_scenario", "err_pct", err_pct);
     println!(
         "  aggregate over {:.1}s: {} requests, {} errors ({:.2}%)",
         result.wall.as_secs_f64(),
         result.total,
         result.errors,
-        100.0 * result.errors as f64 / result.total.max(1) as f64
+        err_pct
     );
     let mut sorted = result.latencies_ns.clone();
     sorted.sort_unstable();
+    results().record("failure_scenario", "p50_ms", ms(percentile(&sorted, 0.50)));
+    results().record("failure_scenario", "p95_ms", ms(percentile(&sorted, 0.95)));
+    results().record("failure_scenario", "p99_ms", ms(percentile(&sorted, 0.99)));
+    results().record(
+        "failure_scenario",
+        "p999_ms",
+        ms(percentile(&sorted, 0.999)),
+    );
     println!(
         "  p50={:.2}ms p95={:.2}ms p99={:.2}ms p999={:.2}ms (the failed backend's own requests both time out and get retried once, which is what the tail captures)",
         ms(percentile(&sorted, 0.50)),
@@ -827,6 +857,13 @@ fn print_comparison_row(strategy: &str, result: &RunResult) {
     let mut sorted = result.latencies_ns.clone();
     sorted.sort_unstable();
     let rps = result.total as f64 / result.wall.as_secs_f64();
+    let scenario = format!("compare_all_strategies/{strategy}");
+    results().record(&scenario, "req_s", rps);
+    results().record(&scenario, "p50_ms", ms(percentile(&sorted, 0.50)));
+    results().record(&scenario, "p95_ms", ms(percentile(&sorted, 0.95)));
+    results().record(&scenario, "p99_ms", ms(percentile(&sorted, 0.99)));
+    results().record(&scenario, "p999_ms", ms(percentile(&sorted, 0.999)));
+    results().record(&scenario, "errors", result.errors);
     println!(
         "{:<22} | {:>10.0} | {:>7.2} | {:>7.2} | {:>7.2} | {:>7.2} | {:>8}",
         strategy,
@@ -910,6 +947,16 @@ async fn heterogeneous_static_comparison() {
         let mut sorted = result.latencies_ns.clone();
         sorted.sort_unstable();
         let rps = result.total as f64 / result.wall.as_secs_f64();
+        let scenario = format!("heterogeneous_static/{strategy}");
+        results().record(&scenario, "a_req_pct", pct[0]);
+        results().record(&scenario, "b_req_pct", pct[1]);
+        results().record(&scenario, "c_req_pct", pct[2]);
+        results().record(&scenario, "d_req_pct", pct[3]);
+        results().record(&scenario, "req_s", rps);
+        results().record(&scenario, "p50_ms", ms(percentile(&sorted, 0.50)));
+        results().record(&scenario, "p95_ms", ms(percentile(&sorted, 0.95)));
+        results().record(&scenario, "p99_ms", ms(percentile(&sorted, 0.99)));
+        results().record(&scenario, "p999_ms", ms(percentile(&sorted, 0.999)));
         println!(
             "{:<22} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>10.0} | {:>7.2} | {:>7.2} | {:>7.2} | {:>7.2}",
             strategy,
@@ -1093,6 +1140,11 @@ async fn retry_amplification_matrix() {
             let backend_attempts = attempts.load(Ordering::Relaxed);
             let amplification = backend_attempts as f64 / result.total.max(1) as f64;
             let err_pct = 100.0 * result.errors as f64 / result.total.max(1) as f64;
+            let scenario = format!("retry_amplification/fail={fail_pct}/{mode_name}");
+            results().record(&scenario, "client_req", result.total);
+            results().record(&scenario, "backend_req", backend_attempts);
+            results().record(&scenario, "amplification_x", amplification);
+            results().record(&scenario, "err_pct", err_pct);
             println!(
                 "{:>8}% | {:<30} | {:>10} | {:>10} | {:>12.2}x | {:>7.2}%",
                 fail_pct, mode_name, result.total, backend_attempts, amplification, err_pct
@@ -1454,6 +1506,20 @@ fn print_reliability_row(r: &ScenarioResult) {
         Some(ms) => format!("{:.0}ms", ms),
         None => "never".to_string(),
     };
+    let scenario = format!("reliability/{}", r.label);
+    if let Some(v) = r.time_to_detection_ms {
+        results().record(&scenario, "time_to_detection_ms", v);
+    }
+    if let Some(v) = r.time_to_ejection_ms {
+        results().record(&scenario, "time_to_ejection_ms", v);
+    }
+    results().record(&scenario, "baseline_d_share_pct", r.baseline_d_share_pct);
+    results().record(&scenario, "degraded_d_share_pct", r.degraded_d_share_pct);
+    if let Some(v) = r.time_to_recovery_ms {
+        results().record(&scenario, "time_to_recovery_ms", v);
+    }
+    results().record(&scenario, "false_ejection", r.false_ejection);
+    results().record(&scenario, "abc_max_deviation_pct", r.abc_max_deviation_pct);
     println!(
         "{:<22} | {:>12} | {:>12} | {:>9.1}% | {:>9.1}% | {:>12} | {:>7} | {:>7.1}%",
         r.label,
@@ -1535,28 +1601,43 @@ async fn reliability_characterization() {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_args(&args) {
-        Cli::Help => print_help(),
+    let mode_and_params: Option<(&str, Vec<(&str, String)>)> = match parse_args(&args) {
+        Cli::Help => {
+            print_help();
+            None
+        }
         Cli::CompareAll => {
             print_methodology();
             compare_all_strategies().await;
+            Some(("compare-all-strategies", vec![]))
         }
         Cli::Heterogeneous => {
             print_methodology();
             heterogeneous_static_comparison().await;
             heterogeneous_dynamic_adaptation().await;
+            Some(("heterogeneous", vec![]))
         }
         Cli::RetryAmplification => {
             print_methodology();
             retry_amplification_matrix().await;
+            Some(("retry-amplification", vec![]))
         }
         Cli::Reliability => {
             print_methodology();
             reliability_characterization().await;
+            Some(("reliability", vec![]))
         }
         Cli::Run { strategy } => {
             print_methodology();
             run_single(strategy).await;
+            Some(("run", vec![("strategy", strategy.to_string())]))
+        }
+    };
+
+    if let Some((mode, params)) = mode_and_params {
+        match results().finish(mode, &params) {
+            Ok(dir) => println!("results persisted to {}", dir.display()),
+            Err(err) => eprintln!("failed to persist results: {err}"),
         }
     }
 }
