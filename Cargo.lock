@@ -1088,6 +1088,7 @@ dependencies = [
  "lb-core",
  "lb-healthcheck",
  "lb-metrics",
+ "lb-ratelimit",
  "lb-tcp",
  "lb-tls",
  "rustls",

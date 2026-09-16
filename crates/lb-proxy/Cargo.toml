@@ -8,6 +8,7 @@ license.workspace = true
 lb-core = { path = "../lb-core" }
 lb-healthcheck = { path = "../lb-healthcheck" }
 lb-metrics = { path = "../lb-metrics" }
+lb-ratelimit = { path = "../lb-ratelimit" }
 lb-tls = { path = "../lb-tls" }
 # For `pump` (upgrade.rs's post-upgrade byte relay): already generic over
 # any `AsyncRead`/`AsyncWrite`, not TCP-specific despite the crate name, and

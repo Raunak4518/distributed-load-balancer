@@ -14,6 +14,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
 
@@ -31,6 +32,7 @@ enum Cli {
     Run { strategy: &'static str },
     CompareAll,
     Heterogeneous,
+    RetryAmplification,
     Help,
 }
 
@@ -41,6 +43,7 @@ fn parse_args(args: &[String]) -> Cli {
         },
         [flag] if flag == "--compare-all-strategies" => Cli::CompareAll,
         [flag] if flag == "--heterogeneous" => Cli::Heterogeneous,
+        [flag] if flag == "--retry-amplification" => Cli::RetryAmplification,
         [flag] if flag == "--help" || flag == "-h" => Cli::Help,
         [flag, name] if flag == "--strategy" => {
             match STRATEGIES.iter().copied().find(|s| *s == name.as_str()) {
@@ -60,6 +63,7 @@ fn print_help() {
     println!("    lb-bench-e2e --strategy <STRATEGY>");
     println!("    lb-bench-e2e --compare-all-strategies");
     println!("    lb-bench-e2e --heterogeneous");
+    println!("    lb-bench-e2e --retry-amplification");
     println!("    lb-bench-e2e --help");
     println!();
     println!("STRATEGY one of: {}", STRATEGIES.join(", "));
@@ -152,7 +156,13 @@ fn lb_server_path() -> PathBuf {
     path
 }
 
-fn write_config(path: &Path, listen: SocketAddr, backends: &[SocketAddr], strategy: &str) {
+fn write_config(
+    path: &Path,
+    listen: SocketAddr,
+    backends: &[SocketAddr],
+    strategy: &str,
+    retry_budget: Option<(f64, u32)>,
+) {
     let backends_toml: String = backends
         .iter()
         .enumerate()
@@ -160,6 +170,12 @@ fn write_config(path: &Path, listen: SocketAddr, backends: &[SocketAddr], strate
             format!("  [[listeners.backends]]\n  id = \"b{i}\"\n  address = \"{addr}\"\n\n")
         })
         .collect();
+    let retry_budget_toml = match retry_budget {
+        Some((rate_per_sec, burst)) => format!(
+            "\n  [listeners.retry_budget]\n  rate_per_sec = {rate_per_sec}\n  burst = {burst}\n"
+        ),
+        None => String::new(),
+    };
     let toml = format!(
         r#"
 [[listeners]]
@@ -181,7 +197,7 @@ max_connections_per_ip = 1000000
   key = "source_ip"
   rate_per_sec = 10000000
   burst = 10000000
-
+{retry_budget_toml}
   [listeners.load_balancing]
   strategy = "{strategy}"
 "#
@@ -680,6 +696,14 @@ async fn failure_scenario(
 }
 
 async fn start_lb_server_for(strategy: &str, backend_addrs: &[SocketAddr]) -> (Child, SocketAddr) {
+    start_lb_server_with_retry_budget(strategy, backend_addrs, None).await
+}
+
+async fn start_lb_server_with_retry_budget(
+    strategy: &str,
+    backend_addrs: &[SocketAddr],
+    retry_budget: Option<(f64, u32)>,
+) -> (Child, SocketAddr) {
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let listener = TcpListener::bind(listen).await.unwrap();
     let listen = listener.local_addr().unwrap();
@@ -688,7 +712,7 @@ async fn start_lb_server_for(strategy: &str, backend_addrs: &[SocketAddr]) -> (C
     let config_dir = std::env::temp_dir().join("lb-bench-e2e");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.toml");
-    write_config(&config_path, listen, backend_addrs, strategy);
+    write_config(&config_path, listen, backend_addrs, strategy, retry_budget);
 
     let child = spawn_lb_server(&config_path).await;
     wait_until_listening(listen).await;
@@ -942,6 +966,106 @@ async fn heterogeneous_dynamic_adaptation() {
     }
 }
 
+async fn spawn_amplification_backend(fail_pct: u64) -> (SocketAddr, Arc<AtomicU64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicU64::new(0));
+    let sequence = Arc::new(AtomicU64::new(0));
+    let attempts_for_task = Arc::clone(&attempts);
+    let sequence_for_task = Arc::clone(&sequence);
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = stream.set_nodelay(true);
+            let attempts = Arc::clone(&attempts_for_task);
+            let sequence = Arc::clone(&sequence_for_task);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let n = match stream.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => return,
+                };
+                if buf[..n].starts_with(b"GET /health") {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
+                attempts.fetch_add(1, Ordering::Relaxed);
+                let seq = sequence.fetch_add(1, Ordering::Relaxed);
+                if fail_pct > 0 && seq % 100 < fail_pct {
+                    let _ = stream.write_all(b"not a valid http response\r\n\r\n").await;
+                } else {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                        .await;
+                }
+            });
+        }
+    });
+    (addr, attempts)
+}
+
+const AMPLIFICATION_FAIL_PCTS: [u64; 3] = [0, 50, 100];
+const AMPLIFICATION_MODES: [(&str, Option<(f64, u32)>); 3] = [
+    ("unbudgeted (today's default)", None),
+    ("budgeted (200 r/s, burst 50)", Some((200.0, 50))),
+    ("near-zero budget (~disabled)", Some((0.01, 1))),
+];
+
+async fn retry_amplification_matrix() {
+    println!(
+        "=== Backend amplification under retries (concurrency=32, 4s + 1s warmup) ==="
+    );
+    println!(
+        "Every failed attempt is a genuine transport-level failure (the backend answers with an \
+         unparsable response), which is the only failure kind lb-proxy's retry loop reacts to -- \
+         a plain 5xx from a healthy backend is returned to the client immediately, never retried."
+    );
+    println!(
+        "\"near-zero budget\" is this codebase's only way to approximate \"retries off\": the \
+         default one-retry is otherwise unconditional, so a budget with essentially no burst \
+         allowance is the closest stand-in for a literal disable switch."
+    );
+    println!();
+    println!(
+        "{:<10} | {:<30} | {:>10} | {:>10} | {:>13} | {:>8}",
+        "fail%", "retry policy", "client req", "backend req", "amplification", "err%"
+    );
+    for fail_pct in AMPLIFICATION_FAIL_PCTS {
+        for (mode_name, retry_budget) in AMPLIFICATION_MODES {
+            let (addr, attempts) = spawn_amplification_backend(fail_pct).await;
+            let (mut child, listen) =
+                start_lb_server_with_retry_budget("round_robin", &[addr], retry_budget).await;
+            let client = build_client();
+
+            let result = run_closed_loop(
+                &client,
+                listen,
+                32,
+                Duration::from_secs(4),
+                Duration::from_secs(1),
+                false,
+            )
+            .await;
+
+            let backend_attempts = attempts.load(Ordering::Relaxed);
+            let amplification = backend_attempts as f64 / result.total.max(1) as f64;
+            let err_pct = 100.0 * result.errors as f64 / result.total.max(1) as f64;
+            println!(
+                "{:>8}% | {:<30} | {:>10} | {:>10} | {:>12.2}x | {:>7.2}%",
+                fail_pct, mode_name, result.total, backend_attempts, amplification, err_pct
+            );
+
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+    }
+    println!();
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -955,6 +1079,10 @@ async fn main() {
             print_methodology();
             heterogeneous_static_comparison().await;
             heterogeneous_dynamic_adaptation().await;
+        }
+        Cli::RetryAmplification => {
+            print_methodology();
+            retry_amplification_matrix().await;
         }
         Cli::Run { strategy } => {
             print_methodology();

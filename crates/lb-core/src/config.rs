@@ -389,6 +389,15 @@ pub struct ListenerConfig {
     /// `lb_proxy::waf`'s module docs for the exact scope and why.
     #[serde(default)]
     pub waf: Option<WafConfig>,
+
+    #[serde(default)]
+    pub retry_budget: Option<RetryBudgetConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RetryBudgetConfig {
+    pub rate_per_sec: f64,
+    pub burst: u32,
 }
 
 /// See `ListenerConfig::waf`.
@@ -1081,6 +1090,14 @@ impl ListenerConfig {
                 "rate_limit.max_tracked_keys must be positive".into(),
             ));
         }
+        if let Some(rb) = &self.retry_budget {
+            if rb.rate_per_sec <= 0.0 {
+                return Err(invalid("retry_budget.rate_per_sec must be positive".into()));
+            }
+            if rb.burst == 0 {
+                return Err(invalid("retry_budget.burst must be positive".into()));
+            }
+        }
         if self.health_check.flap_backoff_multiplier < 1.0 {
             return Err(invalid(
                 "health_check.flap_backoff_multiplier must be >= 1.0".into(),
@@ -1282,6 +1299,12 @@ impl ListenerConfig {
                 if self.waf.is_some() {
                     return Err(invalid(
                         "waf is an http-only setting -- a tcp listener has no path or query to inspect"
+                            .into(),
+                    ));
+                }
+                if self.retry_budget.is_some() {
+                    return Err(invalid(
+                        "retry_budget is an http-only setting -- lb-tcp's own retry loop does not consult a listener-level budget"
                             .into(),
                     ));
                 }
@@ -1587,6 +1610,37 @@ mod tests {
         assert!(
             format!("{err}").contains("http-only"),
             "error should explain headers don't exist at L4, got: {err}"
+        );
+    }
+
+    #[test]
+    fn retry_budget_is_off_by_default_and_parses_when_set() {
+        assert_eq!(Config::parse(VALID).unwrap().listeners[0].retry_budget, None);
+
+        let text = VALID.replace(
+            "          [listeners.load_balancing]\n          strategy = \"round_robin\"\n\n        [[listeners]]\n        name = \"postgres\"",
+            "          [listeners.retry_budget]\n          rate_per_sec = 5\n          burst = 2\n\n          [listeners.load_balancing]\n          strategy = \"round_robin\"\n\n        [[listeners]]\n        name = \"postgres\"",
+        );
+        let cfg = Config::parse(&text).expect("valid config should parse");
+        assert_eq!(
+            cfg.listeners[0].retry_budget,
+            Some(RetryBudgetConfig {
+                rate_per_sec: 5.0,
+                burst: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_retry_budget_on_tcp_listener() {
+        let text = VALID.replace(
+            "        name = \"postgres\"\n        protocol = \"tcp\"\n        listen = \"0.0.0.0:5432\"",
+            "        name = \"postgres\"\n        protocol = \"tcp\"\n        listen = \"0.0.0.0:5432\"\n\n          [listeners.retry_budget]\n          rate_per_sec = 5\n          burst = 2",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("http-only"),
+            "error should explain a tcp listener's retry loop doesn't consult a budget, got: {err}"
         );
     }
 

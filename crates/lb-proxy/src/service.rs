@@ -14,6 +14,7 @@ use lb_core::{
 };
 use lb_healthcheck::{CircuitBreaker, OutlierDetector};
 use lb_metrics::{BackendMetrics, ListenerMetrics, StatusClass};
+use lb_ratelimit::Gcra;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::IpAddr;
@@ -69,6 +70,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// same way, for the same reason).
     pub waf: Option<WafMode>,
     pub waf_inspect_headers: bool,
+    pub retry_budget: Option<Gcra<C>>,
     /// Flat, not scoped per pool: correct because `Config::validate()`
     /// requires every backend id to be unique across the default backends
     /// *and every route's* within one listener, so a `BackendId` here
@@ -439,6 +441,8 @@ fn build_outbound_request(
             .expect("forwarded request is well-formed"),
     )
 }
+
+const RETRY_BUDGET_KEY: &str = "retry";
 
 pub async fn handle<R, C>(
     req: Request<Incoming>,
@@ -880,6 +884,11 @@ where
                 if attempt == 1 {
                     break;
                 }
+                if let Some(budget) = &ctx.retry_budget {
+                    if matches!(budget.check(RETRY_BUDGET_KEY), Decision::Deny { .. }) {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -897,6 +906,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use lb_core::test_util::FakeClock;
     use lb_core::{Backend, Decision};
+    use lb_ratelimit::GcraConfig;
     use std::convert::Infallible;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -976,6 +986,24 @@ mod tests {
             }
         });
         addr
+    }
+
+    async fn spawn_counting_malformed_response_backend() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_clone = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(b"not a valid http response\r\n\r\n").await;
+            }
+        });
+        (addr, count)
     }
 
     /// Like `spawn_fixed_response_backend`, but counts requests and sends an
@@ -1173,6 +1201,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1209,6 +1238,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1264,6 +1294,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1304,6 +1335,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1360,6 +1392,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1381,6 +1414,112 @@ mod tests {
         });
         let resp = run_through_proxy(ctx).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    fn ctx_with_retry_budget(
+        backend: &Backend,
+        pool: Arc<BackendPool>,
+        retry_budget: Option<Gcra<FakeClock>>,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(2),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget,
+        })
+    }
+
+    #[tokio::test]
+    async fn exhausted_retry_budget_suppresses_the_retry() {
+        let (addr, hits) = spawn_counting_malformed_response_backend().await;
+        let backend = Backend::new("b1", addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let clock = FakeClock::new();
+        let retry_budget = Gcra::new(
+            GcraConfig {
+                rate_per_sec: 1.0,
+                burst: 1,
+                max_tracked_keys: 1,
+            },
+            clock,
+        );
+        let ctx = ctx_with_retry_budget(&backend, pool, Some(retry_budget));
+
+        let first = run_through_proxy(ctx.clone()).await;
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the first failing request still gets its usual one retry, spending the budget's only burst token"
+        );
+
+        let second = run_through_proxy(ctx).await;
+        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the second failing request's retry must be suppressed once the budget is exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_budget_replenishes_after_the_configured_period() {
+        let (addr, hits) = spawn_counting_malformed_response_backend().await;
+        let backend = Backend::new("b1", addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let clock = FakeClock::new();
+        let retry_budget = Gcra::new(
+            GcraConfig {
+                rate_per_sec: 10.0,
+                burst: 1,
+                max_tracked_keys: 1,
+            },
+            clock.clone(),
+        );
+        let ctx = ctx_with_retry_budget(&backend, pool, Some(retry_budget));
+
+        let first = run_through_proxy(ctx.clone()).await;
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let second = run_through_proxy(ctx.clone()).await;
+        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        clock.advance(Duration::from_millis(100));
+
+        let third = run_through_proxy(ctx).await;
+        assert_eq!(third.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "one period elapsed, so the budget should have refilled a token and allowed a retry again"
+        );
     }
 
     #[tokio::test]
@@ -1434,6 +1573,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1502,6 +1642,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1570,6 +1711,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
@@ -1729,6 +1871,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1868,6 +2011,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -1908,6 +2052,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2032,6 +2177,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2207,6 +2353,7 @@ mod tests {
             cache: Some(cache),
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2255,6 +2402,7 @@ mod tests {
             cache: Some(test_cache()),
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2299,6 +2447,7 @@ mod tests {
             cache: Some(test_cache()),
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2342,6 +2491,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2382,6 +2532,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Block),
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2429,6 +2580,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Log),
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2476,6 +2628,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Block),
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2517,6 +2670,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Block),
             waf_inspect_headers: true,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2556,6 +2710,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Block),
             waf_inspect_headers: true,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2601,6 +2756,7 @@ mod tests {
             cache: None,
             waf: Some(WafMode::Block),
             waf_inspect_headers: true,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2650,6 +2806,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2776,6 +2933,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2841,6 +2999,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
             outlier: None,
             acme_challenges: None,
@@ -2919,6 +3078,7 @@ mod tests {
             cache: None,
             waf: None,
             waf_inspect_headers: false,
+            retry_budget: None,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,

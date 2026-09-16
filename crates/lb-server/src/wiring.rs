@@ -990,6 +990,16 @@ pub(crate) fn build_listener_core(
                 }),
                 waf: lc.waf.as_ref().map(|w| w.mode),
                 waf_inspect_headers: lc.waf.as_ref().is_some_and(|w| w.inspect_headers),
+                retry_budget: lc.retry_budget.as_ref().map(|rb| {
+                    Gcra::new(
+                        GcraConfig {
+                            rate_per_sec: rb.rate_per_sec,
+                            burst: rb.burst,
+                            max_tracked_keys: 1,
+                        },
+                        SystemClock,
+                    )
+                }),
                 circuit_breakers,
                 outlier: outlier.clone(),
                 acme_challenges: Some(Arc::clone(acme_challenges)),
