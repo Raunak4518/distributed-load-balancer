@@ -27,7 +27,7 @@ Client → TLS termination → Rate limiter → Backend selection → Forward
 
 ## Architecture
 
-Eleven crates. `lb-server` is the binary; the rest are libraries with narrow responsibilities:
+Twelve crates. `lb-server` is the binary; the rest are libraries with narrow responsibilities:
 
 ```
 lb-server          Binary. Config, binding, wiring, shutdown.
@@ -43,6 +43,7 @@ lb-server          Binary. Config, binding, wiring, shutdown.
 │                  optional mutual TLS on the peer channel.
 ├── lb-tls         TLS termination (rustls), backend connector, cert reloading.
 ├── lb-metrics     Prometheus registry, admin HTTP server (/metrics, /healthz, /ready).
+├── lb-tracing     Structured logging plus OpenTelemetry trace export (OTLP).
 └── lb-bench       Micro-benchmarks for pool selection, GCRA, cluster admit, circuit refresh.
 ```
 
