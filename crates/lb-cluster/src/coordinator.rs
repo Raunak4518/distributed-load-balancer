@@ -120,9 +120,9 @@ impl<C: Clock> ClusterCoordinator for ListenerCoordinator<C> {
 
 /// Worst-case count by which the cluster-wide budget for one key can be
 /// transiently over-admitted before gossip convergence catches up: each of
-/// the other `peer_count` nodes can independently admit up to `rate_per_sec
-/// * sync_interval` requests against a shared key before this node's next
-/// gossip round would see them.
+/// the other `peer_count` nodes can independently admit up to
+/// `rate_per_sec` requests per second of `sync_interval` against a shared
+/// key before this node's next gossip round would see them.
 pub fn convergence_over_admission_bound(
     rate_per_sec: f64,
     sync_interval_ms: u64,
