@@ -1744,6 +1744,41 @@ mod tests {
         assert_eq!(resp.body(), "default");
     }
 
+    fn route_with_host(host: &str) -> CompiledRoute {
+        CompiledRoute {
+            path_prefix: None,
+            host: Some(host.to_string()),
+            pool: Arc::new(BackendPool::new(Vec::new())),
+            balancer: Arc::new(NoBackend),
+            outlier: None,
+        }
+    }
+
+    #[test]
+    fn a_host_header_with_an_embedded_null_byte_does_not_match_the_prefix_before_it() {
+        let route = route_with_host("api.internal");
+        assert!(!route_matches(&route, "/", Some("api.internal\0evil.com")));
+    }
+
+    #[test]
+    fn non_ascii_case_variants_are_not_folded_together() {
+        let route = route_with_host("caf\u{e9}.internal");
+        assert!(!route_matches(&route, "/", Some("caf\u{c9}.internal")));
+    }
+
+    #[test]
+    fn the_kelvin_sign_does_not_match_ascii_k_despite_unicode_lowercasing_to_it() {
+        let route = route_with_host("\u{212a}elvin.internal");
+        assert!(!route_matches(&route, "/", Some("kelvin.internal")));
+    }
+
+    #[test]
+    fn a_literal_asterisk_in_a_configured_host_is_matched_literally_not_as_a_wildcard() {
+        let route = route_with_host("*.internal");
+        assert!(route_matches(&route, "/", Some("*.internal")));
+        assert!(!route_matches(&route, "/", Some("api.internal")));
+    }
+
     /// First-match-wins, in declaration order: a second rule that would also
     /// match is never reached once an earlier one already did.
     #[tokio::test]
