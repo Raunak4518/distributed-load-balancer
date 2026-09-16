@@ -44,7 +44,11 @@ lb-server          Binary. Config, binding, wiring, shutdown.
 ├── lb-tls         TLS termination (rustls), backend connector, cert reloading.
 ├── lb-metrics     Prometheus registry, admin HTTP server (/metrics, /healthz, /ready).
 ├── lb-tracing     Structured logging plus OpenTelemetry trace export (OTLP).
-└── lb-bench       Micro-benchmarks for pool selection, GCRA, cluster admit, circuit refresh.
+└── lb-bench       Micro-benchmarks (pool selection, GCRA, cluster admit, circuit
+                   refresh) plus two real-traffic evaluation harnesses:
+                   lb-bench-e2e (strategy comparison, heterogeneous backends,
+                   retry amplification, reliability characterization) and
+                   lb-bench-cluster (gossip convergence-bound validation).
 ```
 
 Dependencies flow strictly downward. `lb-core` depends on nothing inside the workspace. The data-plane crates (`lb-proxy`, `lb-tcp`) never import each other and never import `lb-tls`. `lb-tcp` has no `rustls` in its dependency tree — it asks an `OutboundTransport` trait object to wrap its stream and pumps whatever comes back.
@@ -74,8 +78,18 @@ cargo test --workspace --features lb-core/test-util
 
 **Benchmark:**
 ```bash
+# Micro-benchmarks: pool selection, GCRA, cluster admit, circuit refresh
 cargo run --release -p lb-bench
+
+# Real-traffic evaluation harness against a real lb-server: strategy
+# comparison, heterogeneous backends, retry amplification, reliability/
+# outlier-detection characterization
+cargo run --release -p lb-bench --bin lb-bench-e2e -- --help
+
+# Gossip convergence-bound validation across a real multi-node cluster
+cargo run --release -p lb-bench --bin lb-bench-cluster
 ```
+`lb-bench-e2e` runs are persisted to `results/<timestamp>/{metadata.json,results.csv}` (git SHA, rustc version, OS, run params) for comparing across runs.
 
 **CLI flags:**
 ```bash
