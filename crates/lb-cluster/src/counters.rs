@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Per-key request counts, partitioned by the node that admitted them and
 /// bucketed by Unix epoch second.
@@ -17,9 +18,12 @@ use std::collections::HashMap;
 pub struct CounterStore {
     window_secs: u64,
     keys: DashMap<String, KeyCounts>,
+    snapshot_cursor: AtomicUsize,
 }
 
 const MAX_TRACKED_KEYS: usize = 100_000;
+
+const MAX_SNAPSHOT_BUCKET_ENTRIES: usize = 5_000;
 
 const FUTURE_SKEW_TOLERANCE_SECS: u64 = 5;
 
@@ -54,6 +58,7 @@ impl CounterStore {
         CounterStore {
             window_secs: window_secs.max(1),
             keys: DashMap::new(),
+            snapshot_cursor: AtomicUsize::new(0),
         }
     }
 
@@ -166,21 +171,45 @@ impl CounterStore {
     /// Our own in-window cells, for pushing to peers. A node is only
     /// authoritative for its own counts and never relays anyone else's.
     pub fn snapshot_own(&self, node_id: &str, now_secs: u64) -> Vec<(String, Vec<(u64, u64)>)> {
+        self.snapshot_own_capped(node_id, now_secs, MAX_SNAPSHOT_BUCKET_ENTRIES)
+    }
+
+    fn snapshot_own_capped(
+        &self,
+        node_id: &str,
+        now_secs: u64,
+        max_entries: usize,
+    ) -> Vec<(String, Vec<(u64, u64)>)> {
         let cutoff = now_secs.saturating_sub(self.window_secs.saturating_sub(1));
-        let mut out = Vec::new();
-        for item in self.keys.iter() {
-            let Some(buckets) = item.value().per_node.get(node_id) else {
-                continue;
-            };
-            let in_window: Vec<(u64, u64)> = buckets
-                .iter()
-                .filter(|(epoch, _)| **epoch >= cutoff)
-                .map(|(epoch, count)| (*epoch, *count))
-                .collect();
-            if !in_window.is_empty() {
-                out.push((item.key().clone(), in_window));
-            }
+        let mut keys: Vec<String> = self.keys.iter().map(|item| item.key().clone()).collect();
+        keys.sort_unstable();
+        if keys.is_empty() {
+            return Vec::new();
         }
+        let len = keys.len();
+        let mut idx = self.snapshot_cursor.load(Ordering::Relaxed) % len;
+        let mut out = Vec::new();
+        let mut total_entries = 0usize;
+        for _ in 0..len {
+            if let Some(item) = self.keys.get(&keys[idx]) {
+                if let Some(buckets) = item.per_node.get(node_id) {
+                    let in_window: Vec<(u64, u64)> = buckets
+                        .iter()
+                        .filter(|(epoch, _)| **epoch >= cutoff)
+                        .map(|(epoch, count)| (*epoch, *count))
+                        .collect();
+                    if !in_window.is_empty() {
+                        if total_entries > 0 && total_entries + in_window.len() > max_entries {
+                            break;
+                        }
+                        total_entries += in_window.len();
+                        out.push((keys[idx].clone(), in_window));
+                    }
+                }
+            }
+            idx = (idx + 1) % len;
+        }
+        self.snapshot_cursor.store(idx, Ordering::Relaxed);
         out
     }
 
@@ -313,6 +342,40 @@ mod tests {
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].0, "k");
         assert_eq!(snap[0].1, vec![(NOW, 2)]);
+    }
+
+    #[test]
+    fn a_capped_snapshot_stops_at_the_entry_limit() {
+        let store = CounterStore::new(10);
+        for i in 0..10 {
+            store.merge(&format!("k{i}"), "me", &[(NOW, 1)], NOW);
+        }
+        let snap = store.snapshot_own_capped("me", NOW, 4);
+        assert_eq!(snap.len(), 4);
+    }
+
+    #[test]
+    fn a_capped_snapshot_always_includes_at_least_one_key() {
+        let store = CounterStore::new(10);
+        store.merge("big", "me", &[(NOW, 1), (NOW - 1, 1), (NOW - 2, 1)], NOW);
+        let snap = store.snapshot_own_capped("me", NOW, 1);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].0, "big");
+    }
+
+    #[test]
+    fn successive_capped_snapshots_round_robin_across_all_keys() {
+        let store = CounterStore::new(10);
+        for i in 0..6 {
+            store.merge(&format!("k{i}"), "me", &[(NOW, 1)], NOW);
+        }
+        let first = store.snapshot_own_capped("me", NOW, 3);
+        let second = store.snapshot_own_capped("me", NOW, 3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        let mut seen: Vec<String> = first.into_iter().chain(second).map(|(k, _)| k).collect();
+        seen.sort();
+        assert_eq!(seen, vec!["k0", "k1", "k2", "k3", "k4", "k5"]);
     }
 
     #[test]
