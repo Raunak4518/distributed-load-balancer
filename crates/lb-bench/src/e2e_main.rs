@@ -19,6 +19,50 @@ use tokio::process::{Child, Command};
 
 type ProxyClient = Client<HttpConnector, Full<Bytes>>;
 
+const STRATEGIES: &[&str] = &[
+    "round_robin",
+    "least_connections",
+    "weighted_round_robin",
+    "consistent_hash",
+    "peak_ewma_p2c",
+];
+
+enum Cli {
+    Run { strategy: &'static str },
+    CompareAll,
+    Help,
+}
+
+fn parse_args(args: &[String]) -> Cli {
+    match args {
+        [] => Cli::Run {
+            strategy: STRATEGIES[0],
+        },
+        [flag] if flag == "--compare-all-strategies" => Cli::CompareAll,
+        [flag] if flag == "--help" || flag == "-h" => Cli::Help,
+        [flag, name] if flag == "--strategy" => {
+            match STRATEGIES.iter().copied().find(|s| *s == name.as_str()) {
+                Some(strategy) => Cli::Run { strategy },
+                None => Cli::Help,
+            }
+        }
+        _ => Cli::Help,
+    }
+}
+
+fn print_help() {
+    println!("lb-bench-e2e");
+    println!();
+    println!("USAGE:");
+    println!("    lb-bench-e2e");
+    println!("    lb-bench-e2e --strategy <STRATEGY>");
+    println!("    lb-bench-e2e --compare-all-strategies");
+    println!("    lb-bench-e2e --help");
+    println!();
+    println!("STRATEGY one of: {}", STRATEGIES.join(", "));
+    println!("    [default: {}]", STRATEGIES[0]);
+}
+
 fn build_client() -> ProxyClient {
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
@@ -85,7 +129,7 @@ fn lb_server_path() -> PathBuf {
     path
 }
 
-fn write_config(path: &Path, listen: SocketAddr, backends: &[SocketAddr]) {
+fn write_config(path: &Path, listen: SocketAddr, backends: &[SocketAddr], strategy: &str) {
     let backends_toml: String = backends
         .iter()
         .enumerate()
@@ -116,7 +160,7 @@ max_connections_per_ip = 1000000
   burst = 10000000
 
   [listeners.load_balancing]
-  strategy = "round_robin"
+  strategy = "{strategy}"
 "#
     );
     std::fs::write(path, toml).expect("write config");
@@ -410,16 +454,20 @@ async fn failure_scenario(
     println!();
 }
 
-#[tokio::main]
-async fn main() {
-    print_methodology();
-
-    let mut backends = Vec::new();
+async fn start_harness(
+    strategy: &str,
+) -> (
+    Child,
+    Vec<tokio::task::JoinHandle<()>>,
+    SocketAddr,
+    Vec<SocketAddr>,
+) {
+    let mut backend_handles = Vec::new();
     let mut backend_addrs = Vec::new();
     for _ in 0..4 {
         let (addr, _count, handle) = spawn_backend().await;
         backend_addrs.push(addr);
-        backends.push(handle);
+        backend_handles.push(handle);
     }
 
     let listen: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -430,21 +478,103 @@ async fn main() {
     let config_dir = std::env::temp_dir().join("lb-bench-e2e");
     std::fs::create_dir_all(&config_dir).unwrap();
     let config_path = config_dir.join("config.toml");
-    write_config(&config_path, listen, &backend_addrs);
+    write_config(&config_path, listen, &backend_addrs, strategy);
 
-    let mut child = spawn_lb_server(&config_path).await;
-    let child_pid = child.id();
+    let child = spawn_lb_server(&config_path).await;
     wait_until_listening(listen).await;
-    println!(
-        "lb-server listening on {listen} (pid {child_pid:?}), 4 backends on {backend_addrs:?}"
-    );
+
+    (child, backend_handles, listen, backend_addrs)
+}
+
+async fn run_single(strategy: &str) {
+    let (mut child, backend_handles, listen, backend_addrs) = start_harness(strategy).await;
+    let child_pid = child.id();
+    if strategy == STRATEGIES[0] {
+        println!(
+            "lb-server listening on {listen} (pid {child_pid:?}), 4 backends on {backend_addrs:?}"
+        );
+    } else {
+        println!(
+            "lb-server listening on {listen} (pid {child_pid:?}), 4 backends on {backend_addrs:?}, strategy={strategy}"
+        );
+    }
     println!();
 
     let client = build_client();
 
     throughput_matrix(&client, listen, child_pid).await;
-    failure_scenario(&client, listen, backends).await;
+    failure_scenario(&client, listen, backend_handles).await;
 
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+async fn run_strategy_workload(client: &ProxyClient, strategy: &str) -> RunResult {
+    let (mut child, backend_handles, listen, _backend_addrs) = start_harness(strategy).await;
+
+    let result = run_closed_loop(
+        client,
+        listen,
+        128,
+        Duration::from_secs(5),
+        Duration::from_secs(2),
+        false,
+    )
+    .await;
+
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    for handle in backend_handles {
+        handle.abort();
+    }
+
+    result
+}
+
+fn print_comparison_row(strategy: &str, result: &RunResult) {
+    let mut sorted = result.latencies_ns.clone();
+    sorted.sort_unstable();
+    let rps = result.total as f64 / result.wall.as_secs_f64();
+    println!(
+        "{:<22} | {:>10.0} | {:>7.2} | {:>7.2} | {:>7.2} | {:>7.2} | {:>8}",
+        strategy,
+        rps,
+        ms(percentile(&sorted, 0.50)),
+        ms(percentile(&sorted, 0.95)),
+        ms(percentile(&sorted, 0.99)),
+        ms(percentile(&sorted, 0.999)),
+        result.errors,
+    );
+}
+
+async fn compare_all_strategies() {
+    println!(
+        "=== Strategy comparison: fixed workload (4 backends, concurrency=128, 5s + 2s warmup) ==="
+    );
+    println!(
+        "{:<22} | {:>10} | {:>7} | {:>7} | {:>7} | {:>7} | {:>8}",
+        "strategy", "req/s", "p50ms", "p95ms", "p99ms", "p999ms", "errors"
+    );
+    let client = build_client();
+    for strategy in STRATEGIES {
+        let result = run_strategy_workload(&client, strategy).await;
+        print_comparison_row(strategy, &result);
+    }
+    println!();
+}
+
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match parse_args(&args) {
+        Cli::Help => print_help(),
+        Cli::CompareAll => {
+            print_methodology();
+            compare_all_strategies().await;
+        }
+        Cli::Run { strategy } => {
+            print_methodology();
+            run_single(strategy).await;
+        }
+    }
 }
