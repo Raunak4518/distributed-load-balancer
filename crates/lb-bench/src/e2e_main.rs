@@ -7,7 +7,6 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioIo;
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,6 +32,7 @@ enum Cli {
     CompareAll,
     Heterogeneous,
     RetryAmplification,
+    Reliability,
     Help,
 }
 
@@ -44,6 +44,7 @@ fn parse_args(args: &[String]) -> Cli {
         [flag] if flag == "--compare-all-strategies" => Cli::CompareAll,
         [flag] if flag == "--heterogeneous" => Cli::Heterogeneous,
         [flag] if flag == "--retry-amplification" => Cli::RetryAmplification,
+        [flag] if flag == "--reliability" => Cli::Reliability,
         [flag] if flag == "--help" || flag == "-h" => Cli::Help,
         [flag, name] if flag == "--strategy" => {
             match STRATEGIES.iter().copied().find(|s| *s == name.as_str()) {
@@ -64,6 +65,7 @@ fn print_help() {
     println!("    lb-bench-e2e --compare-all-strategies");
     println!("    lb-bench-e2e --heterogeneous");
     println!("    lb-bench-e2e --retry-amplification");
+    println!("    lb-bench-e2e --reliability");
     println!("    lb-bench-e2e --help");
     println!();
     println!("STRATEGY one of: {}", STRATEGIES.join(", "));
@@ -79,17 +81,37 @@ fn build_client() -> ProxyClient {
 struct SpawnedBackend {
     addr: SocketAddr,
     count: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
     delay_ms: Arc<AtomicU64>,
+    fail_pct: Arc<AtomicU64>,
     handle: tokio::task::JoinHandle<()>,
+}
+
+fn roll(state: &AtomicU64) -> u64 {
+    let mut x = state.load(Ordering::Relaxed);
+    if x == 0 {
+        x = 0x9E3779B97F4A7C15;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    state.store(x, Ordering::Relaxed);
+    x
 }
 
 async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let count = Arc::new(AtomicU64::new(0));
+    let received = Arc::new(AtomicU64::new(0));
     let delay_ms = Arc::new(AtomicU64::new(initial_delay_ms));
+    let fail_pct = Arc::new(AtomicU64::new(0));
+    let rng_state = Arc::new(AtomicU64::new(addr.port() as u64));
     let count_for_task = Arc::clone(&count);
+    let received_for_task = Arc::clone(&received);
     let delay_for_task = Arc::clone(&delay_ms);
+    let fail_for_task = Arc::clone(&fail_pct);
+    let rng_for_task = Arc::clone(&rng_state);
     let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -98,31 +120,44 @@ async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
             let _ = stream.set_nodelay(true);
             let io = TokioIo::new(stream);
             let count = Arc::clone(&count_for_task);
+            let received = Arc::clone(&received_for_task);
             let delay_ms = Arc::clone(&delay_for_task);
+            let fail_pct = Arc::clone(&fail_for_task);
+            let rng_state = Arc::clone(&rng_for_task);
             tokio::spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let count = Arc::clone(&count);
+                    let received = Arc::clone(&received);
                     let delay_ms = Arc::clone(&delay_ms);
+                    let fail_pct = Arc::clone(&fail_pct);
+                    let rng_state = Arc::clone(&rng_state);
                     async move {
                         if req.uri().path() == "/health" {
-                            return Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(StatusCode::OK)
-                                    .body(Full::new(Bytes::new()))
-                                    .unwrap(),
-                            );
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::new()))
+                                .unwrap());
+                        }
+                        received.fetch_add(1, Ordering::Relaxed);
+                        let pct = fail_pct.load(Ordering::Relaxed);
+                        if pct > 0 && roll(&rng_state) % 100 < pct {
+                            if roll(&rng_state).is_multiple_of(2) {
+                                return Err(std::io::Error::other("simulated backend failure"));
+                            }
+                            return Ok(Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(Bytes::from_static(b"err")))
+                                .unwrap());
                         }
                         let delay = delay_ms.load(Ordering::Relaxed);
                         if delay > 0 {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
                         count.fetch_add(1, Ordering::Relaxed);
-                        Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(StatusCode::OK)
-                                .body(Full::new(Bytes::from_static(b"ok")))
-                                .unwrap(),
-                        )
+                        Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from_static(b"ok")))
+                            .unwrap())
                     }
                 });
                 let _ = server_http1::Builder::new().serve_connection(io, svc).await;
@@ -132,7 +167,9 @@ async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
     SpawnedBackend {
         addr,
         count,
+        received,
         delay_ms,
+        fail_pct,
         handle,
     }
 }
@@ -1068,6 +1105,433 @@ async fn retry_amplification_matrix() {
     println!();
 }
 
+fn write_reliability_config(
+    path: &Path,
+    listen: SocketAddr,
+    admin_listen: SocketAddr,
+    backends: &[SocketAddr],
+) {
+    let ids = ["a", "b", "c", "d"];
+    let backends_toml: String = backends
+        .iter()
+        .zip(ids.iter())
+        .map(|(addr, id)| {
+            format!("  [[listeners.backends]]\n  id = \"{id}\"\n  address = \"{addr}\"\n\n")
+        })
+        .collect();
+    let toml = format!(
+        r#"
+[admin]
+listen = "{admin_listen}"
+
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+max_connections = 1000000
+max_connections_per_ip = 1000000
+
+{backends_toml}
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 100
+  timeout_ms = 200
+  failure_threshold = 3
+  cooldown_ms = 2000
+  half_open_successes_required = 2
+  unhealthy_latency_ms = 50
+  max_ejected_fraction = 0.5
+
+  [listeners.health_check.outlier_detection]
+  min_volume = 10
+  min_hosts = 3
+  stddev_factor = 1.0
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000000
+  burst = 10000000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    );
+    std::fs::write(path, toml).expect("write config");
+}
+
+#[derive(Clone, Copy)]
+enum Degradation {
+    Latency(u64),
+    Failure(u64),
+}
+
+impl Degradation {
+    fn apply(&self, backend: &SpawnedBackend) {
+        match self {
+            Degradation::Latency(ms) => backend.delay_ms.store(*ms, Ordering::Relaxed),
+            Degradation::Failure(pct) => backend.fail_pct.store(*pct, Ordering::Relaxed),
+        }
+    }
+
+    fn revert(&self, backend: &SpawnedBackend) {
+        match self {
+            Degradation::Latency(_) => backend.delay_ms.store(10, Ordering::Relaxed),
+            Degradation::Failure(_) => backend.fail_pct.store(0, Ordering::Relaxed),
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Degradation::Latency(ms) => format!("D -> {ms}ms"),
+            Degradation::Failure(pct) => format!("D -> intermittent {pct}%"),
+        }
+    }
+}
+
+struct Sample {
+    t_ms: f64,
+    counts: [u64; 4],
+    d_circuit_state: Option<i64>,
+}
+
+async fn fetch_admin_text(client: &ProxyClient, admin_addr: SocketAddr) -> Option<String> {
+    let uri: hyper::Uri = format!("http://{admin_addr}/metrics").parse().ok()?;
+    let req = Request::builder()
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+        .ok()?;
+    let resp = client.request(req).await.ok()?;
+    let (parts, body) = resp.into_parts();
+    if !parts.status.is_success() {
+        return None;
+    }
+    let bytes = body.collect().await.ok()?.to_bytes();
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn extract_gauge(text: &str, key: &str) -> Option<i64> {
+    let idx = text.find(key)?;
+    let rest = &text[idx + key.len()..];
+    let end = rest.find('\n').unwrap_or(rest.len());
+    rest[..end].trim().parse::<i64>().ok()
+}
+
+struct ScenarioResult {
+    label: String,
+    time_to_detection_ms: Option<f64>,
+    time_to_ejection_ms: Option<f64>,
+    baseline_d_share_pct: f64,
+    degraded_d_share_pct: f64,
+    time_to_recovery_ms: Option<f64>,
+    false_ejection: bool,
+    abc_max_deviation_pct: f64,
+}
+
+fn share_series(samples: &[Sample], backend_idx: usize) -> Vec<(f64, f64)> {
+    let mut out = Vec::with_capacity(samples.len());
+    for w in samples.windows(2) {
+        let (prev, cur) = (&w[0], &w[1]);
+        let deltas: Vec<i64> = (0..4)
+            .map(|i| cur.counts[i] as i64 - prev.counts[i] as i64)
+            .collect();
+        let total: i64 = deltas.iter().sum();
+        let share = if total > 0 {
+            100.0 * deltas[backend_idx] as f64 / total as f64
+        } else {
+            0.0
+        };
+        out.push((cur.t_ms, share));
+    }
+    out
+}
+
+fn analyze(samples: Vec<Sample>, baseline_ms: f64, hold_ms: f64, label: String) -> ScenarioResult {
+    let d_share = share_series(&samples, 3);
+    let degrade_at = baseline_ms;
+    let revert_at = baseline_ms + hold_ms;
+
+    let baseline_shares: Vec<f64> = d_share
+        .iter()
+        .filter(|(t, _)| *t < degrade_at)
+        .map(|(_, s)| *s)
+        .collect();
+    let baseline_d_share_pct = if baseline_shares.is_empty() {
+        0.0
+    } else {
+        baseline_shares.iter().sum::<f64>() / baseline_shares.len() as f64
+    };
+
+    let degraded_shares: Vec<f64> = d_share
+        .iter()
+        .filter(|(t, _)| *t >= degrade_at + 1000.0 && *t < revert_at)
+        .map(|(_, s)| *s)
+        .collect();
+    let degraded_d_share_pct = if degraded_shares.is_empty() {
+        0.0
+    } else {
+        degraded_shares.iter().sum::<f64>() / degraded_shares.len() as f64
+    };
+
+    let mut time_to_detection_ms = None;
+    for s in samples.iter().filter(|s| s.t_ms >= degrade_at) {
+        if let Some(state) = s.d_circuit_state {
+            if state != 0 {
+                time_to_detection_ms = Some(s.t_ms - degrade_at);
+                break;
+            }
+        }
+    }
+    if time_to_detection_ms.is_none() {
+        for (t, share) in d_share.iter().filter(|(t, _)| *t >= degrade_at) {
+            if *share < 12.5 {
+                time_to_detection_ms = Some(t - degrade_at);
+                break;
+            }
+        }
+    }
+
+    let mut time_to_ejection_ms = None;
+    let degraded_series: Vec<&(f64, f64)> =
+        d_share.iter().filter(|(t, _)| *t >= degrade_at).collect();
+    for w in degraded_series.windows(3) {
+        if w.iter().all(|(_, s)| *s < 2.0) {
+            time_to_ejection_ms = Some(w[0].0 - degrade_at);
+            break;
+        }
+    }
+
+    let mut time_to_recovery_ms = None;
+    let recovery_series: Vec<&(f64, f64)> =
+        d_share.iter().filter(|(t, _)| *t >= revert_at).collect();
+    for w in recovery_series.windows(2) {
+        if w.iter().all(|(_, s)| *s >= 15.0) {
+            time_to_recovery_ms = Some(w[0].0 - revert_at);
+            break;
+        }
+    }
+
+    let mut abc_max_deviation_pct: f64 = 0.0;
+    let mut false_ejection = false;
+    let a_share = share_series(&samples, 0);
+    let b_share = share_series(&samples, 1);
+    let c_share = share_series(&samples, 2);
+    for i in 0..a_share.len() {
+        let (t, a) = a_share[i];
+        if t < degrade_at || t >= revert_at {
+            continue;
+        }
+        let b = b_share[i].1;
+        let c = c_share[i].1;
+        let avg = (a + b + c) / 3.0;
+        let dev = [a, b, c]
+            .iter()
+            .map(|v| (v - avg).abs())
+            .fold(0.0_f64, f64::max);
+        abc_max_deviation_pct = abc_max_deviation_pct.max(dev);
+        if a < avg * 0.3 || b < avg * 0.3 || c < avg * 0.3 {
+            false_ejection = true;
+        }
+    }
+
+    ScenarioResult {
+        label,
+        time_to_detection_ms,
+        time_to_ejection_ms,
+        baseline_d_share_pct,
+        degraded_d_share_pct,
+        time_to_recovery_ms,
+        false_ejection,
+        abc_max_deviation_pct,
+    }
+}
+
+async fn run_reliability_scenario(degradation: Degradation) -> ScenarioResult {
+    let mut backends = Vec::with_capacity(4);
+    for _ in 0..4 {
+        backends.push(spawn_backend(10).await);
+    }
+    let addrs: Vec<SocketAddr> = backends.iter().map(|b| b.addr).collect();
+
+    let listen_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = listen_listener.local_addr().unwrap();
+    drop(listen_listener);
+    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    drop(admin_listener);
+
+    let config_dir = std::env::temp_dir().join("lb-bench-e2e-reliability");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join(format!("config-{}.toml", listen.port()));
+    write_reliability_config(&config_path, listen, admin_addr, &addrs);
+
+    let mut child = spawn_lb_server(&config_path).await;
+    wait_until_listening(listen).await;
+    wait_until_listening(admin_addr).await;
+
+    let client = build_client();
+    let concurrency = 40;
+    let baseline = Duration::from_secs(3);
+    let hold = Duration::from_secs(8);
+    let recover = Duration::from_secs(5);
+    let total = baseline + hold + recover;
+    let sample_every = Duration::from_millis(100);
+
+    let load = run_closed_loop(
+        &client,
+        listen,
+        concurrency,
+        total,
+        Duration::from_secs(0),
+        false,
+    );
+
+    let d_index = 3;
+    let controller = async {
+        tokio::time::sleep(baseline).await;
+        degradation.apply(&backends[d_index]);
+        tokio::time::sleep(hold).await;
+        degradation.revert(&backends[d_index]);
+        tokio::time::sleep(recover).await;
+    };
+
+    let sampler = async {
+        let start = Instant::now();
+        let stop_at = start + total;
+        let mut samples = Vec::new();
+        samples.push(Sample {
+            t_ms: 0.0,
+            counts: [
+                backends[0].received.load(Ordering::Relaxed),
+                backends[1].received.load(Ordering::Relaxed),
+                backends[2].received.load(Ordering::Relaxed),
+                backends[3].received.load(Ordering::Relaxed),
+            ],
+            d_circuit_state: None,
+        });
+        while Instant::now() < stop_at {
+            tokio::time::sleep(sample_every).await;
+            let t_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let counts = [
+                backends[0].received.load(Ordering::Relaxed),
+                backends[1].received.load(Ordering::Relaxed),
+                backends[2].received.load(Ordering::Relaxed),
+                backends[3].received.load(Ordering::Relaxed),
+            ];
+            let text = fetch_admin_text(&client, admin_addr).await;
+            let d_circuit_state = text.as_deref().and_then(|t| {
+                extract_gauge(
+                    t,
+                    "lb_backend_circuit_state{backend=\"d\",listener=\"web\"} ",
+                )
+            });
+            samples.push(Sample {
+                t_ms,
+                counts,
+                d_circuit_state,
+            });
+        }
+        samples
+    };
+
+    let (_, _, samples) = tokio::join!(load, controller, sampler);
+
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    for b in backends {
+        b.handle.abort();
+    }
+
+    analyze(
+        samples,
+        baseline.as_secs_f64() * 1000.0,
+        hold.as_secs_f64() * 1000.0,
+        degradation.label(),
+    )
+}
+
+fn print_reliability_row(r: &ScenarioResult) {
+    let fmt_ms = |v: Option<f64>| match v {
+        Some(ms) => format!("{:.0}ms", ms),
+        None => "never".to_string(),
+    };
+    println!(
+        "{:<22} | {:>12} | {:>12} | {:>9.1}% | {:>9.1}% | {:>12} | {:>7} | {:>7.1}%",
+        r.label,
+        fmt_ms(r.time_to_detection_ms),
+        fmt_ms(r.time_to_ejection_ms),
+        r.baseline_d_share_pct,
+        r.degraded_d_share_pct,
+        fmt_ms(r.time_to_recovery_ms),
+        if r.false_ejection { "YES" } else { "no" },
+        r.abc_max_deviation_pct,
+    );
+}
+
+async fn reliability_characterization() {
+    println!(
+        "=== Failure-control characterization: A/B/C=10ms baseline, D degrades then recovers ==="
+    );
+    println!(
+        "Config: interval_ms=100 timeout_ms=200 failure_threshold=3 cooldown_ms=2000 half_open_successes_required=2"
+    );
+    println!(
+        "        unhealthy_latency_ms=50 outlier_detection{{min_volume=10,min_hosts=3,stddev_factor=1.0}} max_ejected_fraction=0.5"
+    );
+    println!("        concurrency=40 closed-loop, per scenario: 3s baseline + 8s degraded + 5s recovery, 100ms sampling");
+    println!();
+
+    let scenarios = [
+        Degradation::Latency(100),
+        Degradation::Latency(500),
+        Degradation::Latency(2000),
+        Degradation::Failure(30),
+    ];
+
+    let mut results = Vec::new();
+    for scenario in scenarios {
+        println!("--- running {} ---", scenario.label());
+        let result = run_reliability_scenario(scenario).await;
+        println!(
+            "    detection={} ejection={} baseline_share={:.1}% degraded_share={:.1}% recovery={} false_ejection={} abc_max_dev={:.1}%",
+            result
+                .time_to_detection_ms
+                .map(|v| format!("{v:.0}ms"))
+                .unwrap_or_else(|| "never".to_string()),
+            result
+                .time_to_ejection_ms
+                .map(|v| format!("{v:.0}ms"))
+                .unwrap_or_else(|| "never".to_string()),
+            result.baseline_d_share_pct,
+            result.degraded_d_share_pct,
+            result
+                .time_to_recovery_ms
+                .map(|v| format!("{v:.0}ms"))
+                .unwrap_or_else(|| "never within 5s".to_string()),
+            result.false_ejection,
+            result.abc_max_deviation_pct,
+        );
+        results.push(result);
+    }
+
+    println!();
+    println!("=== Results table ===");
+    println!(
+        "{:<22} | {:>12} | {:>12} | {:>10} | {:>10} | {:>12} | {:>7} | {:>8}",
+        "scenario",
+        "detection",
+        "ejection",
+        "D share(base)",
+        "D share(deg)",
+        "recovery",
+        "false_ej",
+        "abc_dev"
+    );
+    for r in &results {
+        print_reliability_row(r);
+    }
+    println!();
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1085,6 +1549,10 @@ async fn main() {
         Cli::RetryAmplification => {
             print_methodology();
             retry_amplification_matrix().await;
+        }
+        Cli::Reliability => {
+            print_methodology();
+            reliability_characterization().await;
         }
         Cli::Run { strategy } => {
             print_methodology();
