@@ -324,7 +324,25 @@ fn ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
-fn print_row(concurrency: usize, result: &RunResult, cpu_cores: Option<f64>, mem_mb: Option<f64>) {
+struct ProcessSample {
+    cpu_secs: f64,
+    mem_mb: f64,
+    threads: Option<u64>,
+    fds: Option<u64>,
+    voluntary_ctxt_switches: Option<u64>,
+    nonvoluntary_ctxt_switches: Option<u64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_row(
+    concurrency: usize,
+    result: &RunResult,
+    cpu_cores: Option<f64>,
+    mem_mb: Option<f64>,
+    threads: Option<u64>,
+    fds: Option<u64>,
+    ctxsw: Option<u64>,
+) {
     let mut sorted = result.latencies_ns.clone();
     sorted.sort_unstable();
     let rps = result.total as f64 / result.wall.as_secs_f64();
@@ -339,8 +357,17 @@ fn print_row(concurrency: usize, result: &RunResult, cpu_cores: Option<f64>, mem
     let mem_str = mem_mb
         .map(|m| format!("{m:.0}"))
         .unwrap_or_else(|| "n/a".to_string());
+    let threads_str = threads
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let fds_str = fds
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
+    let ctxsw_str = ctxsw
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "n/a".to_string());
     println!(
-        "{:>6} | {:>10.0} | {:>8} | {:>7.2}% | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8} | {:>8}",
+        "{:>6} | {:>10.0} | {:>8} | {:>7.2}% | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8} | {:>8} | {:>7} | {:>6} | {:>8}",
         concurrency,
         rps,
         result.total,
@@ -351,11 +378,14 @@ fn print_row(concurrency: usize, result: &RunResult, cpu_cores: Option<f64>, mem
         ms(percentile(&sorted, 0.999)),
         cpu_str,
         mem_str,
+        threads_str,
+        fds_str,
+        ctxsw_str,
     );
 }
 
 #[cfg(windows)]
-fn sample_process(pid: u32) -> Option<(f64, f64)> {
+fn sample_process(pid: u32) -> Option<ProcessSample> {
     let output = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
@@ -371,18 +401,161 @@ fn sample_process(pid: u32) -> Option<(f64, f64)> {
     let mut parts = line.trim().split(',');
     let cpu_secs: f64 = parts.next()?.trim().parse().ok()?;
     let mem_bytes: f64 = parts.next()?.trim().parse().ok()?;
-    Some((cpu_secs, mem_bytes / (1024.0 * 1024.0)))
+    Some(ProcessSample {
+        cpu_secs,
+        mem_mb: mem_bytes / (1024.0 * 1024.0),
+        threads: None,
+        fds: None,
+        voluntary_ctxt_switches: None,
+        nonvoluntary_ctxt_switches: None,
+    })
 }
 
 #[cfg(not(windows))]
-fn sample_process(_pid: u32) -> Option<(f64, f64)> {
-    None
+fn sample_process(pid: u32) -> Option<ProcessSample> {
+    const CLK_TCK_HZ: f64 = 100.0;
+
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    let utime: f64 = fields.get(11)?.parse().ok()?;
+    let stime: f64 = fields.get(12)?.parse().ok()?;
+    let cpu_secs = (utime + stime) / CLK_TCK_HZ;
+
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut mem_mb: Option<f64> = None;
+    let mut threads: Option<u64> = None;
+    let mut voluntary_ctxt_switches: Option<u64> = None;
+    let mut nonvoluntary_ctxt_switches: Option<u64> = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            mem_mb = rest
+                .trim()
+                .split_whitespace()
+                .next()
+                .and_then(|kb| kb.parse::<f64>().ok())
+                .map(|kb| kb / 1024.0);
+        } else if let Some(rest) = line.strip_prefix("Threads:") {
+            threads = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
+            voluntary_ctxt_switches = rest.trim().parse().ok();
+        } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
+            nonvoluntary_ctxt_switches = rest.trim().parse().ok();
+        }
+    }
+    let mem_mb = mem_mb?;
+
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()
+        .map(|entries| entries.count() as u64);
+
+    Some(ProcessSample {
+        cpu_secs,
+        mem_mb,
+        threads,
+        fds,
+        voluntary_ctxt_switches,
+        nonvoluntary_ctxt_switches,
+    })
+}
+
+#[cfg(windows)]
+fn powershell_query(script: &str) -> Option<String> {
+    let output = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", script])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next()?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
+#[cfg(windows)]
+fn detect_host_line() -> String {
+    let cpu = powershell_query("(Get-CimInstance Win32_Processor).Name")
+        .unwrap_or_else(|| "unknown CPU".to_string());
+    let physical = powershell_query("(Get-CimInstance Win32_Processor).NumberOfCores")
+        .unwrap_or_else(|| "?".to_string());
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    let mem_gib = powershell_query(
+        "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)",
+    )
+    .unwrap_or_else(|| "?".to_string());
+    format!("{cpu}, {physical} physical / {logical} logical cores, {mem_gib} GiB RAM")
+}
+
+#[cfg(windows)]
+fn detect_os_line() -> String {
+    let caption = powershell_query("(Get-CimInstance Win32_OperatingSystem).Caption")
+        .unwrap_or_else(|| "Windows".to_string());
+    let build = powershell_query("[System.Environment]::OSVersion.Version.Build")
+        .unwrap_or_else(|| "?".to_string());
+    format!("{caption}, build {build}")
+}
+
+#[cfg(not(windows))]
+fn detect_host_line() -> String {
+    let cpu = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown CPU".to_string());
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let mem_str = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("MemTotal:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<f64>().ok())
+        })
+        .map(|kb| format!("{:.0}", kb / (1024.0 * 1024.0)))
+        .unwrap_or_else(|| "?".to_string());
+    format!("{cpu}, {logical} logical cores, {mem_str} GiB RAM")
+}
+
+#[cfg(not(windows))]
+fn detect_os_line() -> String {
+    let pretty = std::fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("PRETTY_NAME="))
+                .map(|l| {
+                    l.trim_start_matches("PRETTY_NAME=")
+                        .trim_matches('"')
+                        .to_string()
+                })
+        });
+    let kernel = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match (pretty, kernel) {
+        (Some(p), Some(k)) => format!("{p}, kernel {k}"),
+        (Some(p), None) => p,
+        (None, Some(k)) => format!("Linux, kernel {k}"),
+        (None, None) => "Linux".to_string(),
+    }
 }
 
 fn print_methodology() {
     println!("Methodology / environment (recorded so this is reproducible, not just a number):");
-    println!("  Host: AMD Ryzen 7 7435HS, 8 physical / 16 logical cores, 16 GiB RAM");
-    println!("  OS: Windows 11 Home Single Language, build 26200");
+    println!("  Host: {}", detect_host_line());
+    println!("  OS: {}", detect_os_line());
     println!(
         "  Toolchain: {} / {}",
         rustc_version(),
@@ -407,8 +580,20 @@ fn rustc_version() -> String {
 async fn throughput_matrix(client: &ProxyClient, target: SocketAddr, child_pid: Option<u32>) {
     println!("=== Throughput / latency across concurrency levels ===");
     println!(
-        "{:>6} | {:>10} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8}",
-        "conc", "req/s", "total", "err%", "p50ms", "p95ms", "p99ms", "p999ms", "cpu-s", "mem-MB"
+        "{:>6} | {:>10} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>8} | {:>7} | {:>6} | {:>8}",
+        "conc",
+        "req/s",
+        "total",
+        "err%",
+        "p50ms",
+        "p95ms",
+        "p99ms",
+        "p999ms",
+        "cpu-s",
+        "mem-MB",
+        "threads",
+        "fds",
+        "ctxsw"
     );
     for concurrency in [1usize, 8, 32, 128, 256] {
         let before = child_pid.and_then(sample_process);
@@ -422,12 +607,30 @@ async fn throughput_matrix(client: &ProxyClient, target: SocketAddr, child_pid: 
         )
         .await;
         let after = child_pid.and_then(sample_process);
-        let cpu_cores = match (before, after) {
-            (Some((cpu0, _)), Some((cpu1, _))) => Some((cpu1 - cpu0) / result.wall.as_secs_f64()),
+        let cpu_cores = match (&before, &after) {
+            (Some(b), Some(a)) => Some((a.cpu_secs - b.cpu_secs) / result.wall.as_secs_f64()),
             _ => None,
         };
-        let mem_mb = after.map(|(_, mem)| mem);
-        print_row(concurrency, &result, cpu_cores, mem_mb);
+        let mem_mb = after.as_ref().map(|a| a.mem_mb);
+        let threads = after.as_ref().and_then(|a| a.threads);
+        let fds = after.as_ref().and_then(|a| a.fds);
+        let ctxsw = match (&before, &after) {
+            (Some(b), Some(a)) => {
+                match (
+                    b.voluntary_ctxt_switches,
+                    b.nonvoluntary_ctxt_switches,
+                    a.voluntary_ctxt_switches,
+                    a.nonvoluntary_ctxt_switches,
+                ) {
+                    (Some(bv), Some(bn), Some(av), Some(an)) => {
+                        Some((av + an).saturating_sub(bv + bn))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        print_row(concurrency, &result, cpu_cores, mem_mb, threads, fds, ctxsw);
     }
     println!();
 }
