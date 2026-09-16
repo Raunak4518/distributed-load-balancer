@@ -882,6 +882,13 @@ pub(crate) fn build_listener_core(
     {
         (Some(node), Some(cc)) => {
             let limit = (lc.rate_limit.rate_per_sec * cc.window_secs as f64).ceil() as u64;
+            listener_metrics.cluster_convergence_bound.set(
+                lb_cluster::convergence_over_admission_bound(
+                    lc.rate_limit.rate_per_sec,
+                    cc.sync_interval_ms,
+                    cc.peers.len(),
+                ) as i64,
+            );
             Some(Arc::new(ListenerCoordinator::new(
                 Arc::clone(node),
                 lc.name.clone(),

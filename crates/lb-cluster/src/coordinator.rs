@@ -118,6 +118,20 @@ impl<C: Clock> ClusterCoordinator for ListenerCoordinator<C> {
     }
 }
 
+/// Worst-case count by which the cluster-wide budget for one key can be
+/// transiently over-admitted before gossip convergence catches up: each of
+/// the other `peer_count` nodes can independently admit up to `rate_per_sec
+/// * sync_interval` requests against a shared key before this node's next
+/// gossip round would see them.
+pub fn convergence_over_admission_bound(
+    rate_per_sec: f64,
+    sync_interval_ms: u64,
+    peer_count: usize,
+) -> u64 {
+    let per_node_burst = rate_per_sec * (sync_interval_ms as f64 / 1000.0);
+    (per_node_burst * peer_count as f64).ceil() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +233,25 @@ mod tests {
 
         clock.advance(Duration::from_secs(10));
         assert!(coord.try_admit("k"));
+    }
+
+    #[test]
+    fn convergence_bound_scales_with_rate_interval_and_peer_count() {
+        // 100 req/s, 200ms gossip round -> 20 requests one node can admit
+        // before a peer's next sync round would see them; three peers could
+        // each independently do this at once.
+        assert_eq!(convergence_over_admission_bound(100.0, 200, 3), 60);
+    }
+
+    #[test]
+    fn convergence_bound_is_zero_with_no_peers() {
+        assert_eq!(convergence_over_admission_bound(100.0, 200, 0), 0);
+    }
+
+    #[test]
+    fn convergence_bound_rounds_up_a_fractional_burst() {
+        // 1 req/s, 1500ms round -> 1.5 requests/node, rounded up to 2, times
+        // one peer.
+        assert_eq!(convergence_over_admission_bound(1.0, 1_500, 1), 2);
     }
 }

@@ -36,6 +36,7 @@ pub struct Metrics {
     request_timeouts: IntCounterVec,
     ratelimit_tracked_keys: IntGaugeVec,
     pub cluster_auth_failures: IntCounterVec,
+    ratelimit_cluster_convergence_bound: IntGaugeVec,
 
     // TLS (Phase 6)
     tls_handshakes: IntCounterVec,
@@ -166,6 +167,16 @@ impl Metrics {
             ),
             &["peer"],
         )?;
+        // The cluster-wide rate limit is a converging target, not an
+        // instantaneous ceiling: this many requests can transiently get
+        // through above the configured limit while gossip catches up.
+        let ratelimit_cluster_convergence_bound = IntGaugeVec::new(
+            Opts::new(
+                "lb_ratelimit_cluster_convergence_bound",
+                "Worst-case requests the cluster-wide rate limit can transiently over-admit before gossip convergence catches up",
+            ),
+            &["listener"],
+        )?;
         // `outcome` separates "we are being probed" (failed) from "clients
         // cannot finish" (timeout) from "our configuration is wrong" (no
         // successes at all) -- three incidents with three different fixes.
@@ -268,6 +279,7 @@ impl Metrics {
         registry.register(Box::new(request_timeouts.clone()))?;
         registry.register(Box::new(ratelimit_tracked_keys.clone()))?;
         registry.register(Box::new(cluster_auth_failures.clone()))?;
+        registry.register(Box::new(ratelimit_cluster_convergence_bound.clone()))?;
         registry.register(Box::new(tls_handshakes.clone()))?;
         registry.register(Box::new(tls_handshake_duration.clone()))?;
         registry.register(Box::new(tls_certificate_reloads.clone()))?;
@@ -296,6 +308,7 @@ impl Metrics {
             request_timeouts,
             ratelimit_tracked_keys,
             cluster_auth_failures,
+            ratelimit_cluster_convergence_bound,
             tls_handshakes,
             tls_handshake_duration,
             tls_certificate_reloads,
@@ -358,6 +371,9 @@ impl Metrics {
             timeouts_header: self.request_timeouts.with_label_values(&[name, "header"]),
             timeouts_body: self.request_timeouts.with_label_values(&[name, "body"]),
             tracked_keys: self.ratelimit_tracked_keys.with_label_values(&[name]),
+            cluster_convergence_bound: self
+                .ratelimit_cluster_convergence_bound
+                .with_label_values(&[name]),
             tls_handshakes_success: self.tls_handshakes.with_label_values(&[name, "success"]),
             tls_handshakes_failed: self.tls_handshakes.with_label_values(&[name, "failed"]),
             tls_handshakes_timeout: self.tls_handshakes.with_label_values(&[name, "timeout"]),

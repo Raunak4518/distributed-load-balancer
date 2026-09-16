@@ -84,6 +84,10 @@ pub struct ListenerMetrics {
     pub timeouts_body: IntCounter,
     /// Early warning that the rate-limit overflow bucket is about to engage.
     pub tracked_keys: IntGauge,
+    /// Worst-case count by which this listener's cluster-wide rate limit
+    /// budget can be transiently over-admitted before gossip convergence
+    /// catches up. Absent a `[cluster]` config, stays at its default zero.
+    pub cluster_convergence_bound: IntGauge,
 
     // TLS (Phase 6). Pre-resolved per outcome for the same reason as every
     // handle above: the outcome set is fixed in code, so there is no reason
