@@ -234,6 +234,17 @@ None of the above is authenticated by default — exactly the risk nginx's paywa
 
 The same private admin port also serves `GET /backends` (every listener's backends, with health/circuit/drain state, in-flight connection counts, and which route each one belongs to — `default` or a `route:N` label — as JSON) and `POST /backends/{listener}/{id}/drain` / `.../undrain` — runtime backend inspection and draining with no config edit or reload, the two things nginx paywalls into nginx Plus's dynamic reconfiguration API. A drain is a separate flag from the active health checker's own healthy/unhealthy verdict, so a passing probe doesn't silently undo an operator's drain request. It doesn't add or remove backends — that still goes through the config file and `SIGHUP`.
 
+## Evaluation Findings
+
+Real runs against a real `lb-server`, not synthetic assertions. Full methodology and numbers live in each `results/<timestamp>/` directory; the headline findings so far:
+
+- **Peak-EWMA+P2C beats round-robin under heterogeneous backend latency.** On a 10/20/100/500ms backend mix, round-robin's traffic stayed perfectly even, despite one backend being 30x slower than another (zero adaptation, by design). Peak-EWMA+P2C matched least-connections' throughput while cutting p99 latency from 507ms to 125ms. When a backend's latency jumped 30x mid-run, its share of traffic collapsed within ~1s and recovered over ~10s once it improved — a real, measurable convergence lag, not a bug.
+- **The gossip-based cluster rate limiter stays within its documented overshoot bound in 11 of 12 tested (node-count, gossip-interval) combinations** (3/5/10 nodes × 100ms/500ms/1s/5s intervals); the one exception (3 nodes, 100ms interval) exceeded it marginally (105 vs. 104 predicted), likely from `tokio::time::interval`'s immediate first tick front-loading admissions. Partition-and-restore scenarios confirmed the underlying CRDT reconciles with no lost or double-counted admissions.
+- **A bounded retry budget (GCRA-based, off by default) prevents backend-request amplification** under partial and total backend failure — measured directly via `--retry-amplification`.
+- **Circuit-breaker detection/ejection/recovery times scale plausibly with failure severity** across four injected degradation scenarios (100ms/500ms/2000ms latency spikes, 30% intermittent failure).
+- **DNS-discovered backends have a narrow readiness race**: a newly-resolved backend is marked eligible at discovery time, not after its first successful health check, so a request can rarely land on a not-yet-ready backend before its first probe completes. Also found: DNS-discovered backends never get a circuit breaker in the current wiring (health checking still applies; the separate consecutive-failure fast-fail path does not).
+- **Graceful shutdown, live reload, and restart-required-reload all behave correctly under real concurrent load**: shutdown drains in-flight requests within the configured timeout before exiting; a reload that changes the backend list preserves a manually-drained backend's drain state and an already-open circuit breaker's state; a reload that would require a restart (e.g. re-addressing a listener) is refused outright with zero dropped requests.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) — crate graph, trait boundaries, wiring
