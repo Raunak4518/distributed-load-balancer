@@ -2918,6 +2918,7 @@ mod tests {
             sticky: None,
             cache: None,
             waf: None,
+            waf_inspect_headers: false,
             circuit_breakers: breakers,
             outlier: None,
             acme_challenges: None,
