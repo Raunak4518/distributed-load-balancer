@@ -2637,4 +2637,103 @@ mod tests {
             "expected 200, got:\n{head}"
         );
     }
+
+    struct PanicOnHeader(&'static str);
+    impl LoadBalancer for PanicOnHeader {
+        fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
+            if key == self.0 {
+                panic!("synthetic panic to prove one connection's task does not affect another");
+            }
+            pool.eligible_backends().into_iter().next()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_mid_request_does_not_affect_other_in_flight_connections_or_shared_state() {
+        let backend_addr = spawn_fixed_response_backend(StatusCode::OK, "ok").await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let mut breakers = HashMap::new();
+        breakers.insert(
+            backend.id.clone(),
+            CircuitBreaker::new(
+                3,
+                Duration::from_secs(5),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                None,
+                None,
+                FakeClock::new(),
+            ),
+        );
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(PanicOnHeader("panic")),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            circuit_breakers: breakers,
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::Header("X-Trigger".to_string()),
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let addr = spawn_proxy_listener(ctx).await;
+
+        async fn send(addr: SocketAddr, trigger: &str) -> Vec<u8> {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "GET / HTTP/1.1\r\nHost: x\r\nX-Trigger: {trigger}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf).await;
+            buf
+        }
+
+        let (panicking, concurrent) = tokio::join!(send(addr, "panic"), send(addr, "normal"));
+
+        let concurrent_text = String::from_utf8_lossy(&concurrent);
+        assert!(
+            concurrent_text.contains("200"),
+            "a concurrent, unrelated connection was affected by another connection's panic: {concurrent_text}"
+        );
+        assert!(
+            !panicking.windows(3).any(|w| w == b"200"),
+            "a panicking connection must not be served a 200 as if nothing happened: {}",
+            String::from_utf8_lossy(&panicking)
+        );
+
+        let after = send(addr, "normal").await;
+        assert!(
+            String::from_utf8_lossy(&after).contains("200"),
+            "the listener or its shared pool/breaker state was broken after a panic"
+        );
+    }
 }
