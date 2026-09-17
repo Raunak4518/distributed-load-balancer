@@ -21,14 +21,18 @@
 
 mod tls;
 
-use lb_balancer::{ConsistentHash, RoundRobin};
+use lb_balancer::{ConsistentHash, LeastConnections, PeakEwmaP2c, RoundRobin, WeightedRoundRobin};
 use lb_cluster::{ClusterNode, ListenerCoordinator};
-use lb_core::{Backend, BackendPool, ClusterCoordinator, LoadBalancer, RateLimiter, SystemClock};
+use lb_core::{
+    Backend, BackendId, BackendPool, ClusterCoordinator, LoadBalancer, RateLimiter, SystemClock,
+};
 use lb_healthcheck::{CircuitBreaker, CircuitState};
 use lb_ratelimit::{Gcra, GcraConfig};
 use std::collections::HashMap;
 use std::hint::black_box;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const ITERATIONS: u64 = 200_000;
@@ -169,6 +173,186 @@ fn bench_circuit_refresh() {
     }
 }
 
+const POOL_SIZES: [usize; 6] = [1, 5, 20, 100, 500, 1000];
+const CONTENTION_DURATION: Duration = Duration::from_millis(2_500);
+const CONTENTION_PICKER_THREADS: usize = 4;
+const CONTENTION_SAMPLE_STRIDE: u64 = 64;
+
+fn iterations_for(n: usize) -> u64 {
+    match n {
+        0..=20 => ITERATIONS,
+        21..=100 => 100_000,
+        101..=500 => 20_000,
+        _ => 5_000,
+    }
+}
+
+fn backend_list(n: usize) -> Vec<Backend> {
+    (0..n)
+        .map(|i| {
+            Backend::new(
+                format!("backend-{i}"),
+                format!("127.0.0.1:{}", 9000 + i).parse().unwrap(),
+                1,
+                None,
+            )
+        })
+        .collect()
+}
+
+fn bench_pick_at_scale(strategy_name: &str, lb: &dyn LoadBalancer) {
+    println!("\n{strategy_name}::pick()  [backend-pool scaling, item 4]");
+    for n in POOL_SIZES {
+        let pool = pool_of(n);
+        let iterations = iterations_for(n);
+        bench(&format!("{n} backend(s)"), iterations, || {
+            black_box(lb.pick(&pool, "client-key"));
+        });
+    }
+}
+
+fn bench_apply_resolved_at_scale() {
+    println!(
+        "\nBackendPool::apply_resolved()  [membership/weight update: rebuild + one ArcSwap::store]"
+    );
+    for n in POOL_SIZES {
+        let pool = pool_of(n);
+        let backends = backend_list(n);
+        let iterations = iterations_for(n);
+        bench(&format!("{n} backend(s)"), iterations, || {
+            pool.apply_resolved(backends.clone());
+        });
+    }
+}
+
+fn print_memory_estimate() {
+    println!("\nPer-backend memory estimate  [rough floor via std::mem::size_of on public types]");
+
+    let backend_bytes = std::mem::size_of::<Backend>();
+    let backend_id_bytes = std::mem::size_of::<BackendId>();
+    let atomic_bool_bytes = std::mem::size_of::<AtomicBool>();
+    let atomic_usize_bytes = std::mem::size_of::<std::sync::atomic::AtomicUsize>();
+    let thin_arc_ptr_bytes = std::mem::size_of::<Arc<u8>>();
+    let arc_refcount_header_bytes = 2 * std::mem::size_of::<usize>();
+
+    let backend_state_fields_bytes = backend_bytes + 4 * atomic_bool_bytes + atomic_usize_bytes;
+    let backend_state_heap_alloc_bytes = arc_refcount_header_bytes + backend_state_fields_bytes;
+    let pool_state_inline_bytes = 2 * backend_id_bytes + thin_arc_ptr_bytes;
+    let per_backend_floor_bytes = backend_state_heap_alloc_bytes + pool_state_inline_bytes;
+
+    println!("  size_of::<Backend>()                        {backend_bytes:>6} bytes");
+    println!("  size_of::<BackendId>() (Arc<str> fat ptr)   {backend_id_bytes:>6} bytes");
+    println!(
+        "  4x AtomicBool + 1x AtomicUsize              {:>6} bytes",
+        4 * atomic_bool_bytes + atomic_usize_bytes
+    );
+    println!("  BackendState fields (Backend + flags)       {backend_state_fields_bytes:>6} bytes");
+    println!(
+        "  + Arc<BackendState> refcount header (est.)  {backend_state_heap_alloc_bytes:>6} bytes  (one heap allocation)"
+    );
+    println!(
+        "  order Vec entry + states map key+value      {pool_state_inline_bytes:>6} bytes  (inline in PoolState)"
+    );
+    println!("  {}", "-".repeat(58));
+    println!("  rough floor per backend                     {per_backend_floor_bytes:>6} bytes");
+    println!(
+        "  at 1000 backends: ~{:.1} KiB (rough floor only)",
+        per_backend_floor_bytes as f64 * 1000.0 / 1024.0
+    );
+    println!("  NOT counted here, and why an exact number isn't reliable on this platform:");
+    println!("    - the id/server_name string bytes themselves (heap-allocated separately)");
+    println!("    - the system allocator's own per-allocation bookkeeping overhead");
+    println!("    - HashMap's real bucket/control-byte layout and load-factor slack");
+    println!("    - Vec/HashMap growth over-allocation (capacity commonly exceeds len)");
+    println!("    - ConsistentHash's separately cached ring (Vec<(u64, BackendId)>,");
+    println!("      10 virtual nodes per unit of weight, rebuilt on membership change)");
+}
+
+fn run_contention_case(strategy_name: &str, lb: Arc<dyn LoadBalancer>, n: usize) {
+    let pool = Arc::new(pool_of(n));
+    let stop = Arc::new(AtomicBool::new(false));
+    let max_latency_nanos = Arc::new(AtomicU64::new(0));
+    let total_calls = Arc::new(AtomicU64::new(0));
+
+    let updater = {
+        let pool = Arc::clone(&pool);
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                pool.apply_resolved(backend_list(n));
+            }
+        })
+    };
+
+    let start = Instant::now();
+    let handles: Vec<_> = (0..CONTENTION_PICKER_THREADS)
+        .map(|t| {
+            let pool = Arc::clone(&pool);
+            let lb = Arc::clone(&lb);
+            let stop = Arc::clone(&stop);
+            let max_latency_nanos = Arc::clone(&max_latency_nanos);
+            let total_calls = Arc::clone(&total_calls);
+            thread::spawn(move || {
+                let key = format!("client-{t}");
+                let mut samples: Vec<u64> = Vec::new();
+                let mut calls: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let call_start = Instant::now();
+                    black_box(lb.pick(&pool, &key));
+                    let elapsed_nanos = call_start.elapsed().as_nanos() as u64;
+                    max_latency_nanos.fetch_max(elapsed_nanos, Ordering::Relaxed);
+                    if calls.is_multiple_of(CONTENTION_SAMPLE_STRIDE) {
+                        samples.push(elapsed_nanos);
+                    }
+                    calls += 1;
+                }
+                total_calls.fetch_add(calls, Ordering::Relaxed);
+                samples
+            })
+        })
+        .collect();
+
+    thread::sleep(CONTENTION_DURATION);
+    stop.store(true, Ordering::Relaxed);
+
+    let mut all_samples: Vec<u64> = Vec::new();
+    for h in handles {
+        all_samples.extend(h.join().unwrap());
+    }
+    updater.join().unwrap();
+
+    let elapsed_secs = start.elapsed().as_secs_f64();
+    all_samples.sort_unstable();
+    let sample_count = all_samples.len();
+    let p50 = all_samples[sample_count / 2];
+    let p99 = all_samples[(sample_count * 99 / 100).min(sample_count - 1)];
+    let max = max_latency_nanos.load(Ordering::Relaxed);
+    let calls = total_calls.load(Ordering::Relaxed);
+    let ops_per_sec = calls as f64 / elapsed_secs;
+
+    println!(
+        "  {strategy_name:<16} {n:>5} backend(s)   p50 {p50:>8} ns   p99 {p99:>9} ns   max {max:>10} ns   {ops_per_sec:>12.0} ops/s"
+    );
+}
+
+fn bench_pick_under_concurrent_apply_resolved() {
+    println!(
+        "\npick() latency while apply_resolved() runs concurrently, once per second [DNS-poll cadence]"
+    );
+    println!(
+        "  {CONTENTION_PICKER_THREADS} picker threads hammering pick() for {:.1}s; p50/p99 from a 1-in-{CONTENTION_SAMPLE_STRIDE} sampled\n  subset, max is the true max across every call (atomic fetch_max, unsampled)",
+        CONTENTION_DURATION.as_secs_f64()
+    );
+    for n in POOL_SIZES {
+        run_contention_case("RoundRobin", Arc::new(RoundRobin::new()), n);
+        run_contention_case("ConsistentHash", Arc::new(ConsistentHash::new()), n);
+    }
+}
+
 fn main() {
     println!("lb-bench — hot-path micro-benchmarks");
     println!("{}", "=".repeat(78));
@@ -187,4 +371,19 @@ fn main() {
 
     println!("\n{}", "=".repeat(78));
     println!("Phase 7 should reduce ns/op on every line above.");
+
+    println!("\n{}", "=".repeat(78));
+    println!(
+        "Backend-pool scaling characteristics (backlog item 4): pick(), apply_resolved(),\n\
+         memory, and pick()-under-concurrent-apply_resolved(), across 1/5/20/100/500/1000 backends."
+    );
+
+    bench_pick_at_scale("RoundRobin", &RoundRobin::new());
+    bench_pick_at_scale("LeastConnections", &LeastConnections::new());
+    bench_pick_at_scale("WeightedRoundRobin", &WeightedRoundRobin::new());
+    bench_pick_at_scale("ConsistentHash", &ConsistentHash::new());
+    bench_pick_at_scale("PeakEwmaP2c", &PeakEwmaP2c::new(SystemClock));
+    bench_apply_resolved_at_scale();
+    print_memory_estimate();
+    bench_pick_under_concurrent_apply_resolved();
 }
