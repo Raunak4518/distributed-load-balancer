@@ -963,6 +963,14 @@ mod tests {
         }
     }
 
+    struct CycleThroughAll(Vec<BackendId>, std::sync::atomic::AtomicUsize);
+    impl LoadBalancer for CycleThroughAll {
+        fn pick(&self, _pool: &BackendPool, _key: &str) -> Option<BackendId> {
+            let i = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst) % self.0.len();
+            Some(self.0[i].clone())
+        }
+    }
+
     /// Proves a cache hit skips picking a backend entirely: any call to
     /// `pick` at all is the test failing, not just picking wrong.
     struct PanicIfPicked;
@@ -1609,6 +1617,189 @@ mod tests {
         assert_eq!(metrics.retry_successes.get(), 1);
         assert_eq!(metrics.retry_failures.get(), 0);
         assert_eq!(metrics.retry_budget_denials.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_after_a_dead_pick_lands_on_the_remaining_live_backend() {
+        let dead_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (live_addr, live_hits) = spawn_counting_cacheable_backend("ok", &[]).await;
+
+        let dead = Backend::new("dead", dead_addr, 1, None);
+        let live = Backend::new("live", live_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![dead.clone(), live.clone()]));
+
+        let clock = FakeClock::new();
+        let mut breakers = HashMap::new();
+        breakers.insert(
+            dead.id.clone(),
+            CircuitBreaker::new(
+                1,
+                Duration::from_secs(60),
+                1,
+                1.0,
+                Duration::from_secs(1_000_000_000),
+                Duration::from_secs(60),
+                None,
+                None,
+                clock.clone(),
+            ),
+        );
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(PreferFirstEligible),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            retry_budget: None,
+            circuit_breakers: breakers,
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        let metrics = ctx.metrics.clone();
+
+        let resp = run_through_proxy(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(live_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_successes.get(), 1);
+        assert_eq!(metrics.retry_failures.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn only_backend_failing_retries_exactly_once_not_repeatedly() {
+        let (addr, hits) = spawn_counting_malformed_response_backend().await;
+        let backend = Backend::new("b1", addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            retry_budget: None,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        let metrics = ctx.metrics.clone();
+
+        let resp = run_through_proxy(ctx).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_failures.get(), 1);
+        assert_eq!(metrics.retry_successes.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn all_backends_failing_bounds_retries_and_the_budget_suppresses_excess() {
+        let (addr_a, hits_a) = spawn_counting_malformed_response_backend().await;
+        let (addr_b, hits_b) = spawn_counting_malformed_response_backend().await;
+        let backend_a = Backend::new("a", addr_a, 1, None);
+        let backend_b = Backend::new("b", addr_b, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend_a.clone(), backend_b.clone()]));
+        let clock = FakeClock::new();
+        let retry_budget = Gcra::new(
+            GcraConfig {
+                rate_per_sec: 1.0,
+                burst: 1,
+                max_tracked_keys: 1,
+            },
+            clock,
+        );
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(CycleThroughAll(
+                vec![backend_a.id.clone(), backend_b.id.clone()],
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            retry_budget: Some(retry_budget),
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        let metrics = ctx.metrics.clone();
+
+        let first = run_through_proxy(ctx.clone()).await;
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hits_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_budget_admits.get(), 1);
+        assert_eq!(metrics.retry_budget_denials.get(), 0);
+
+        let second = run_through_proxy(ctx).await;
+        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(hits_a.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(hits_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(metrics.retry_budget_denials.get(), 1);
+        assert_eq!(metrics.retry_attempts.get(), 1);
     }
 
     #[tokio::test]
