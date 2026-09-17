@@ -1283,3 +1283,271 @@ async fn max_concurrent_streams_is_enforced_on_the_wire() {
     let _ = release.send(true);
     driver.abort();
 }
+
+async fn try_tls_connect_h2(
+    addr: SocketAddr,
+) -> Option<tokio_rustls::client::TlsStream<TcpStream>> {
+    let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .ok()?
+    .dangerous()
+    .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyCert))
+    .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec()];
+
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+    let stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .ok()?
+        .ok()?;
+    let name = rustls::pki_types::ServerName::try_from("localhost").ok()?;
+    tokio::time::timeout(Duration::from_secs(2), connector.connect(name, stream))
+        .await
+        .ok()?
+        .ok()
+}
+
+#[tokio::test]
+async fn many_streams_opened_in_rapid_succession_all_succeed() {
+    const N: usize = 64;
+    let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let config =
+        Config::parse(&tls_http_config(listen, backend, &cert, &key, 5_000, 5_000)).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    let statuses = statuses_over_one_h2_connection(listen, N).await;
+
+    assert_eq!(statuses.len(), N);
+    assert!(
+        statuses.iter().all(|s| *s == 200),
+        "a burst of {N} legitimate streams on one connection did not all succeed: {statuses:?}"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), N);
+}
+
+#[tokio::test]
+async fn max_concurrent_streams_boundary_is_exact_at_the_limit() {
+    const LIMIT: u32 = 5;
+    const ATTEMPTED: usize = LIMIT as usize + 1;
+
+    let (backend, in_flight, peak, release) = spawn_blocking_backend().await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let mut toml = tls_http_config_with(
+        listen, backend, &cert, &key, 5_000, 5_000, 30_000, 10_000.0, 10_000,
+    );
+    toml.push_str(&format!(
+        "\n  [listeners.http2]\n  max_concurrent_streams = {LIMIT}\n"
+    ));
+    let config = Config::parse(&toml).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    let tls = tls_connect_h2(listen).await;
+    let (mut send, mut connection) = h2::client::handshake(tls).await.unwrap();
+    let url = format!("https://localhost:{}/", listen.port());
+
+    let mut streams = Vec::new();
+    for _ in 0..ATTEMPTED {
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri(&url)
+            .body(())
+            .unwrap();
+        let (response, _body) = send.send_request(req, true).unwrap();
+        streams.push(response);
+    }
+
+    let _ = tokio::time::timeout(Duration::from_millis(500), &mut connection).await;
+    let driver = tokio::spawn(connection);
+
+    wait_for_count(&in_flight, LIMIT as usize, Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        LIMIT as usize,
+        "the backend saw a different concurrency than the configured max_concurrent_streams = {LIMIT}"
+    );
+
+    let (mut refused, mut still_open) = (0usize, 0usize);
+    for response in streams {
+        match tokio::time::timeout(Duration::from_millis(500), response).await {
+            Err(_) => still_open += 1,
+            Ok(Ok(_)) => panic!(
+                "a stream was answered, but the backend was supposed to be holding every \
+                 admitted stream open"
+            ),
+            Ok(Err(err)) => {
+                assert_eq!(
+                    err.reason(),
+                    Some(h2::Reason::REFUSED_STREAM),
+                    "a stream failed for a reason other than the concurrency limit: {err}"
+                );
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(
+        still_open, LIMIT as usize,
+        "expected exactly {LIMIT} streams admitted onto the connection"
+    );
+    assert_eq!(
+        refused, 1,
+        "attempting exactly one stream past max_concurrent_streams = {LIMIT} should refuse \
+         exactly that one stream, not {refused}"
+    );
+
+    let _ = release.send(true);
+    driver.abort();
+}
+
+#[tokio::test]
+async fn oversized_headers_are_rejected_without_hanging() {
+    let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let mut toml = tls_http_config(listen, backend, &cert, &key, 5_000, 5_000);
+    toml.push_str("\n  [listeners.http2]\n  max_header_list_size = 200\n");
+    let config = Config::parse(&toml).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    let tls = tls_connect_h2(listen).await;
+    let (mut send, connection) = h2::client::handshake(tls).await.unwrap();
+    let driver = tokio::spawn(connection);
+
+    let url = format!("https://localhost:{}/", listen.port());
+    let oversized = "x".repeat(8192);
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri(&url)
+        .header("x-oversized", oversized)
+        .body(())
+        .unwrap();
+    let (response, _body) = send.send_request(req, true).unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .expect(
+            "the server never resolved an oversized-header request -- \
+             it hung instead of rejecting it",
+        );
+    let rejected = match outcome {
+        Err(_) => true,
+        Ok(resp) => resp.status() != StatusCode::OK,
+    };
+    assert!(
+        rejected,
+        "a header list past max_header_list_size was accepted rather than rejected"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        0,
+        "an oversized-header request reached the backend"
+    );
+
+    drop(send);
+    driver.abort();
+}
+
+#[tokio::test]
+async fn a_stalled_stream_on_a_silent_client_is_reclaimed_by_keep_alive() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let (_dir, cert, key) = cert_files(&["localhost"]);
+    let toml = format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+max_connections_per_ip = 1
+
+  [listeners.tls]
+  handshake_timeout_ms = 5000
+    [[listeners.tls.certificates]]
+    name = "primary"
+    cert_file = "{cert}"
+    key_file = "{key}"
+    hostnames = ["localhost"]
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000
+  burst = 10000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+
+  [listeners.http2]
+  keep_alive_interval_secs = 1
+  keep_alive_timeout_secs = 1
+"#,
+        cert = cert.display().to_string().replace('\\', "\\\\"),
+        key = key.display().to_string().replace('\\', "\\\\"),
+    );
+    let config = Config::parse(&toml).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut primary = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(tls) = try_tls_connect_h2(listen).await {
+            primary = Some(h2::client::handshake(tls).await.unwrap());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (mut send, mut connection) =
+        primary.expect("could not establish the primary h2 connection within the per-IP slot");
+    let url = format!("https://localhost:{}/", listen.port());
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri(&url)
+        .body(())
+        .unwrap();
+    let (_response, _body) = send.send_request(req, false).unwrap();
+    let _ = tokio::time::timeout(Duration::from_millis(300), &mut connection).await;
+
+    assert!(
+        try_tls_connect_h2(listen).await.is_none(),
+        "a second connection from the same IP was admitted while the first \
+         connection, still holding a stalled stream open, should have owned \
+         the only per-IP slot"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut admitted = false;
+    while std::time::Instant::now() < deadline {
+        if try_tls_connect_h2(listen).await.is_some() {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        admitted,
+        "the per-IP slot was never freed: a silent client holding a stalled \
+         stream open was not reclaimed by PING keep-alive"
+    );
+
+    drop(connection);
+    drop(send);
+}
