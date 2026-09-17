@@ -355,4 +355,138 @@ mod tests {
             Duration::from_millis(42).as_nanos() as u64
         );
     }
+
+    #[test]
+    fn nanosecond_scale_samples_decay_to_the_precisely_predicted_weighted_value() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::new(clock.clone());
+        let id = BackendId::new("b1");
+        lb.record_latency(&id, Duration::from_nanos(1));
+        assert_eq!(lb.estimate_nanos(&id), 1);
+
+        clock.advance(Duration::from_nanos(500));
+        lb.record_latency(&id, Duration::from_nanos(700));
+        assert_eq!(
+            lb.estimate_nanos(&id),
+            1,
+            "at a 10s decay constant a 500ns gap barely moves the weight off 1.0, \
+             so the estimate should still round down to the prior 1ns sample"
+        );
+    }
+
+    #[test]
+    fn multi_day_latencies_decay_to_the_precisely_predicted_weighted_value_without_overflow() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::new(clock.clone());
+        let id = BackendId::new("b1");
+        let slow = Duration::from_secs(3 * 24 * 3600);
+        lb.record_latency(&id, slow);
+        assert_eq!(lb.estimate_nanos(&id), slow.as_nanos() as u64);
+
+        clock.advance(Duration::from_secs(3600));
+        let fast = Duration::from_secs(24 * 3600);
+        lb.record_latency(&id, fast);
+        assert_eq!(
+            lb.estimate_nanos(&id),
+            fast.as_nanos() as u64,
+            "one hour at a 10s decay constant is ~360 time constants, so the weight on \
+             the stale 3-day estimate underflows to exactly 0.0 and the new sample wins outright"
+        );
+    }
+
+    #[test]
+    fn a_hundred_day_idle_gap_lets_the_new_sample_fully_dominate() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::with_decay(clock.clone(), Duration::from_secs(10));
+        let id = BackendId::new("b1");
+        lb.record_latency(&id, Duration::from_secs(1));
+
+        clock.advance(Duration::from_secs(3600 * 24 * 100));
+        lb.record_latency(&id, Duration::from_millis(1));
+        assert_eq!(
+            lb.estimate_nanos(&id),
+            Duration::from_millis(1).as_nanos() as u64,
+            "a 100-day idle gap must not produce a negative, zero, or nonsensical weight; \
+             the decay weight on the stale estimate underflows cleanly to 0.0"
+        );
+    }
+
+    #[test]
+    fn thousands_of_repeated_decays_stay_bounded_by_the_span_of_the_samples_fed_in() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::with_decay(clock.clone(), Duration::from_secs(10));
+        let id = BackendId::new("b1");
+        let low = Duration::from_millis(1).as_nanos() as u64;
+        let high = Duration::from_millis(100).as_nanos() as u64;
+
+        for i in 0..10_000u32 {
+            clock.advance(Duration::from_millis(50));
+            let sample = if i % 2 == 0 { low } else { high };
+            lb.record_latency(&id, Duration::from_nanos(sample));
+            let estimate = lb.estimate_nanos(&id);
+            assert!(
+                (low..=high).contains(&estimate),
+                "iteration {i}: estimate {estimate} left the [{low}, {high}] band \
+                 every sample was drawn from -- repeated decay must not drift or saturate"
+            );
+        }
+    }
+
+    #[test]
+    fn samples_near_u64_max_decay_to_the_precisely_predicted_weighted_value() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::with_decay(clock.clone(), Duration::from_secs(10));
+        let id = BackendId::new("b1");
+        let huge_a = u64::MAX - 2;
+        let huge_b = (u64::MAX / 2) - 1;
+        lb.record_latency(&id, Duration::from_nanos(huge_a));
+        clock.advance(Duration::from_secs(5));
+        lb.record_latency(&id, Duration::from_nanos(huge_b));
+
+        let estimate = lb.estimate_nanos(&id);
+        let expected: u64 = 14_817_629_963_143_358_464;
+        assert!(
+            estimate.abs_diff(expected) <= 4096,
+            "expected an f64-precision-bounded estimate near {expected}, got {estimate}"
+        );
+        assert!(
+            (huge_b..=huge_a).contains(&estimate),
+            "estimate {estimate} must stay within [{huge_b}, {huge_a}] despite f64 \
+             precision limits above 2^53, i.e. it must not overflow past huge_a or \
+             underflow past huge_b"
+        );
+    }
+
+    #[test]
+    fn a_zero_latency_sample_decays_the_estimate_to_the_precisely_predicted_weighted_value() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::with_decay(clock.clone(), Duration::from_secs(10));
+        let id = BackendId::new("b1");
+        lb.record_latency(&id, Duration::from_millis(100));
+        clock.advance(Duration::from_secs(5));
+        lb.record_latency(&id, Duration::ZERO);
+
+        let estimate = lb.estimate_nanos(&id);
+        assert!(
+            (60_000_000..=61_000_000).contains(&estimate),
+            "at a 10s decay constant a 5s gap gives weight=exp(-0.5)=~0.6065, so 100ms of \
+             prior estimate weighted against a 0ns sample should land around 60.65ms, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn a_same_instant_second_sample_does_not_corrupt_the_estimate_with_nan() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::new(clock.clone());
+        let id = BackendId::new("b1");
+        lb.record_latency(&id, Duration::from_millis(100));
+        lb.record_latency(&id, Duration::from_millis(50));
+        assert_eq!(
+            lb.estimate_nanos(&id),
+            Duration::from_millis(100).as_nanos() as u64,
+            "with zero elapsed time the decay weight on the prior estimate is exactly 1.0, \
+             so the second sample must be fully discarded rather than corrupting the \
+             estimate via a stray NaN"
+        );
+    }
 }
