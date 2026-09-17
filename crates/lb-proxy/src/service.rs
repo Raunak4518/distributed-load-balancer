@@ -763,6 +763,9 @@ where
         };
         match forward(&client, outbound, ctx.forward_timeout).await {
             Ok(resp) => {
+                if attempt == 1 {
+                    ctx.metrics.retry_successes.inc();
+                }
                 let elapsed = attempt_started.elapsed();
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     bm.requests_success.inc();
@@ -882,13 +885,19 @@ where
                 }
                 last_status = StatusCode::BAD_GATEWAY;
                 if attempt == 1 {
+                    ctx.metrics.retry_failures.inc();
                     break;
                 }
                 if let Some(budget) = &ctx.retry_budget {
-                    if matches!(budget.check(RETRY_BUDGET_KEY), Decision::Deny { .. }) {
-                        break;
+                    match budget.check(RETRY_BUDGET_KEY) {
+                        Decision::Deny { .. } => {
+                            ctx.metrics.retry_budget_denials.inc();
+                            break;
+                        }
+                        Decision::Allow => ctx.metrics.retry_budget_admits.inc(),
                     }
                 }
+                ctx.metrics.retry_attempts.inc();
             }
         }
     }
@@ -1004,6 +1013,36 @@ mod tests {
             }
         });
         (addr, count)
+    }
+
+    async fn spawn_flaky_then_ok_backend() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let count = std::sync::atomic::AtomicUsize::new(0);
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let _ = stream.write_all(b"not a valid http response\r\n\r\n").await;
+                    continue;
+                }
+                let io = TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| async move {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from_static(b"ok")))
+                                .unwrap(),
+                        )
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+        addr
     }
 
     /// Like `spawn_fixed_response_backend`, but counts requests and sends an
@@ -1469,6 +1508,7 @@ mod tests {
             clock,
         );
         let ctx = ctx_with_retry_budget(&backend, pool, Some(retry_budget));
+        let metrics = ctx.metrics.clone();
 
         let first = run_through_proxy(ctx.clone()).await;
         assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
@@ -1477,6 +1517,11 @@ mod tests {
             2,
             "the first failing request still gets its usual one retry, spending the budget's only burst token"
         );
+        assert_eq!(metrics.retry_budget_admits.get(), 1);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_failures.get(), 1);
+        assert_eq!(metrics.retry_successes.get(), 0);
+        assert_eq!(metrics.retry_budget_denials.get(), 0);
 
         let second = run_through_proxy(ctx).await;
         assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
@@ -1485,6 +1530,14 @@ mod tests {
             3,
             "the second failing request's retry must be suppressed once the budget is exhausted"
         );
+        assert_eq!(metrics.retry_budget_denials.get(), 1);
+        assert_eq!(
+            metrics.retry_attempts.get(),
+            1,
+            "the suppressed retry must not also count as an attempt"
+        );
+        assert_eq!(metrics.retry_failures.get(), 1);
+        assert_eq!(metrics.retry_budget_admits.get(), 1);
     }
 
     #[tokio::test]
@@ -1502,14 +1555,19 @@ mod tests {
             clock.clone(),
         );
         let ctx = ctx_with_retry_budget(&backend, pool, Some(retry_budget));
+        let metrics = ctx.metrics.clone();
 
         let first = run_through_proxy(ctx.clone()).await;
         assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_budget_admits.get(), 1);
 
         let second = run_through_proxy(ctx.clone()).await;
         assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(metrics.retry_budget_denials.get(), 1);
+        assert_eq!(metrics.retry_attempts.get(), 1);
 
         clock.advance(Duration::from_millis(100));
 
@@ -1520,6 +1578,37 @@ mod tests {
             5,
             "one period elapsed, so the budget should have refilled a token and allowed a retry again"
         );
+        assert_eq!(metrics.retry_attempts.get(), 2);
+        assert_eq!(metrics.retry_budget_admits.get(), 2);
+        assert_eq!(metrics.retry_failures.get(), 2);
+        assert_eq!(metrics.retry_budget_denials.get(), 1);
+        assert_eq!(metrics.retry_successes.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_retry_increments_attempt_and_success_counters() {
+        let addr = spawn_flaky_then_ok_backend().await;
+        let backend = Backend::new("b1", addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let clock = FakeClock::new();
+        let retry_budget = Gcra::new(
+            GcraConfig {
+                rate_per_sec: 10.0,
+                burst: 1,
+                max_tracked_keys: 1,
+            },
+            clock,
+        );
+        let ctx = ctx_with_retry_budget(&backend, pool, Some(retry_budget));
+        let metrics = ctx.metrics.clone();
+
+        let resp = run_through_proxy(ctx).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_budget_admits.get(), 1);
+        assert_eq!(metrics.retry_successes.get(), 1);
+        assert_eq!(metrics.retry_failures.get(), 0);
+        assert_eq!(metrics.retry_budget_denials.get(), 0);
     }
 
     #[tokio::test]
