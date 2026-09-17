@@ -33,6 +33,11 @@ impl Drop for AbortOnDrop {
     }
 }
 
+fn retain_live_checkers(checkers: &mut HashMap<BackendId, AbortOnDrop>, ids: &[BackendId]) {
+    let id_set: std::collections::HashSet<&BackendId> = ids.iter().collect();
+    checkers.retain(|id, _| id_set.contains(id));
+}
+
 fn spawn_checker_for(
     backend: &Backend,
     pool: &Arc<BackendPool>,
@@ -108,7 +113,7 @@ pub fn spawn_dns_poller<R: Resolve + 'static>(
                     if let Some(per_backend) = &per_backend_client {
                         per_backend.evict_missing(&ids);
                     }
-                    checkers.retain(|id, _| ids.contains(id));
+                    retain_live_checkers(&mut checkers, &ids);
                     for backend in &backends {
                         checkers.entry(backend.id.clone()).or_insert_with(|| {
                             spawn_checker_for(
@@ -329,5 +334,44 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn retain_live_checkers_cost_does_not_scale_quadratically() {
+        let small = fastest_retain_time(10).await;
+        let large = fastest_retain_time(1000).await;
+        assert!(
+            large < small.max(StdDuration::from_micros(1)) * 500,
+            "retain took {large:?} at 1000 tracked backends vs {small:?} at 10; \
+             expected roughly linear growth (O(N+M)), not an O(N*M) blowup"
+        );
+        assert!(
+            large < StdDuration::from_millis(50),
+            "retain at 1000 tracked backends took {large:?}, too slow for an \
+             O(N+M) HashSet-backed retain"
+        );
+    }
+
+    async fn fastest_retain_time(n: usize) -> StdDuration {
+        let mut fastest = StdDuration::MAX;
+        for _ in 0..5 {
+            let mut checkers: HashMap<BackendId, AbortOnDrop> = HashMap::new();
+            for i in 0..n {
+                let id = BackendId::new(format!("dns:127.0.0.1:{i}"));
+                checkers.insert(id, AbortOnDrop(tokio::spawn(async {})));
+            }
+            let ids: Vec<BackendId> = (0..n)
+                .filter(|i| i % 2 == 0)
+                .map(|i| BackendId::new(format!("dns:127.0.0.1:{i}")))
+                .collect();
+
+            let start = std::time::Instant::now();
+            retain_live_checkers(&mut checkers, &ids);
+            let elapsed = start.elapsed();
+
+            assert_eq!(checkers.len(), ids.len());
+            fastest = fastest.min(elapsed);
+        }
+        fastest
     }
 }
