@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time", "macros"] }
 [dev-dependencies]
 lb-core = { path = "../lb-core", features = ["test-util"] }
 rcgen = "0.13"
+proptest = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
