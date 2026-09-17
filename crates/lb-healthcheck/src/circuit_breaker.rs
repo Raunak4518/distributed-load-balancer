@@ -805,4 +805,335 @@ mod tests {
             "the third success should close it, since 2 were already carried over"
         );
     }
+
+    #[test]
+    fn every_reachable_state_transition_sequence_stays_within_the_legal_transition_graph() {
+        fn legal(prev: CircuitState, next: CircuitState) -> bool {
+            !matches!(
+                (prev, next),
+                (CircuitState::Closed, CircuitState::HalfOpen)
+                    | (CircuitState::Open, CircuitState::Closed)
+            )
+        }
+
+        #[derive(Clone, Copy)]
+        enum Op {
+            Fail,
+            Success,
+            AdvanceCooldown,
+        }
+        const ALPHABET: [Op; 3] = [Op::Fail, Op::Success, Op::AdvanceCooldown];
+
+        fn run(
+            threshold: u32,
+            half_open_successes_required: u32,
+            flap_backoff_multiplier: f64,
+            max_cooldown: Duration,
+            flap_streak_reset: Duration,
+            sequence_len: usize,
+        ) {
+            let total = ALPHABET.len().pow(sequence_len as u32);
+            for encoded in 0..total {
+                let mut idx = encoded;
+                let mut ops = Vec::with_capacity(sequence_len);
+                for _ in 0..sequence_len {
+                    ops.push(ALPHABET[idx % ALPHABET.len()]);
+                    idx /= ALPHABET.len();
+                }
+                let clock = FakeClock::new();
+                let cb = CircuitBreaker::new(
+                    threshold,
+                    Duration::from_secs(5),
+                    half_open_successes_required,
+                    flap_backoff_multiplier,
+                    max_cooldown,
+                    flap_streak_reset,
+                    None,
+                    None,
+                    clock.clone(),
+                );
+                let mut prev = cb.state();
+                assert_eq!(prev, CircuitState::Closed);
+                for op in ops {
+                    match op {
+                        Op::Fail => cb.record_failure(),
+                        Op::Success => cb.record_success(),
+                        Op::AdvanceCooldown => clock.advance(max_cooldown + Duration::from_secs(1)),
+                    }
+                    let next = cb.state();
+                    assert!(
+                        legal(prev, next),
+                        "illegal transition {prev:?} -> {next:?} after op sequence encoded {encoded}"
+                    );
+                    prev = next;
+                }
+            }
+        }
+
+        run(
+            2,
+            2,
+            1.0,
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+            7,
+        );
+        run(
+            1,
+            3,
+            2.0,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            7,
+        );
+    }
+
+    #[test]
+    fn rapid_failure_success_alternation_across_many_threads_never_trips_below_threshold() {
+        let cb = Arc::new(CircuitBreaker::new(
+            1_000_000,
+            Duration::from_secs(5),
+            1,
+            1.0,
+            Duration::from_secs(1_000_000_000),
+            Duration::from_secs(60),
+            None,
+            None,
+            FakeClock::new(),
+        ));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cb = Arc::clone(&cb);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        cb.record_failure();
+                        cb.record_success();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
+        let snap = cb.snapshot();
+        assert!(snap.consecutive_failures <= 8 * 200);
+    }
+
+    #[test]
+    fn concurrent_failures_trip_the_breaker_exactly_once_with_a_consistent_snapshot() {
+        let cb = Arc::new(CircuitBreaker::new(
+            20,
+            Duration::from_secs(5),
+            1,
+            1.0,
+            Duration::from_secs(1_000_000_000),
+            Duration::from_secs(60),
+            None,
+            None,
+            FakeClock::new(),
+        ));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cb = Arc::clone(&cb);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        cb.record_failure();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        let snap = cb.snapshot();
+        assert_eq!(snap.trip_streak, 1);
+        assert_ne!(snap.opened_at_nanos, NOT_OPENED);
+        assert_eq!(snap.consecutive_failures, 0);
+        assert_eq!(snap.consecutive_successes, 0);
+    }
+
+    #[test]
+    fn concurrent_successes_during_half_open_close_the_breaker_exactly_once() {
+        let (cb, clock) = breaker_with_recovery(1, Duration::from_secs(5), 5);
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        let cb = Arc::new(cb);
+        let handles: Vec<_> = (0..30)
+            .map(|_| {
+                let cb = Arc::clone(&cb);
+                std::thread::spawn(move || cb.record_success())
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
+        let snap = cb.snapshot();
+        assert_eq!(snap.consecutive_successes, 0);
+        assert_ne!(snap.closed_since_nanos, 0);
+    }
+
+    #[test]
+    fn concurrent_stale_successes_while_open_never_close_or_reopen_it() {
+        let (cb, _clock) = breaker(1, Duration::from_secs(5));
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        let cb = Arc::new(cb);
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let cb = Arc::clone(&cb);
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        cb.record_success();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn open_to_half_open_races_settle_into_a_single_consistent_half_open_state() {
+        let (cb, clock) = breaker(1, Duration::from_secs(5));
+        cb.record_failure();
+        assert_eq!(cb.state(), CircuitState::Open);
+        clock.advance(Duration::from_secs(5));
+
+        let cb = Arc::new(cb);
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let cb = Arc::clone(&cb);
+                std::thread::spawn(move || cb.state())
+            })
+            .collect();
+        let mut observed = Vec::with_capacity(handles.len());
+        for h in handles {
+            observed.push(h.join().unwrap());
+        }
+        assert!(observed
+            .iter()
+            .all(|s| matches!(s, CircuitState::Open | CircuitState::HalfOpen)));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn a_failure_among_many_concurrent_half_open_probes_always_wins_the_race_to_reopen() {
+        let (cb, clock) = breaker_with_recovery(1, Duration::from_secs(5), 1_000);
+        cb.record_failure();
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+        let cb = Arc::new(cb);
+        let mut handles = Vec::new();
+        for _ in 0..30 {
+            let cb = Arc::clone(&cb);
+            handles.push(std::thread::spawn(move || cb.record_success()));
+        }
+        {
+            let cb = Arc::clone(&cb);
+            handles.push(std::thread::spawn(move || cb.record_failure()));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+    }
+
+    #[test]
+    fn backend_recovery_under_heavy_concurrent_traffic_reaches_closed_across_repeated_cycles() {
+        let (cb, clock) = breaker_with_recovery(5, Duration::from_secs(5), 5);
+        let cb = Arc::new(cb);
+
+        for _round in 0..2 {
+            let handles: Vec<_> = (0..10)
+                .map(|_| {
+                    let cb = Arc::clone(&cb);
+                    std::thread::spawn(move || {
+                        for _ in 0..20 {
+                            cb.record_failure();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(cb.state(), CircuitState::Open);
+
+            clock.advance(Duration::from_secs(5));
+            assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+            let handles: Vec<_> = (0..10)
+                .map(|_| {
+                    let cb = Arc::clone(&cb);
+                    std::thread::spawn(move || {
+                        for _ in 0..20 {
+                            cb.record_success();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!(cb.state(), CircuitState::Closed);
+        }
+    }
+
+    #[test]
+    fn heavy_concurrent_traffic_never_panics_and_never_leaves_the_breaker_in_a_corrupt_state() {
+        let (cb, clock) = breaker_with_flap_backoff(
+            10,
+            Duration::from_secs(5),
+            2.0,
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+        );
+        let cb = Arc::new(cb);
+
+        for round in 0..4u32 {
+            let handles: Vec<_> = (0..12u32)
+                .map(|t| {
+                    let cb = Arc::clone(&cb);
+                    std::thread::spawn(move || {
+                        for i in 0..100u32 {
+                            cb.state();
+                            if (t + i + round) % 3 == 0 {
+                                cb.record_failure();
+                            } else {
+                                cb.record_success();
+                            }
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            clock.advance(Duration::from_secs(61));
+        }
+
+        let state = cb.state();
+        assert!(matches!(
+            state,
+            CircuitState::Closed | CircuitState::Open | CircuitState::HalfOpen
+        ));
+        let snap = cb.snapshot();
+        if snap.state == CircuitState::Open.as_u8() {
+            assert_ne!(snap.opened_at_nanos, NOT_OPENED);
+        }
+        if snap.opened_at_nanos != NOT_OPENED {
+            assert!(snap.trip_streak >= 1);
+        }
+        assert!(snap.consecutive_failures <= 12 * 100);
+        assert!(snap.consecutive_successes <= 12 * 100);
+    }
 }
