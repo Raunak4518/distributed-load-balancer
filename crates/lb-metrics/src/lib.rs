@@ -65,6 +65,12 @@ pub struct Metrics {
     /// silently.
     pub admin_auth_disabled: IntGauge,
     pub admin_auth_failures: IntCounter,
+
+    retry_attempts: IntCounterVec,
+    retry_successes: IntCounterVec,
+    retry_failures: IntCounterVec,
+    retry_budget_admits: IntCounterVec,
+    retry_budget_denials: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -263,6 +269,41 @@ impl Metrics {
             "lb_admin_auth_failures_total",
             "Admin API requests rejected for a missing or incorrect bearer token",
         )?;
+        let retry_attempts = IntCounterVec::new(
+            Opts::new(
+                "lb_retry_attempts_total",
+                "Retry attempts made, by listener",
+            ),
+            &["listener"],
+        )?;
+        let retry_successes = IntCounterVec::new(
+            Opts::new(
+                "lb_retry_successes_total",
+                "Retries that ultimately succeeded, by listener",
+            ),
+            &["listener"],
+        )?;
+        let retry_failures = IntCounterVec::new(
+            Opts::new(
+                "lb_retry_failures_total",
+                "Retries that ultimately failed, by listener",
+            ),
+            &["listener"],
+        )?;
+        let retry_budget_admits = IntCounterVec::new(
+            Opts::new(
+                "lb_retry_budget_admits_total",
+                "Retry-budget checks that admitted a retry, by listener",
+            ),
+            &["listener"],
+        )?;
+        let retry_budget_denials = IntCounterVec::new(
+            Opts::new(
+                "lb_retry_budget_denials_total",
+                "Retry-budget checks that denied a retry, by listener",
+            ),
+            &["listener"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -290,6 +331,11 @@ impl Metrics {
         registry.register(Box::new(websocket_upgrades.clone()))?;
         registry.register(Box::new(admin_auth_disabled.clone()))?;
         registry.register(Box::new(admin_auth_failures.clone()))?;
+        registry.register(Box::new(retry_attempts.clone()))?;
+        registry.register(Box::new(retry_successes.clone()))?;
+        registry.register(Box::new(retry_failures.clone()))?;
+        registry.register(Box::new(retry_budget_admits.clone()))?;
+        registry.register(Box::new(retry_budget_denials.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -319,6 +365,11 @@ impl Metrics {
             websocket_upgrades,
             admin_auth_disabled,
             admin_auth_failures,
+            retry_attempts,
+            retry_successes,
+            retry_failures,
+            retry_budget_admits,
+            retry_budget_denials,
         })
     }
 
@@ -414,6 +465,11 @@ impl Metrics {
             websocket_upgrade_backend_unreachable: self
                 .websocket_upgrades
                 .with_label_values(&[name, WebsocketUpgradeResult::BackendUnreachable.as_label()]),
+            retry_attempts: self.retry_attempts.with_label_values(&[name]),
+            retry_successes: self.retry_successes.with_label_values(&[name]),
+            retry_failures: self.retry_failures.with_label_values(&[name]),
+            retry_budget_admits: self.retry_budget_admits.with_label_values(&[name]),
+            retry_budget_denials: self.retry_budget_denials.with_label_values(&[name]),
         }
     }
 

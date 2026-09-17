@@ -131,6 +131,12 @@ pub struct ListenerMetrics {
     pub websocket_upgrade_success: IntCounter,
     pub websocket_upgrade_backend_declined: IntCounter,
     pub websocket_upgrade_backend_unreachable: IntCounter,
+
+    pub retry_attempts: IntCounter,
+    pub retry_successes: IntCounter,
+    pub retry_failures: IntCounter,
+    pub retry_budget_admits: IntCounter,
+    pub retry_budget_denials: IntCounter,
 }
 
 /// The built-in WAF rule that matched a request -- see `lb_proxy::waf`.
