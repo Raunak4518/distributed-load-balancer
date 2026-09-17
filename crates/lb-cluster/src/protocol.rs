@@ -207,4 +207,148 @@ mod tests {
         assert_eq!(read_message(&mut cursor, SECRET).await.unwrap(), sample());
         assert_eq!(read_message(&mut cursor, SECRET).await.unwrap(), sample());
     }
+
+    #[tokio::test]
+    async fn replayed_message_accepted_on_independent_readers() {
+        let encoded = encode(&sample(), SECRET).unwrap();
+        let mut cursor1 = std::io::Cursor::new(encoded.clone());
+        let mut cursor2 = std::io::Cursor::new(encoded.clone());
+
+        let first = read_message(&mut cursor1, SECRET).await.unwrap();
+        let second = read_message(&mut cursor2, SECRET).await.unwrap();
+
+        assert_eq!(first, sample());
+        assert_eq!(second, sample());
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn valid_hmac_with_mismatched_payload_rejected() {
+        let payload_a = b"{\"node_id\":\"a\",\"entries\":[]}";
+        let payload_b = b"{\"node_id\":\"b\",\"entries\":[]}";
+        let tag = tag_for(SECRET, payload_a);
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&((HMAC_TAG_LEN + payload_b.len()) as u32).to_be_bytes());
+        framed.extend_from_slice(&tag);
+        framed.extend_from_slice(payload_b);
+        let mut cursor = std::io::Cursor::new(framed);
+
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn large_payload_under_limit_accepted() {
+        let mut entries = Vec::new();
+        for i in 0..1000 {
+            entries.push(KeyEntry {
+                key: format!("key-{}", i),
+                buckets: vec![(1_700_000_000 + i as u64, 5)],
+            });
+        }
+        let msg = SyncMessage {
+            node_id: "lb-1".into(),
+            entries,
+        };
+
+        let encoded = encode(&msg, SECRET).unwrap();
+        assert!(encoded.len() < MAX_MESSAGE_BYTES);
+
+        let mut cursor = std::io::Cursor::new(encoded);
+        let decoded = read_message(&mut cursor, SECRET).await.unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[tokio::test]
+    async fn zero_length_frame_rejected() {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&0u32.to_be_bytes());
+        let mut cursor = std::io::Cursor::new(framed);
+
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn maximum_frame_size_accepted() {
+        let payload_size = MAX_MESSAGE_BYTES - HMAC_TAG_LEN;
+        let payload = vec![b'A'; payload_size];
+        let tag = tag_for(SECRET, &payload);
+
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(MAX_MESSAGE_BYTES as u32).to_be_bytes());
+        framed.extend_from_slice(&tag);
+        framed.extend_from_slice(&payload);
+        let mut cursor = std::io::Cursor::new(framed);
+
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(!format!("{err}").contains("over the"));
+    }
+
+    #[tokio::test]
+    async fn one_byte_over_maximum_rejected() {
+        let oversize_len = (MAX_MESSAGE_BYTES + 1) as u32;
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&oversize_len.to_be_bytes());
+        let mut cursor = std::io::Cursor::new(framed);
+
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(format!("{err}").contains("over the"));
+    }
+
+    #[tokio::test]
+    async fn incomplete_frame_mid_payload_rejected() {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&100u32.to_be_bytes());
+        framed.extend_from_slice(b"incomplete");
+        let mut cursor = std::io::Cursor::new(framed);
+
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert!(
+            err.kind() == io::ErrorKind::UnexpectedEof || err.kind() == io::ErrorKind::InvalidData
+        );
+    }
+
+    #[tokio::test]
+    async fn malicious_length_at_u32_max_rejected() {
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut cursor = std::io::Cursor::new(framed);
+
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn corrupted_middle_frame_in_sequence_rejected() {
+        let valid1 = encode(&sample(), SECRET).unwrap();
+        let mut corrupted = Vec::new();
+        corrupted.extend_from_slice(&50u32.to_be_bytes());
+        corrupted.extend_from_slice(b"corrupt data");
+
+        let mut sequence = valid1.clone();
+        sequence.extend_from_slice(&corrupted);
+        let mut cursor = std::io::Cursor::new(sequence);
+
+        assert_eq!(read_message(&mut cursor, SECRET).await.unwrap(), sample());
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert!(
+            err.kind() == io::ErrorKind::InvalidData
+                || err.kind() == io::ErrorKind::UnexpectedEof
+                || err.kind() == io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_close_at_frame_boundary_clean() {
+        let encoded = encode(&sample(), SECRET).unwrap();
+        let mut cursor = std::io::Cursor::new(encoded);
+
+        assert_eq!(read_message(&mut cursor, SECRET).await.unwrap(), sample());
+        let err = read_message(&mut cursor, SECRET).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }
