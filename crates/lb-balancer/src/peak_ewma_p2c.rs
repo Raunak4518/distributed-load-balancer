@@ -139,7 +139,7 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
             .now()
             .saturating_duration_since(self.creation)
             .as_nanos() as u64;
-        let sample_nanos = latency.as_nanos() as u64;
+        let sample_nanos = latency.as_nanos().min((NO_SAMPLE - 1) as u128) as u64;
 
         if let Some(entry) = self.entries.read().unwrap().get(id) {
             store_sample(entry, sample_nanos, now_nanos, self.decay);
@@ -161,7 +161,12 @@ fn store_sample(entry: &EwmaEntry, sample_nanos: u64, now_nanos: u64, decay: Dur
     } else {
         let last = entry.last_update_nanos.load(Ordering::Relaxed);
         let dt_nanos = now_nanos.saturating_sub(last) as f64;
-        let weight = (-dt_nanos / decay.as_nanos() as f64).exp();
+        let decay_nanos = decay.as_nanos() as f64;
+        let weight = if decay_nanos > 0.0 {
+            (-dt_nanos / decay_nanos).exp()
+        } else {
+            0.0
+        };
         (prev as f64 * weight + sample_nanos as f64 * (1.0 - weight)) as u64
     };
     entry.estimate_nanos.store(new_estimate, Ordering::Relaxed);
@@ -304,6 +309,36 @@ mod tests {
         assert!(
             decayed < spiked,
             "estimate should have decayed back down after 60s at the 10s time constant: spiked={spiked} decayed={decayed}"
+        );
+    }
+
+    #[test]
+    fn a_duration_max_latency_saturates_instead_of_wrapping_into_the_no_sample_sentinel() {
+        let lb = PeakEwmaP2c::new(FakeClock::new());
+        let id = BackendId::new("b1");
+        lb.record_latency(&id, Duration::MAX);
+        assert!(
+            lb.has_sample(&id),
+            "a recorded latency must never be mistaken for no sample at all"
+        );
+        assert_eq!(
+            lb.estimate_nanos(&id),
+            NO_SAMPLE - 1,
+            "an as-u64 latency at or beyond u64::MAX must saturate to NO_SAMPLE - 1, not wrap"
+        );
+    }
+
+    #[test]
+    fn zero_decay_with_zero_elapsed_time_does_not_produce_a_nan_estimate() {
+        let lb = PeakEwmaP2c::with_decay(FakeClock::new(), Duration::ZERO);
+        let id = BackendId::new("b1");
+        lb.record_latency(&id, Duration::from_millis(100));
+        lb.record_latency(&id, Duration::from_millis(50));
+        assert_eq!(
+            lb.estimate_nanos(&id),
+            Duration::from_millis(50).as_nanos() as u64,
+            "zero decay must fully trust the newest sample, not divide 0.0/0.0 into NaN \
+             (which an `as u64` cast would silently turn into 0)"
         );
     }
 
