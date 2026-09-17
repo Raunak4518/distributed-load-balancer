@@ -21,7 +21,7 @@
 
 mod tls;
 
-use lb_balancer::RoundRobin;
+use lb_balancer::{ConsistentHash, RoundRobin};
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::{Backend, BackendPool, ClusterCoordinator, LoadBalancer, RateLimiter, SystemClock};
 use lb_healthcheck::{CircuitBreaker, CircuitState};
@@ -108,6 +108,17 @@ fn bench_round_robin_pick() {
     }
 }
 
+fn bench_consistent_hash_pick() {
+    println!("\nConsistentHash::pick()  [cached ring: no hash/sort/rebuild once warm]");
+    for n in [10usize, 100, 1000] {
+        let pool = pool_of(n);
+        let ch = ConsistentHash::new();
+        bench(&format!("{n} backend(s)"), ITERATIONS, || {
+            black_box(ch.pick(&pool, "client-key"));
+        });
+    }
+}
+
 fn bench_gcra_check() {
     println!("\nGcra::check()  [key.to_string() allocation per call]");
     // A high rate so the limiter admits throughout and we measure the
@@ -168,6 +179,7 @@ fn main() {
 
     bench_eligible_backends();
     bench_round_robin_pick();
+    bench_consistent_hash_pick();
     bench_gcra_check();
     bench_cluster_try_admit();
     bench_circuit_refresh();
