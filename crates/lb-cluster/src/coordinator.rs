@@ -254,4 +254,184 @@ mod tests {
         // one peer.
         assert_eq!(convergence_over_admission_bound(1.0, 1_500, 1), 2);
     }
+
+    #[test]
+    fn delayed_delivery_of_successive_snapshots_converges_to_in_order_result() {
+        let sender_clock = FakeClock::new();
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            sender_clock,
+            b"secret".to_vec(),
+        ));
+        let coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 100);
+
+        assert!(coord.try_admit("k"));
+        let snap1 = sender.snapshot_message();
+
+        assert!(coord.try_admit("k"));
+        assert!(coord.try_admit("k"));
+        let snap2 = sender.snapshot_message();
+
+        assert!(coord.try_admit("k"));
+        let snap3 = sender.snapshot_message();
+
+        let in_order = ClusterNode::new("receiver", 10, FakeClock::new(), b"secret".to_vec());
+        in_order.merge_message(&snap1);
+        in_order.merge_message(&snap2);
+        in_order.merge_message(&snap3);
+
+        let delayed = ClusterNode::new("receiver", 10, FakeClock::new(), b"secret".to_vec());
+        delayed.merge_message(&snap3);
+        delayed.merge_message(&snap1);
+        delayed.merge_message(&snap2);
+
+        assert_eq!(in_order.store().raw_state(), delayed.store().raw_state());
+    }
+
+    #[test]
+    fn partial_delivery_from_some_peers_reflects_only_those_peers() {
+        let clock = FakeClock::new();
+        let peer_a = Arc::new(ClusterNode::new("a", 10, clock.clone(), b"secret".to_vec()));
+        let peer_b = Arc::new(ClusterNode::new("b", 10, clock.clone(), b"secret".to_vec()));
+        let peer_c = Arc::new(ClusterNode::new("c", 10, clock.clone(), b"secret".to_vec()));
+
+        for peer in [&peer_a, &peer_b, &peer_c] {
+            let coord = ListenerCoordinator::new(Arc::clone(peer), "web", 10);
+            assert!(coord.try_admit("k"));
+        }
+
+        let receiver = ClusterNode::new("receiver", 10, clock.clone(), b"secret".to_vec());
+        receiver.merge_message(&peer_a.snapshot_message());
+        receiver.merge_message(&peer_c.snapshot_message());
+
+        let state = receiver.store().raw_state();
+        let nodes = state.get("web\u{1}k").expect("key present after merge");
+        assert!(nodes.contains_key("a"));
+        assert!(nodes.contains_key("c"));
+        assert!(!nodes.contains_key("b"));
+        assert_eq!(
+            receiver
+                .store()
+                .total_in_window("web\u{1}k", clock.unix_secs()),
+            2
+        );
+    }
+
+    use proptest::prelude::*;
+
+    fn key_entry_strategy(now: u64) -> impl Strategy<Value = KeyEntry> {
+        (0u8..3, prop::collection::vec((0u8..11, 0u64..50), 1..4)).prop_map(move |(k, buckets)| {
+            KeyEntry {
+                key: format!("k{k}"),
+                buckets: buckets
+                    .into_iter()
+                    .map(|(e, c)| (now - 3 + e as u64, c))
+                    .collect(),
+            }
+        })
+    }
+
+    fn sync_message_strategy(now: u64) -> impl Strategy<Value = SyncMessage> {
+        prop::collection::vec(key_entry_strategy(now), 0..5).prop_map(|entries| SyncMessage {
+            node_id: "peer".to_string(),
+            entries,
+        })
+    }
+
+    fn xorshift_shuffled<T: Clone>(items: &[T], seed: u64) -> Vec<T> {
+        let mut out = items.to_vec();
+        let mut state = seed | 1;
+        for i in (1..out.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state as usize) % (i + 1);
+            out.swap(i, j);
+        }
+        out
+    }
+
+    fn tagged_message_strategy(now: u64) -> impl Strategy<Value = (u8, SyncMessage)> {
+        (0u8..4, key_entry_strategy(now)).prop_map(|(sender, entry)| {
+            (
+                sender,
+                SyncMessage {
+                    node_id: format!("peer{sender}"),
+                    entries: vec![entry],
+                },
+            )
+        })
+    }
+
+    fn multi_sender_message_stream(now: u64) -> impl Strategy<Value = Vec<(u8, SyncMessage)>> {
+        prop::collection::vec(tagged_message_strategy(now), 1..10)
+    }
+
+    proptest! {
+        #[test]
+        fn prop_duplicate_gossip_message_delivery_is_idempotent(msg in sync_message_strategy(1_700_000_000)) {
+            let receiver = ClusterNode::new("receiver", 1_000_000, FakeClock::new(), b"secret".to_vec());
+            receiver.merge_message(&msg);
+            let once = receiver.store().raw_state();
+            receiver.merge_message(&msg);
+            let twice = receiver.store().raw_state();
+            prop_assert_eq!(once, twice);
+        }
+
+        #[test]
+        fn prop_delayed_gossip_delivery_converges_like_in_order_delivery(
+            msgs in prop::collection::vec(sync_message_strategy(1_700_000_000), 1..5),
+            seed in any::<u64>(),
+        ) {
+            let receiver_in_order = ClusterNode::new("receiver", 1_000_000, FakeClock::new(), b"secret".to_vec());
+            for msg in &msgs {
+                receiver_in_order.merge_message(msg);
+            }
+
+            let receiver_delayed = ClusterNode::new("receiver", 1_000_000, FakeClock::new(), b"secret".to_vec());
+            for msg in xorshift_shuffled(&msgs, seed) {
+                receiver_delayed.merge_message(&msg);
+            }
+
+            prop_assert_eq!(
+                receiver_in_order.store().raw_state(),
+                receiver_delayed.store().raw_state()
+            );
+        }
+
+        #[test]
+        fn prop_partial_delivery_reflects_exactly_the_delivered_senders(
+            msgs in multi_sender_message_stream(1_700_000_000),
+            delivered_mask in 0u8..16,
+        ) {
+            let is_delivered = |sender: u8| (delivered_mask >> sender) & 1 == 1;
+
+            let receiver = ClusterNode::new("receiver", 1_000_000, FakeClock::new(), b"secret".to_vec());
+            let mut expected_msgs = Vec::new();
+            for (sender, msg) in &msgs {
+                if is_delivered(*sender) {
+                    receiver.merge_message(msg);
+                    expected_msgs.push(msg.clone());
+                }
+            }
+
+            let state = receiver.store().raw_state();
+            let delivered_ids: std::collections::HashSet<String> = (0u8..4)
+                .filter(|sender| is_delivered(*sender))
+                .map(|sender| format!("peer{sender}"))
+                .collect();
+            for nodes in state.values() {
+                for sender_id in nodes.keys() {
+                    prop_assert!(delivered_ids.contains(sender_id));
+                }
+            }
+
+            let expected = ClusterNode::new("receiver", 1_000_000, FakeClock::new(), b"secret".to_vec());
+            for msg in &expected_msgs {
+                expected.merge_message(msg);
+            }
+            prop_assert_eq!(state, expected.store().raw_state());
+        }
+    }
 }
