@@ -138,6 +138,51 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_and_ipv6_addresses_do_not_share_a_budget() {
+        let limiter = Arc::new(PerIpLimiter::new(1));
+        let v4 = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let v6 = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let _a = limiter.try_acquire(v4).expect("v4 first");
+        let _b = limiter.try_acquire(v6).expect("v6 first");
+        assert!(limiter.try_acquire(v4).is_none());
+        assert!(limiter.try_acquire(v6).is_none());
+        assert_eq!(limiter.tracked_ips(), 2);
+    }
+
+    #[test]
+    fn high_churn_across_thousands_of_distinct_addresses_leaves_no_residue() {
+        let limiter = Arc::new(PerIpLimiter::new(4));
+        for n in 0..20_000u32 {
+            let addr: IpAddr = if n % 2 == 0 {
+                std::net::Ipv4Addr::from(n).into()
+            } else {
+                std::net::Ipv6Addr::from(u128::from(n)).into()
+            };
+            let guard = limiter.try_acquire(addr).expect("acquire");
+            drop(guard);
+            assert_eq!(limiter.tracked_ips(), 0);
+        }
+    }
+
+    #[test]
+    fn concurrent_churn_across_many_distinct_addresses_leaves_no_residue() {
+        let limiter = Arc::new(PerIpLimiter::new(4));
+        std::thread::scope(|scope| {
+            for base in 0..8u32 {
+                let limiter = Arc::clone(&limiter);
+                scope.spawn(move || {
+                    for n in 0..2_000u32 {
+                        let addr: IpAddr = std::net::Ipv4Addr::from(base * 100_000 + n).into();
+                        let guard = limiter.try_acquire(addr).expect("acquire");
+                        drop(guard);
+                    }
+                });
+            }
+        });
+        assert_eq!(limiter.tracked_ips(), 0);
+    }
+
+    #[test]
     fn concurrent_acquire_and_release_reclaims_correctly() {
         // Interleaves so the entry is repeatedly driven to zero and back,
         // exercising the remove_if race guard.
