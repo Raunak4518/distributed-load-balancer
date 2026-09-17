@@ -28,21 +28,38 @@ async fn free_addr() -> SocketAddr {
         .unwrap()
 }
 
-async fn spawn_killable_backend(
-    status: StatusCode,
-) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+struct KillableBackend {
+    addr: SocketAddr,
+    count: Arc<AtomicUsize>,
+    accept_handle: tokio::task::JoinHandle<()>,
+    conn_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl KillableBackend {
+    fn kill(&self) {
+        self.accept_handle.abort();
+        for h in self.conn_handles.lock().unwrap().drain(..) {
+            h.abort();
+        }
+    }
+}
+
+async fn spawn_killable_backend(status: StatusCode) -> KillableBackend {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let count = Arc::new(AtomicUsize::new(0));
     let count_clone = count.clone();
-    let handle = tokio::spawn(async move {
+    let conn_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let conn_handles_for_accept = Arc::clone(&conn_handles);
+    let accept_handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
             let io = TokioIo::new(stream);
             let count = count_clone.clone();
-            tokio::spawn(async move {
+            let conn_handle = tokio::spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
                     let count = count.clone();
                     async move {
@@ -65,9 +82,15 @@ async fn spawn_killable_backend(
                 });
                 let _ = http1::Builder::new().serve_connection(io, svc).await;
             });
+            conn_handles_for_accept.lock().unwrap().push(conn_handle);
         }
     });
-    (addr, count, handle)
+    KillableBackend {
+        addr,
+        count,
+        accept_handle,
+        conn_handles,
+    }
 }
 
 fn matrix_config_toml(
@@ -183,28 +206,93 @@ async fn run_sequential_burst(client: &reqwest::Client, url: &str, n: usize) -> 
     out
 }
 
-async fn wait_for_dead_circuits_open(
+async fn drive_until_dead_circuits_open(
+    client: &reqwest::Client,
+    url: &str,
     admin_client: &reqwest::Client,
     admin_listen: SocketAddr,
     dead_ids: &[String],
     deadline: Instant,
-) -> Value {
+) -> (Value, Vec<Attempt>) {
+    let mut attempts = Vec::new();
     loop {
+        let started = Instant::now();
+        let result = client.get(url).send().await;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let status = result
+            .unwrap_or_else(|e| panic!("request errored instead of returning a response: {e}"))
+            .status()
+            .as_u16();
+        attempts.push(Attempt { status, elapsed_ms });
         let body = admin_backends(admin_client, admin_listen).await;
         let all_open = dead_ids
             .iter()
             .all(|id| backend_entry(&body, LISTENER, id)["circuit_open"] == Value::Bool(true));
         if all_open {
-            return body;
+            return (body, attempts);
         }
         assert!(
             Instant::now() < deadline,
             "not every dead backend's circuit opened before the deadline: {body}"
         );
+    }
+}
+
+async fn drive_until_backends_ineligible(
+    client: &reqwest::Client,
+    url: &str,
+    admin_client: &reqwest::Client,
+    admin_listen: SocketAddr,
+    ids: &[String],
+    deadline: Instant,
+) -> (Value, Vec<Attempt>) {
+    let mut attempts = Vec::new();
+    loop {
+        let started = Instant::now();
+        let result = client.get(url).send().await;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let status = result
+            .unwrap_or_else(|e| panic!("request errored instead of returning a response: {e}"))
+            .status()
+            .as_u16();
+        attempts.push(Attempt { status, elapsed_ms });
+        let body = admin_backends(admin_client, admin_listen).await;
+        let all_ineligible = ids
+            .iter()
+            .all(|id| backend_entry(&body, LISTENER, id)["eligible"] == Value::Bool(false));
+        if all_ineligible {
+            return (body, attempts);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not every backend became ineligible before the deadline: {body}"
+        );
+    }
+}
+
+async fn wait_for_backends_ineligible(
+    admin_client: &reqwest::Client,
+    admin_listen: SocketAddr,
+    ids: &[String],
+    deadline: Instant,
+) -> Value {
+    loop {
+        let body = admin_backends(admin_client, admin_listen).await;
+        let all_ineligible = ids
+            .iter()
+            .all(|id| backend_entry(&body, LISTENER, id)["eligible"] == Value::Bool(false));
+        if all_ineligible {
+            return body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not every backend became ineligible before the deadline: {body}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
+#[derive(Debug)]
 struct TimedAttempt {
     at_ms: f64,
     elapsed_ms: f64,
@@ -263,25 +351,20 @@ fn max_latency(attempts: &[Attempt]) -> f64 {
 struct Setup {
     traffic: SocketAddr,
     admin: SocketAddr,
-    backends: Vec<(
-        String,
-        SocketAddr,
-        Arc<AtomicUsize>,
-        tokio::task::JoinHandle<()>,
-    )>,
+    backends: Vec<(String, KillableBackend)>,
 }
 
 async fn start_matrix_server() -> Setup {
     let mut backends = Vec::with_capacity(NUM_BACKENDS);
     for i in 0..NUM_BACKENDS {
-        let (addr, count, handle) = spawn_killable_backend(StatusCode::OK).await;
-        backends.push((format!("b{i}"), addr, count, handle));
+        let backend = spawn_killable_backend(StatusCode::OK).await;
+        backends.push((format!("b{i}"), backend));
     }
     let traffic = free_addr().await;
     let admin = free_addr().await;
     let backend_list: Vec<(String, SocketAddr)> = backends
         .iter()
-        .map(|(id, addr, _, _)| (id.clone(), *addr))
+        .map(|(id, backend)| (id.clone(), backend.addr))
         .collect();
     let config = Config::parse(&matrix_config_toml(admin, traffic, &backend_list)).unwrap();
     tokio::spawn(lb_server::run(config, None));
@@ -305,9 +388,9 @@ async fn failure_fraction_case(dead_count: usize, check_active_health_probe: boo
         warm_up.iter().all(|a| a.status == 200),
         "every backend must be healthy and answering before any are killed"
     );
-    for (id, _, count, _) in &setup.backends {
+    for (id, backend) in &setup.backends {
         assert!(
-            count.load(Ordering::SeqCst) > 0,
+            backend.count.load(Ordering::SeqCst) > 0,
             "backend {id} never received warm-up traffic"
         );
     }
@@ -316,40 +399,45 @@ async fn failure_fraction_case(dead_count: usize, check_active_health_probe: boo
     let survivor_ids: Vec<String> = (dead_count..NUM_BACKENDS)
         .map(|i| format!("b{i}"))
         .collect();
-    for (id, _, _, handle) in &setup.backends {
+    for (id, backend) in &setup.backends {
         if dead_ids.contains(id) {
-            handle.abort();
+            backend.kill();
         }
     }
     let dead_baseline: Vec<usize> = setup
         .backends
         .iter()
         .filter(|(id, ..)| dead_ids.contains(id))
-        .map(|(_, _, count, _)| count.load(Ordering::SeqCst))
+        .map(|(_, backend)| backend.count.load(Ordering::SeqCst))
         .collect();
 
-    let burst = run_sequential_burst(&client, &url, NUM_BACKENDS * 4).await;
+    let settle_deadline = Instant::now() + Duration::from_secs(8);
+    let (settled, detection) = drive_until_dead_circuits_open(
+        &client,
+        &url,
+        &admin_client,
+        setup.admin,
+        &dead_ids,
+        settle_deadline,
+    )
+    .await;
     assert!(
-        max_latency(&burst) < 1500.0,
+        max_latency(&detection) < 1500.0,
         "a request during the failure took {:.1}ms, far more than the ~{}ms two-attempt bound",
-        max_latency(&burst),
+        max_latency(&detection),
         200 * 2
     );
     assert!(
-        burst
+        detection
             .iter()
             .all(|a| a.status == 200 || a.status == 502 || a.status == 503),
         "every request during the failure must be a real response, not a hang or a protocol error"
     );
 
-    let settle_deadline = Instant::now() + Duration::from_secs(8);
-    let settled =
-        wait_for_dead_circuits_open(&admin_client, setup.admin, &dead_ids, settle_deadline).await;
-
     for (id, before) in dead_ids.iter().zip(dead_baseline.iter()) {
-        let (_, _, count, _) = setup.backends.iter().find(|(bid, ..)| bid == id).unwrap();
+        let (_, backend) = setup.backends.iter().find(|(bid, ..)| bid == id).unwrap();
         assert_eq!(
-            count.load(Ordering::SeqCst),
+            backend.count.load(Ordering::SeqCst),
             *before,
             "dead backend {id} received traffic after it was killed"
         );
@@ -379,7 +467,7 @@ async fn failure_fraction_case(dead_count: usize, check_active_health_probe: boo
         .backends
         .iter()
         .filter(|(id, ..)| survivor_ids.contains(id))
-        .map(|(_, _, count, _)| count.load(Ordering::SeqCst))
+        .map(|(_, backend)| backend.count.load(Ordering::SeqCst))
         .sum();
 
     let clean_load =
@@ -403,10 +491,10 @@ async fn failure_fraction_case(dead_count: usize, check_active_health_probe: boo
         "steady-state requests should be fast, got a max of {clean_max:.1}ms"
     );
 
-    for (id, _, count, _) in &setup.backends {
+    for (id, backend) in &setup.backends {
         if dead_ids.contains(id) {
             assert_eq!(
-                count.load(Ordering::SeqCst),
+                backend.count.load(Ordering::SeqCst),
                 *dead_baseline
                     .get(dead_ids.iter().position(|d| d == id).unwrap())
                     .unwrap(),
@@ -418,7 +506,7 @@ async fn failure_fraction_case(dead_count: usize, check_active_health_probe: boo
         .backends
         .iter()
         .filter(|(id, ..)| survivor_ids.contains(id))
-        .map(|(_, _, count, _)| count.load(Ordering::SeqCst))
+        .map(|(_, backend)| backend.count.load(Ordering::SeqCst))
         .sum();
     assert_eq!(
         survivor_hits_after_clean - survivor_hits_before_clean,
@@ -470,13 +558,13 @@ async fn ready_flips_to_unavailable_exactly_when_the_last_backend_dies() {
     let warm_up = run_sequential_burst(&client, &url, NUM_BACKENDS * 2).await;
     assert!(warm_up.iter().all(|a| a.status == 200));
 
-    for (id, _, _, handle) in &setup.backends {
+    for (id, backend) in &setup.backends {
         if id != "b9" {
-            handle.abort();
+            backend.kill();
         }
     }
     let settle_deadline = Instant::now() + Duration::from_secs(8);
-    wait_for_dead_circuits_open(
+    wait_for_backends_ineligible(
         &admin_client,
         setup.admin,
         &(0..9).map(|i| format!("b{i}")).collect::<Vec<_>>(),
@@ -489,8 +577,8 @@ async fn ready_flips_to_unavailable_exactly_when_the_last_backend_dies() {
         "/ready must still be 200 with one survivor left"
     );
 
-    let (_, _, _, last_handle) = setup.backends.iter().find(|(id, ..)| id == "b9").unwrap();
-    last_handle.abort();
+    let (_, last_backend) = setup.backends.iter().find(|(id, ..)| id == "b9").unwrap();
+    last_backend.kill();
 
     let flip_started = Instant::now();
     let flip_deadline = flip_started + Duration::from_secs(3);
@@ -528,7 +616,7 @@ async fn all_backends_down_fails_fast_without_amplification_or_resource_leaks() 
     assert!(warm_up.iter().all(|a| a.status == 200));
 
     let before_baseline = admin_backends(&admin_client, setup.admin).await;
-    for (id, _, _, _) in &setup.backends {
+    for (id, _) in &setup.backends {
         assert_eq!(
             backend_entry(&before_baseline, LISTENER, id)["active_conns"],
             Value::from(0),
@@ -536,14 +624,23 @@ async fn all_backends_down_fails_fast_without_amplification_or_resource_leaks() 
         );
     }
 
-    for (_, _, _, handle) in &setup.backends {
-        handle.abort();
+    for (_, backend) in &setup.backends {
+        backend.kill();
     }
     let all_ids: Vec<String> = (0..NUM_BACKENDS).map(|i| format!("b{i}")).collect();
 
     let attempts_before =
         sum_backend_attempts(&scrape_metrics(&admin_client, setup.admin).await, LISTENER);
-    let detection = run_sequential_burst(&client, &url, NUM_BACKENDS * 4).await;
+    let settle_deadline = Instant::now() + Duration::from_secs(8);
+    let (settled, detection) = drive_until_backends_ineligible(
+        &client,
+        &url,
+        &admin_client,
+        setup.admin,
+        &all_ids,
+        settle_deadline,
+    )
+    .await;
     assert!(
         detection.iter().all(|a| a.status == 502 || a.status == 503),
         "every request while all backends are down must be a real 502/503, never 200"
@@ -562,9 +659,18 @@ async fn all_backends_down_fails_fast_without_amplification_or_resource_leaks() 
          one-retry bound of 2 attempts per request over {} requests",
         detection.len()
     );
+    let real_traffic_trips = all_ids
+        .iter()
+        .filter(|id| backend_entry(&settled, LISTENER, id)["circuit_open"] == Value::Bool(true))
+        .count();
+    assert!(
+        real_traffic_trips >= NUM_BACKENDS - 1,
+        "expected real traffic to have tripped at least {} of {NUM_BACKENDS} circuits directly, \
+         only {real_traffic_trips} opened that way (the rest were excluded by the active health \
+         checker's own independent probe instead): {settled}",
+        NUM_BACKENDS - 1
+    );
 
-    let settle_deadline = Instant::now() + Duration::from_secs(8);
-    wait_for_dead_circuits_open(&admin_client, setup.admin, &all_ids, settle_deadline).await;
     assert_eq!(
         ready_status(&admin_client, setup.admin).await,
         StatusCode::SERVICE_UNAVAILABLE,
