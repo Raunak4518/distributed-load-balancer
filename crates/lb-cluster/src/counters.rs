@@ -225,7 +225,35 @@ impl CounterStore {
     pub(crate) fn key_count(&self) -> usize {
         self.keys.len()
     }
+
+    #[cfg(test)]
+    pub(crate) fn raw_state(&self) -> CrdtState {
+        self.keys
+            .iter()
+            .map(|item| {
+                let nodes = item
+                    .value()
+                    .per_node
+                    .iter()
+                    .map(|(node_id, buckets)| {
+                        let cells = buckets
+                            .iter()
+                            .map(|(epoch, count)| (*epoch, *count))
+                            .collect();
+                        (node_id.clone(), cells)
+                    })
+                    .collect();
+                (item.key().clone(), nodes)
+            })
+            .collect()
+    }
 }
+
+#[cfg(test)]
+pub(crate) type CrdtState = std::collections::BTreeMap<
+    String,
+    std::collections::BTreeMap<String, std::collections::BTreeMap<u64, u64>>,
+>;
 
 #[cfg(test)]
 mod tests {
@@ -438,5 +466,161 @@ mod tests {
         // budget is available again. This is also why a dead peer needs no
         // explicit expiry: its counts simply age out.
         assert!(store.try_admit("k", "n1", NOW + 10, 1));
+    }
+
+    #[test]
+    fn merge_order_independence_across_three_nodes_and_orderings() {
+        let updates = [
+            ("n1", NOW, 4u64),
+            ("n2", NOW, 9u64),
+            ("n3", NOW, 2u64),
+            ("n1", NOW - 1, 7u64),
+            ("n2", NOW - 1, 1u64),
+        ];
+
+        let forward = CounterStore::new(10);
+        for (node, epoch, count) in updates {
+            forward.merge("k", node, &[(epoch, count)], NOW);
+        }
+
+        let reverse = CounterStore::new(10);
+        for &(node, epoch, count) in updates.iter().rev() {
+            reverse.merge("k", node, &[(epoch, count)], NOW);
+        }
+
+        let grouped = CounterStore::new(10);
+        grouped.merge("k", "n2", &[(NOW, 9), (NOW - 1, 1)], NOW);
+        grouped.merge("k", "n3", &[(NOW, 2)], NOW);
+        grouped.merge("k", "n1", &[(NOW, 4), (NOW - 1, 7)], NOW);
+
+        assert_eq!(forward.raw_state(), reverse.raw_state());
+        assert_eq!(forward.raw_state(), grouped.raw_state());
+        assert_eq!(forward.total_in_window("k", NOW), 23);
+    }
+
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    struct MergeOp {
+        key: String,
+        node: String,
+        buckets: Vec<(u64, u64)>,
+    }
+
+    fn merge_op_strategy() -> impl Strategy<Value = MergeOp> {
+        (
+            0u8..3,
+            0u8..4,
+            prop::collection::vec((0u8..11, 0u64..50), 1..4),
+        )
+            .prop_map(|(k, n, buckets)| MergeOp {
+                key: format!("k{k}"),
+                node: format!("n{n}"),
+                buckets: buckets
+                    .into_iter()
+                    .map(|(e, c)| (NOW - 3 + e as u64, c))
+                    .collect(),
+            })
+    }
+
+    fn merge_ops_strategy() -> impl Strategy<Value = Vec<MergeOp>> {
+        prop::collection::vec(merge_op_strategy(), 0..8)
+    }
+
+    fn state_from_ops(ops: &[MergeOp]) -> CrdtState {
+        let store = CounterStore::new(1_000_000);
+        for op in ops {
+            store.merge(&op.key, &op.node, &op.buckets, NOW);
+        }
+        store.raw_state()
+    }
+
+    fn replay_state(store: &CounterStore, state: &CrdtState) {
+        for (key, nodes) in state {
+            for (node, buckets) in nodes {
+                let list: Vec<(u64, u64)> = buckets.iter().map(|(e, c)| (*e, *c)).collect();
+                store.merge(key, node, &list, NOW);
+            }
+        }
+    }
+
+    fn combine_states(a: &CrdtState, b: &CrdtState) -> CrdtState {
+        let store = CounterStore::new(1_000_000);
+        replay_state(&store, a);
+        replay_state(&store, b);
+        store.raw_state()
+    }
+
+    fn xorshift_shuffle(ops: &[MergeOp], seed: u64) -> Vec<MergeOp> {
+        let mut items = ops.to_vec();
+        let mut state = seed | 1;
+        for i in (1..items.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state as usize) % (i + 1);
+            items.swap(i, j);
+        }
+        items
+    }
+
+    proptest! {
+        #[test]
+        fn prop_merge_is_idempotent(ops in merge_ops_strategy()) {
+            let a = state_from_ops(&ops);
+            let merged = combine_states(&a, &a);
+            prop_assert_eq!(merged, a);
+        }
+
+        #[test]
+        fn prop_merge_is_commutative(ops_a in merge_ops_strategy(), ops_b in merge_ops_strategy()) {
+            let a = state_from_ops(&ops_a);
+            let b = state_from_ops(&ops_b);
+            prop_assert_eq!(combine_states(&a, &b), combine_states(&b, &a));
+        }
+
+        #[test]
+        fn prop_merge_is_associative(
+            ops_a in merge_ops_strategy(),
+            ops_b in merge_ops_strategy(),
+            ops_c in merge_ops_strategy(),
+        ) {
+            let a = state_from_ops(&ops_a);
+            let b = state_from_ops(&ops_b);
+            let c = state_from_ops(&ops_c);
+            let left = combine_states(&combine_states(&a, &b), &c);
+            let right = combine_states(&a, &combine_states(&b, &c));
+            prop_assert_eq!(left, right);
+        }
+
+        #[test]
+        fn prop_merge_is_monotonic(ops_a in merge_ops_strategy(), ops_b in merge_ops_strategy()) {
+            let a = state_from_ops(&ops_a);
+            let b = state_from_ops(&ops_b);
+            let merged = combine_states(&a, &b);
+            for source in [&a, &b] {
+                for (key, nodes) in source {
+                    for (node, buckets) in nodes {
+                        for (epoch, count) in buckets {
+                            let after = merged
+                                .get(key)
+                                .and_then(|n| n.get(node))
+                                .and_then(|b| b.get(epoch))
+                                .copied()
+                                .unwrap_or(0);
+                            prop_assert!(after >= *count);
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn prop_merge_order_independence(ops in merge_ops_strategy(), seed in any::<u64>()) {
+            let in_order = state_from_ops(&ops);
+            let shuffled = xorshift_shuffle(&ops, seed);
+            let out_of_order = state_from_ops(&shuffled);
+            prop_assert_eq!(in_order, out_of_order);
+        }
     }
 }
