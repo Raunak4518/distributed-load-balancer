@@ -242,11 +242,11 @@ fn resolve_default_or_canary_pool<'a, R: RateLimiter, C: Clock>(
         return (&ctx.pool, &ctx.balancer, ctx.outlier.as_ref());
     }
     if let Some(id) = sticky_pin {
-        if ctx.pool.all_backend_ids().contains(id) {
+        if ctx.pool.backend(id).is_some() {
             return (&ctx.pool, &ctx.balancer, ctx.outlier.as_ref());
         }
         for c in &ctx.canary {
-            if c.pool.all_backend_ids().contains(id) {
+            if c.pool.backend(id).is_some() {
                 return (&c.pool, &c.balancer, c.outlier.as_ref());
             }
         }
@@ -2428,6 +2428,74 @@ mod tests {
             ctx.canary_cursor.load(std::sync::atomic::Ordering::Relaxed),
             1,
             "an unrecognised pin must roll fresh, same as no pin at all"
+        );
+    }
+
+    #[test]
+    fn sticky_pin_membership_check_does_not_scale_with_backend_count() {
+        fn ctx_with_default_pool_size(n: usize) -> ProxyContext<AlwaysAllow, FakeClock> {
+            let backends: Vec<Backend> = (0..n)
+                .map(|i| Backend::new(format!("b{i}"), "127.0.0.1:9000".parse().unwrap(), 1, None))
+                .collect();
+            let first_id = backends[0].id.clone();
+            ProxyContext {
+                rate_limiter: Arc::new(AlwaysAllow),
+                balancer: Arc::new(FixedPick(first_id)),
+                pool: Arc::new(BackendPool::new(backends)),
+                routes: Vec::new(),
+                canary: vec![canary_pool("canary-1", 9500, 5)],
+                canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+                sticky: None,
+                cache: None,
+                waf: None,
+                waf_inspect_headers: false,
+                retry_budget: None,
+                circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+                outlier: None,
+                acme_challenges: None,
+                client: build_client(None, HashMap::new(), false, None),
+                per_backend_client: None,
+                backend_tls: false,
+                backend_tls_connector: None,
+                websocket_idle_timeout: Duration::from_secs(300),
+                backend_tcp_keepalive: None,
+                rate_limit_key: RateLimitKeySource::SourceIp,
+                forward_timeout: Duration::from_secs(1),
+                max_request_body_bytes: 1024,
+                cluster: None,
+                metrics: test_metrics(),
+                backend_metrics: HashMap::new(),
+                access_log: AccessLog::disabled(),
+                body_read_timeout: Duration::from_secs(10),
+                hsts_max_age_secs: None,
+            }
+        }
+
+        fn avg_lookup_nanos(n: usize) -> f64 {
+            let ctx = ctx_with_default_pool_size(n);
+            // The last id in insertion order -- the worst case for a linear
+            // `.contains()` scan, and no different from any other id for an
+            // O(1) hash lookup.
+            let pinned = ctx.pool.all_backend_ids().last().cloned().unwrap();
+            let iterations = 50_000u32;
+            for _ in 0..(iterations / 10) {
+                std::hint::black_box(resolve_default_or_canary_pool(&ctx, Some(&pinned)));
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(resolve_default_or_canary_pool(&ctx, Some(&pinned)));
+            }
+            start.elapsed().as_nanos() as f64 / iterations as f64
+        }
+
+        let small = avg_lookup_nanos(10);
+        let large = avg_lookup_nanos(1000);
+        let ratio = large / small.max(1.0);
+        assert!(
+            ratio < 10.0,
+            "sticky-pin membership check scaled with backend count: \
+             {small:.1}ns/call @10 backends vs {large:.1}ns/call @1000 backends (ratio {ratio:.1}x) -- \
+             an O(n) `.contains()` scan would show roughly a 100x ratio here"
         );
     }
 
