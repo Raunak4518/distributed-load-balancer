@@ -515,6 +515,31 @@ mod tests {
     }
 
     #[test]
+    fn key_churn_across_millions_of_distinct_keys_stays_bounded_and_reclaims_memory() {
+        let store = CounterStore::new(5);
+        let mut now = NOW;
+        let waves = 3;
+        let keys_per_wave = 500_000;
+        for wave in 0..waves {
+            for i in 0..keys_per_wave {
+                store.merge(&format!("churn-{wave}-{i}"), "n1", &[(now, 1)], now);
+            }
+            assert_eq!(
+                store.key_count(),
+                MAX_TRACKED_KEYS,
+                "key_count did not stay bounded at MAX_TRACKED_KEYS on wave {wave}"
+            );
+            now += 100;
+            store.prune(now);
+            assert_eq!(
+                store.key_count(),
+                0,
+                "keys were not reclaimed after aging out of the window on wave {wave}"
+            );
+        }
+    }
+
+    #[test]
     fn counts_age_out_as_time_advances() {
         let store = CounterStore::new(10);
         assert!(store.try_admit("k", "n1", NOW, 1));
