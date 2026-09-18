@@ -8,11 +8,11 @@ pub use handles::{
 
 /// Re-exported so consumer crates can hold metric handles without taking a
 /// direct dependency on the metrics backend.
-pub use prometheus::IntGauge;
+pub use prometheus::{IntCounter, IntGauge};
 
 use prometheus::{
-    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
-    IntGaugeVec, Opts, Registry, TextEncoder,
+    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// Process-wide metric families. Per-listener and per-backend handles are
@@ -37,6 +37,7 @@ pub struct Metrics {
     ratelimit_tracked_keys: IntGaugeVec,
     pub cluster_auth_failures: IntCounterVec,
     ratelimit_cluster_convergence_bound: IntGaugeVec,
+    pub cluster_future_skew_rejections: IntCounter,
 
     // TLS (Phase 6)
     tls_handshakes: IntCounterVec,
@@ -184,6 +185,10 @@ impl Metrics {
             ),
             &["listener"],
         )?;
+        let cluster_future_skew_rejections = IntCounter::new(
+            "lb_cluster_future_skew_rejections_total",
+            "Peer-sync cells rejected at merge time for exceeding the future-clock-skew tolerance",
+        )?;
         // `outcome` separates "we are being probed" (failed) from "clients
         // cannot finish" (timeout) from "our configuration is wrong" (no
         // successes at all) -- three incidents with three different fixes.
@@ -329,6 +334,7 @@ impl Metrics {
         registry.register(Box::new(ratelimit_tracked_keys.clone()))?;
         registry.register(Box::new(cluster_auth_failures.clone()))?;
         registry.register(Box::new(ratelimit_cluster_convergence_bound.clone()))?;
+        registry.register(Box::new(cluster_future_skew_rejections.clone()))?;
         registry.register(Box::new(tls_handshakes.clone()))?;
         registry.register(Box::new(tls_handshake_duration.clone()))?;
         registry.register(Box::new(tls_certificate_reloads.clone()))?;
@@ -364,6 +370,7 @@ impl Metrics {
             ratelimit_tracked_keys,
             cluster_auth_failures,
             ratelimit_cluster_convergence_bound,
+            cluster_future_skew_rejections,
             tls_handshakes,
             tls_handshake_duration,
             tls_certificate_reloads,
@@ -677,6 +684,16 @@ mod tests {
         assert!(text.contains(r#"phase="body""#));
         assert!(text.contains(r#"lb_ratelimit_tracked_keys{listener="web"} 7"#));
         assert!(text.contains("lb_cluster_auth_failures_total"));
+    }
+
+    #[test]
+    fn cluster_future_skew_rejections_is_exposed() {
+        let metrics = Metrics::new().unwrap();
+        metrics.cluster_future_skew_rejections.inc();
+        metrics.cluster_future_skew_rejections.inc_by(2);
+
+        let text = metrics.gather_text();
+        assert!(text.contains("lb_cluster_future_skew_rejections_total 3"));
     }
 
     /// A rising `rejected` count means renewal is broken while the

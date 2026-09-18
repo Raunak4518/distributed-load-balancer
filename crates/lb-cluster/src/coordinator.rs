@@ -35,6 +35,11 @@ impl<C: Clock> ClusterNode<C> {
         }
     }
 
+    pub fn with_skew_rejection_counter(mut self, counter: lb_metrics::IntCounter) -> Self {
+        self.store = self.store.with_skew_rejection_counter(counter);
+        self
+    }
+
     pub fn secret(&self) -> &[u8] {
         &self.secret
     }

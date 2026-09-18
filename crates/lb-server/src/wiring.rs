@@ -318,12 +318,10 @@ pub fn build_app(
     // (`reload::apply_reload` refuses a reload that would change `[cluster]`),
     // so this is the one and only place it is ever constructed.
     let cluster_node = match (config.cluster.as_ref(), cluster_secret) {
-        (Some(c), Some(secret)) => Some(Arc::new(ClusterNode::new(
-            c.node_id.clone(),
-            c.window_secs,
-            SystemClock,
-            secret,
-        ))),
+        (Some(c), Some(secret)) => Some(Arc::new(
+            ClusterNode::new(c.node_id.clone(), c.window_secs, SystemClock, secret)
+                .with_skew_rejection_counter(metrics.cluster_future_skew_rejections.clone()),
+        )),
         _ => None,
     };
 

@@ -1045,6 +1045,7 @@ dependencies = [
  "dashmap",
  "hmac",
  "lb-core",
+ "lb-metrics",
  "lb-tls",
  "proptest",
  "rcgen 0.13.2",
