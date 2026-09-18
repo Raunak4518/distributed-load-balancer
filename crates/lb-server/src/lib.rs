@@ -327,14 +327,23 @@ fn spawn_connection(
             // meant to receive connections from that one trusted front-end,
             // so a header that doesn't parse is either a misconfiguration
             // or an attempt to bypass per-client rate limiting.
-            match proxy_protocol::read_header(&mut stream).await {
-                Ok(Some(real_client)) => peer = real_client,
+            match tokio::time::timeout(
+                runtime.proxy_protocol_timeout(),
+                proxy_protocol::read_header(&mut stream),
+            )
+            .await
+            {
+                Ok(Ok(Some(real_client))) => peer = real_client,
                 // LOCAL/UNKNOWN: no real client behind this connection
                 // (e.g. the front-end's own health check) -- the raw peer
                 // is the right fallback.
-                Ok(None) => {}
-                Err(err) => {
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => {
                     tracing::debug!(peer = %peer, error = %err, "invalid proxy protocol header, dropping connection");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(peer = %peer, "proxy protocol header not received within timeout, dropping connection");
                     return;
                 }
             }

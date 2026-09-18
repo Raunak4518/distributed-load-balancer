@@ -293,6 +293,7 @@ pub struct ListenerConfig {
     /// peer -- see `lb_server::proxy_protocol`'s module docs for why.
     #[serde(default)]
     pub proxy_protocol: bool,
+    pub proxy_protocol_timeout_ms: Option<u64>,
 
     /// Applies to both protocols and both directions independently -- the
     /// socket this listener accepts from clients. `None` (the default)
@@ -575,6 +576,10 @@ impl ListenerConfig {
     /// this, dribbling headers holds a connection open indefinitely.
     pub fn header_read_timeout(&self) -> Duration {
         Duration::from_millis(self.header_read_timeout_ms.unwrap_or(5_000))
+    }
+
+    pub fn proxy_protocol_timeout(&self) -> Duration {
+        Duration::from_millis(self.proxy_protocol_timeout_ms.unwrap_or(1_000))
     }
 
     /// Caps how long a client may take to send the body. A size limit alone
@@ -1146,6 +1151,9 @@ impl ListenerConfig {
                 "header_read_timeout_ms, body_read_timeout_ms and write_timeout_ms must be positive"
                     .into(),
             ));
+        }
+        if self.proxy_protocol_timeout().is_zero() {
+            return Err(invalid("proxy_protocol_timeout_ms must be positive".into()));
         }
 
         match self.protocol {
@@ -2238,6 +2246,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_proxy_protocol_timeout() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        proxy_protocol_timeout_ms = 0",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("proxy_protocol_timeout_ms"),
+            "error should name proxy_protocol_timeout_ms, got: {err}"
+        );
+    }
+
+    #[test]
     fn rejects_non_positive_rate() {
         let text = VALID.replace("rate_per_sec = 50", "rate_per_sec = 0");
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
@@ -2458,6 +2479,7 @@ mod tests {
         assert_eq!(l.max_connections_per_ip(), 100);
         assert_eq!(l.header_read_timeout(), Duration::from_millis(5_000));
         assert_eq!(l.body_read_timeout(), Duration::from_millis(10_000));
+        assert_eq!(l.proxy_protocol_timeout(), Duration::from_millis(1_000));
         assert_eq!(l.rate_limit.max_tracked_keys, 100_000);
         assert_eq!(l.health_check.half_open_successes_required, 1);
         assert_eq!(l.health_check.flap_backoff_multiplier, 1.0);

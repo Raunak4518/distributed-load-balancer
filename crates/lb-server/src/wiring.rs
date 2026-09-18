@@ -61,6 +61,7 @@ pub enum ListenerRuntime {
         /// everything else on the connection -- see `proxy_protocol`'s
         /// module docs for the trust model this implies.
         proxy_protocol: bool,
+        proxy_protocol_timeout: Duration,
         /// Whether responses get gzip/brotli/deflate/zstd compression --
         /// see `compression`'s module docs.
         compression: bool,
@@ -87,6 +88,7 @@ pub enum ListenerRuntime {
         limits: ConnectionLimits,
         metrics: Arc<lb_metrics::ListenerMetrics>,
         proxy_protocol: bool,
+        proxy_protocol_timeout: Duration,
         tls: Option<Arc<lb_tls::TlsAcceptor>>,
         client_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     },
@@ -121,6 +123,19 @@ impl ListenerRuntime {
         match self {
             ListenerRuntime::Http { proxy_protocol, .. }
             | ListenerRuntime::Tcp { proxy_protocol, .. } => *proxy_protocol,
+        }
+    }
+
+    pub fn proxy_protocol_timeout(&self) -> Duration {
+        match self {
+            ListenerRuntime::Http {
+                proxy_protocol_timeout,
+                ..
+            }
+            | ListenerRuntime::Tcp {
+                proxy_protocol_timeout,
+                ..
+            } => *proxy_protocol_timeout,
         }
     }
 
@@ -411,6 +426,7 @@ pub fn build_app(
                     header_read_timeout: lc.header_read_timeout(),
                     write_timeout: lc.write_timeout(),
                     proxy_protocol: lc.proxy_protocol,
+                    proxy_protocol_timeout: lc.proxy_protocol_timeout(),
                     compression: lc.compression,
                     tls,
                     // Built from the same `http2_enabled()` the TLS acceptor's
@@ -437,6 +453,7 @@ pub fn build_app(
                     limits: connection_limits,
                     metrics: Arc::clone(&listener_metrics),
                     proxy_protocol: lc.proxy_protocol,
+                    proxy_protocol_timeout: lc.proxy_protocol_timeout(),
                     tls,
                     client_tcp_keepalive: lc.client_tcp_keepalive.clone(),
                 }

@@ -51,6 +51,42 @@ proxy_protocol = true
     )
 }
 
+fn proxy_protocol_config_with_timeout(
+    listen: SocketAddr,
+    backend: SocketAddr,
+    timeout_ms: u64,
+) -> String {
+    format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+proxy_protocol = true
+proxy_protocol_timeout_ms = {timeout_ms}
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 0.001
+  burst = 1
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    )
+}
+
 /// Opens a fresh connection, sends a v1 PROXY header announcing
 /// `announced_ip` as the source, then a bare HTTP GET, and returns the
 /// response status line's code. A fresh connection each time because a
@@ -353,6 +389,45 @@ async fn v2_reserved_version_is_rejected() {
 async fn v2_reserved_command_is_rejected() {
     let payload = v2_header(0xF, 0x00, &[]);
     assert_malformed_connection_rejected(&payload).await;
+}
+
+#[tokio::test]
+async fn a_stalled_partial_header_is_closed_within_the_configured_timeout() {
+    let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let timeout_ms = 500;
+    let config = Config::parse(&proxy_protocol_config_with_timeout(
+        listen, backend, timeout_ms,
+    ))
+    .unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    let mut stream = TcpStream::connect(listen).await.unwrap();
+    stream.write_all(b"PROXY TC").await.unwrap();
+
+    let started = std::time::Instant::now();
+    let mut response = Vec::new();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .expect("connection was not closed within 3s -- proxy protocol timeout did not fire");
+    outcome.unwrap_or(0);
+    let elapsed = started.elapsed();
+
+    assert!(
+        response.is_empty(),
+        "a stalled partial header was served: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        elapsed >= Duration::from_millis(timeout_ms) - Duration::from_millis(200),
+        "connection closed suspiciously early ({elapsed:?}) for a {timeout_ms}ms timeout"
+    );
+    assert!(
+        elapsed < Duration::from_millis(timeout_ms) + Duration::from_secs(2),
+        "connection took {elapsed:?} to close -- far past the configured {timeout_ms}ms timeout"
+    );
 }
 
 #[tokio::test]

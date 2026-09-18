@@ -53,6 +53,7 @@ fn restart_only_fields_changed(old: &ListenerConfig, new: &ListenerConfig) -> bo
         || old.write_timeout_ms != new.write_timeout_ms
         || old.compression != new.compression
         || old.proxy_protocol != new.proxy_protocol
+        || old.proxy_protocol_timeout_ms != new.proxy_protocol_timeout_ms
         || old.client_tcp_keepalive != new.client_tcp_keepalive
 }
 
@@ -108,7 +109,8 @@ pub async fn apply_reload(
         if restart_only_fields_changed(old_lc, new_lc) {
             return ReloadOutcome::Refused(format!(
                 "listener '{}': tls, backend_tls, http2, connection limits, write_timeout_ms, \
-                 compression, proxy_protocol, or client_tcp_keepalive changed -- requires a restart",
+                 compression, proxy_protocol, proxy_protocol_timeout_ms, or client_tcp_keepalive \
+                 changed -- requires a restart",
                 new_lc.name
             ));
         }
