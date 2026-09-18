@@ -137,6 +137,7 @@ pub struct ListenerMetrics {
     pub retry_failures: IntCounter,
     pub retry_budget_admits: IntCounter,
     pub retry_budget_denials: IntCounter,
+    pub retry_not_idempotent: IntCounter,
 }
 
 /// The built-in WAF rule that matched a request -- see `lb_proxy::waf`.

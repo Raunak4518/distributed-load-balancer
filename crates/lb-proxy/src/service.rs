@@ -444,6 +444,13 @@ fn build_outbound_request(
 
 const RETRY_BUDGET_KEY: &str = "retry";
 
+fn is_idempotent_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS | Method::TRACE
+    )
+}
+
 pub async fn handle<R, C>(
     req: Request<Incoming>,
     ctx: Arc<ProxyContext<R, C>>,
@@ -888,6 +895,10 @@ where
                     ctx.metrics.retry_failures.inc();
                     break;
                 }
+                if !is_idempotent_method(&parts.method) {
+                    ctx.metrics.retry_not_idempotent.inc();
+                    break;
+                }
                 if let Some(budget) = &ctx.retry_budget {
                     match budget.check(RETRY_BUDGET_KEY) {
                         Decision::Deny { .. } => {
@@ -1211,6 +1222,35 @@ mod tests {
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
             .header(name, value)
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let bytes = body.collect().await.unwrap().to_bytes();
+        Response::from_parts(parts, bytes)
+    }
+
+    async fn run_through_proxy_with_method<R, C>(
+        ctx: Arc<ProxyContext<R, C>>,
+        method: Method,
+    ) -> Response<Bytes>
+    where
+        R: RateLimiter + 'static,
+        C: Clock + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle(req, ctx.clone(), "127.0.0.1".parse().unwrap()));
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+
+        let client = build_client(None, HashMap::new(), false, None);
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
             .unwrap();
         let resp = client.request(req).await.unwrap();
@@ -1617,6 +1657,38 @@ mod tests {
         assert_eq!(metrics.retry_successes.get(), 1);
         assert_eq!(metrics.retry_failures.get(), 0);
         assert_eq!(metrics.retry_budget_denials.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_post_to_a_flaky_backend_is_not_retried() {
+        let addr = spawn_flaky_then_ok_backend().await;
+        let backend = Backend::new("b1", addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_with_retry_budget(&backend, pool, None);
+        let metrics = ctx.metrics.clone();
+
+        let resp = run_through_proxy_with_method(ctx, Method::POST).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(metrics.retry_not_idempotent.get(), 1);
+        assert_eq!(metrics.retry_attempts.get(), 0);
+        assert_eq!(metrics.retry_successes.get(), 0);
+        assert_eq!(metrics.retry_failures.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_get_to_a_flaky_backend_still_retries_and_succeeds() {
+        let addr = spawn_flaky_then_ok_backend().await;
+        let backend = Backend::new("b1", addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_with_retry_budget(&backend, pool, None);
+        let metrics = ctx.metrics.clone();
+
+        let resp = run_through_proxy_with_method(ctx, Method::GET).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(metrics.retry_not_idempotent.get(), 0);
+        assert_eq!(metrics.retry_attempts.get(), 1);
+        assert_eq!(metrics.retry_successes.get(), 1);
+        assert_eq!(metrics.retry_failures.get(), 0);
     }
 
     #[tokio::test]

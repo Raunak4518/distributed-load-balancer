@@ -71,6 +71,7 @@ pub struct Metrics {
     retry_failures: IntCounterVec,
     retry_budget_admits: IntCounterVec,
     retry_budget_denials: IntCounterVec,
+    retry_not_idempotent: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -304,6 +305,13 @@ impl Metrics {
             ),
             &["listener"],
         )?;
+        let retry_not_idempotent = IntCounterVec::new(
+            Opts::new(
+                "lb_retry_not_idempotent_total",
+                "Retries skipped because the request method is not idempotent, by listener",
+            ),
+            &["listener"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -336,6 +344,7 @@ impl Metrics {
         registry.register(Box::new(retry_failures.clone()))?;
         registry.register(Box::new(retry_budget_admits.clone()))?;
         registry.register(Box::new(retry_budget_denials.clone()))?;
+        registry.register(Box::new(retry_not_idempotent.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -370,6 +379,7 @@ impl Metrics {
             retry_failures,
             retry_budget_admits,
             retry_budget_denials,
+            retry_not_idempotent,
         })
     }
 
@@ -470,6 +480,7 @@ impl Metrics {
             retry_failures: self.retry_failures.with_label_values(&[name]),
             retry_budget_admits: self.retry_budget_admits.with_label_values(&[name]),
             retry_budget_denials: self.retry_budget_denials.with_label_values(&[name]),
+            retry_not_idempotent: self.retry_not_idempotent.with_label_values(&[name]),
         }
     }
 
