@@ -2545,9 +2545,6 @@ mod tests {
 
         fn avg_lookup_nanos(n: usize) -> f64 {
             let ctx = ctx_with_default_pool_size(n);
-            // The last id in insertion order -- the worst case for a linear
-            // `.contains()` scan, and no different from any other id for an
-            // O(1) hash lookup.
             let pinned = ctx.pool.all_backend_ids().last().cloned().unwrap();
             let iterations = 50_000u32;
             for _ in 0..(iterations / 10) {
