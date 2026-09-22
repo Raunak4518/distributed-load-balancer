@@ -24,11 +24,15 @@ const SECRET: &[u8] = b"lb-bench-cluster-secret";
 
 const NODE_COUNTS: &[usize] = &[3, 5, 10];
 const GOSSIP_INTERVALS_MS: &[u64] = &[100, 500, 1_000, 5_000];
+const COUNTER_STORE_KEY_COUNTS: &[usize] = &[100, 1_000, 10_000, 100_000];
+const COUNTER_STORE_SCALE_GOSSIP_MS: u64 = 200;
+const COUNTER_STORE_SCALE_MEASURE: Duration = Duration::from_secs(3);
 
 struct RelayHandle {
     addr: SocketAddr,
     attempted: Arc<AtomicU64>,
     successful: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
     partitioned: Arc<AtomicBool>,
 }
 
@@ -37,9 +41,11 @@ async fn spawn_relay(target: SocketAddr) -> (RelayHandle, JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
     let attempted = Arc::new(AtomicU64::new(0));
     let successful = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(AtomicU64::new(0));
     let partitioned = Arc::new(AtomicBool::new(false));
     let attempted_task = Arc::clone(&attempted);
     let successful_task = Arc::clone(&successful);
+    let bytes_task = Arc::clone(&bytes);
     let partitioned_task = Arc::clone(&partitioned);
     let task = tokio::spawn(async move {
         loop {
@@ -51,11 +57,13 @@ async fn spawn_relay(target: SocketAddr) -> (RelayHandle, JoinHandle<()>) {
                 continue;
             }
             let successful_task = Arc::clone(&successful_task);
+            let bytes_task = Arc::clone(&bytes_task);
             tokio::spawn(async move {
                 if let Ok(mut outbound) = TcpStream::connect(target).await {
-                    if tokio::io::copy(&mut inbound, &mut outbound).await.is_ok() {
+                    if let Ok(copied) = tokio::io::copy(&mut inbound, &mut outbound).await {
                         let _ = outbound.shutdown().await;
                         successful_task.fetch_add(1, Ordering::Relaxed);
+                        bytes_task.fetch_add(copied, Ordering::Relaxed);
                     }
                 }
             });
@@ -66,6 +74,7 @@ async fn spawn_relay(target: SocketAddr) -> (RelayHandle, JoinHandle<()>) {
             addr,
             attempted,
             successful,
+            bytes,
             partitioned,
         },
         task,
@@ -449,6 +458,62 @@ async fn run_partition_scenario() {
     println!();
 }
 
+async fn run_counter_store_scale_scenario() {
+    println!(
+        "=== CounterStore resource scale (backlog item 33): real gossip over TCP, {COUNTER_STORE_KEY_COUNTS:?} tracked keys ==="
+    );
+    println!(
+        "  2 nodes, gossip interval {COUNTER_STORE_SCALE_GOSSIP_MS}ms, node-0's store pre-loaded with N keys (1 bucket each), measured for {:.0}s per key count."
+    , COUNTER_STORE_SCALE_MEASURE.as_secs_f64());
+    println!(
+        "{:>10} | {:>10} | {:>12} | {:>10} | {:>10}",
+        "keys", "msgs-ok", "bytes-total", "bytes/msg", "msgs/sec"
+    );
+    for &n in COUNTER_STORE_KEY_COUNTS {
+        let interval = Duration::from_millis(COUNTER_STORE_SCALE_GOSSIP_MS);
+        let setup = setup_cluster(2, interval).await;
+        let now = SystemClock.unix_secs();
+        for i in 0..n {
+            setup.nodes[0].store().try_admit(
+                &format!("scale-key-{i}"),
+                setup.nodes[0].node_id(),
+                now,
+                u64::MAX,
+            );
+        }
+
+        tokio::time::sleep(COUNTER_STORE_SCALE_MEASURE).await;
+
+        let messages_successful: u64 = setup
+            .relays
+            .values()
+            .map(|r| r.successful.load(Ordering::Relaxed))
+            .sum();
+        let bytes_total: u64 = setup
+            .relays
+            .values()
+            .map(|r| r.bytes.load(Ordering::Relaxed))
+            .sum();
+        let bytes_per_msg = if messages_successful > 0 {
+            bytes_total as f64 / messages_successful as f64
+        } else {
+            0.0
+        };
+        let msgs_per_sec = messages_successful as f64 / COUNTER_STORE_SCALE_MEASURE.as_secs_f64();
+
+        println!(
+            "{:>10} | {:>10} | {:>12} | {:>10.0} | {:>10.1}",
+            n, messages_successful, bytes_total, bytes_per_msg, msgs_per_sec
+        );
+
+        for task in setup.tasks {
+            task.abort();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    println!();
+}
+
 fn print_methodology() {
     println!(
         "lb-bench-cluster -- empirical validation of the cluster rate-limit convergence bound"
@@ -493,4 +558,5 @@ async fn main() {
     println!();
 
     run_partition_scenario().await;
+    run_counter_store_scale_scenario().await;
 }

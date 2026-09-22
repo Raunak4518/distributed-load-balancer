@@ -22,9 +22,11 @@
 mod tls;
 
 use lb_balancer::{ConsistentHash, LeastConnections, PeakEwmaP2c, RoundRobin, WeightedRoundRobin};
-use lb_cluster::{ClusterNode, ListenerCoordinator};
+use lb_cluster::protocol::{encode, KeyEntry, SyncMessage};
+use lb_cluster::{ClusterNode, CounterStore, ListenerCoordinator};
 use lb_core::{
-    Backend, BackendId, BackendPool, ClusterCoordinator, LoadBalancer, RateLimiter, SystemClock,
+    Backend, BackendId, BackendPool, Clock, ClusterCoordinator, LoadBalancer, RateLimiter,
+    SystemClock,
 };
 use lb_healthcheck::{CircuitBreaker, CircuitState};
 use lb_ratelimit::{Gcra, GcraConfig};
@@ -36,6 +38,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const ITERATIONS: u64 = 200_000;
+const COUNTER_STORE_KEY_COUNTS: [usize; 4] = [100, 1_000, 10_000, 100_000];
+const COUNTER_STORE_WINDOW_SECS: u64 = 30;
+const COUNTER_STORE_SECRET: &[u8] = b"lb-bench-counter-store-secret";
 
 pub fn bench<F: FnMut()>(name: &str, iterations: u64, mut f: F) {
     // Warm up so the first-touch costs (page faults, branch predictor,
@@ -268,6 +273,125 @@ fn print_memory_estimate() {
     println!("      10 virtual nodes per unit of weight, rebuilt on membership change)");
 }
 
+fn counter_store_bench_iterations(n: usize) -> u64 {
+    match n {
+        0..=100 => 2_000,
+        101..=1_000 => 500,
+        1_001..=10_000 => 100,
+        _ => 20,
+    }
+}
+
+fn build_counter_store(n: usize, now: u64) -> CounterStore {
+    let store = CounterStore::new(COUNTER_STORE_WINDOW_SECS);
+    for i in 0..n {
+        store.try_admit(&format!("scale-key-{i}"), "self", now, u64::MAX);
+    }
+    store
+}
+
+fn bench_counter_store_at_scale() {
+    println!(
+        "\nCounterStore at scale (backlog item 33): snapshot_own() and merge(), {COUNTER_STORE_KEY_COUNTS:?} tracked keys"
+    );
+    for n in COUNTER_STORE_KEY_COUNTS {
+        let now = SystemClock.unix_secs();
+        let store = build_counter_store(n, now);
+        let iterations = counter_store_bench_iterations(n);
+
+        let snap = store.snapshot_own("self", now);
+        let entry_count = snap.len();
+        let bucket_entry_count: usize = snap.iter().map(|(_, buckets)| buckets.len()).sum();
+        let msg = SyncMessage {
+            node_id: "self".to_string(),
+            entries: snap
+                .iter()
+                .map(|(key, buckets)| KeyEntry {
+                    key: key.clone(),
+                    buckets: buckets.clone(),
+                })
+                .collect(),
+        };
+        let encoded = encode(&msg, COUNTER_STORE_SECRET).unwrap();
+
+        println!(
+            "\n  {n:>7} tracked keys: snapshot entries={entry_count:>5}   bucket-entries={bucket_entry_count:>5}   encoded bytes={:>7}",
+            encoded.len()
+        );
+
+        bench(
+            &format!("snapshot_own() @ {n} tracked keys"),
+            iterations,
+            || {
+                black_box(store.snapshot_own("self", now));
+            },
+        );
+
+        bench(
+            &format!("merge() one snapshot @ {n} tracked keys ({entry_count} entries)"),
+            iterations,
+            || {
+                let receiver = CounterStore::new(COUNTER_STORE_WINDOW_SECS);
+                for (key, buckets) in &snap {
+                    receiver.merge(key, "peer", buckets, now);
+                }
+                black_box(&receiver);
+            },
+        );
+    }
+}
+
+fn print_counter_store_memory_estimate() {
+    println!(
+        "\nCounterStore per-key memory estimate  [component arithmetic on counters.rs's KeyCounts {{ per_node: HashMap<String, HashMap<u64, u64>> }} fields]"
+    );
+
+    let string_bytes = std::mem::size_of::<String>();
+    let key_counts_bytes = std::mem::size_of::<HashMap<String, HashMap<u64, u64>>>();
+    let per_node_bucket_map_bytes = std::mem::size_of::<HashMap<u64, u64>>();
+    let bucket_entry_bytes = std::mem::size_of::<(u64, u64)>();
+
+    let per_tracked_key_floor_bytes = string_bytes + key_counts_bytes;
+    let per_key_node_pair_floor_bytes = string_bytes + per_node_bucket_map_bytes;
+    let per_bucket_cell_floor_bytes = bucket_entry_bytes;
+
+    println!("  size_of::<String>() (DashMap key / node-id key)          {string_bytes:>6} bytes");
+    println!(
+        "  size_of::<HashMap<String, HashMap<u64,u64>>>() (KeyCounts) {key_counts_bytes:>6} bytes"
+    );
+    println!("  size_of::<HashMap<u64, u64>>() (per-node bucket map)     {per_node_bucket_map_bytes:>6} bytes");
+    println!(
+        "  size_of::<(u64, u64)>() (one bucket cell)                 {bucket_entry_bytes:>6} bytes"
+    );
+    println!("  {}", "-".repeat(58));
+    println!("  per tracked key (DashMap slot + KeyCounts)               {per_tracked_key_floor_bytes:>6} bytes");
+    println!("  + per (key, node) pair (node-id key + bucket map header) {per_key_node_pair_floor_bytes:>6} bytes");
+    println!("  + per (key, node, epoch-second) bucket cell               {per_bucket_cell_floor_bytes:>6} bytes");
+    println!();
+    for n in COUNTER_STORE_KEY_COUNTS {
+        let floor_bytes = n
+            * (per_tracked_key_floor_bytes
+                + per_key_node_pair_floor_bytes
+                + per_bucket_cell_floor_bytes);
+        println!(
+            "  at {n:>7} keys, 1 node, 1 bucket each: ~{:.1} KiB rough floor",
+            floor_bytes as f64 / 1024.0
+        );
+    }
+    println!(
+        "  at 100000 keys is also MAX_TRACKED_KEYS, the hard cap this store enforces at merge()"
+    );
+    println!("  NOT counted here, and why an exact number isn't reliable on this platform:");
+    println!("    - the key string bytes themselves and node-id string bytes (heap-allocated separately per String)");
+    println!("    - the system allocator's own per-allocation bookkeeping overhead");
+    println!(
+        "    - HashMap's real bucket/control-byte layout and load-factor slack (both the outer per_node map and each inner epoch-bucket map)"
+    );
+    println!(
+        "    - DashMap's own shard count, per-shard RwLock<HashMap<...>>, and hashing overhead"
+    );
+}
+
 fn run_contention_case(strategy_name: &str, lb: Arc<dyn LoadBalancer>, n: usize) {
     let pool = Arc::new(pool_of(n));
     let stop = Arc::new(AtomicBool::new(false));
@@ -386,4 +510,12 @@ fn main() {
     bench_apply_resolved_at_scale();
     print_memory_estimate();
     bench_pick_under_concurrent_apply_resolved();
+
+    println!("\n{}", "=".repeat(78));
+    println!(
+        "CounterStore scaling characteristics (backlog item 33): snapshot_own()/merge() cost,\n\
+         snapshot size, and per-key memory, across {COUNTER_STORE_KEY_COUNTS:?} tracked keys."
+    );
+    bench_counter_store_at_scale();
+    print_counter_store_memory_estimate();
 }
