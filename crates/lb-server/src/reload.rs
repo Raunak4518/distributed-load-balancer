@@ -551,6 +551,56 @@ mod tests {
         abort_everything(app).await;
     }
 
+    #[tokio::test]
+    async fn concurrent_reloads_never_leave_stored_config_disagreeing_with_live_state() {
+        for _ in 0..50 {
+            let old = Config::parse(TWO_LISTENERS).unwrap();
+            let app = build_app(&old, None).unwrap();
+
+            let new_a_text = TWO_LISTENERS.replacen(
+                "[[listeners.backends]]\n          id = \"a1\"\n          address = \"127.0.0.1:9001\"",
+                "[[listeners.backends]]\n          id = \"a1\"\n          address = \"127.0.0.1:9001\"\n\n          [[listeners.backends]]\n          id = \"a2\"\n          address = \"127.0.0.1:9099\"",
+                1,
+            );
+            let new_b_text = TWO_LISTENERS.replacen(
+                "[[listeners.backends]]\n          id = \"a1\"\n          address = \"127.0.0.1:9001\"",
+                "[[listeners.backends]]\n          id = \"a1\"\n          address = \"127.0.0.1:9001\"\n\n          [[listeners.backends]]\n          id = \"a3\"\n          address = \"127.0.0.1:9098\"",
+                1,
+            );
+            let new_a = Config::parse(&new_a_text).unwrap();
+            let new_b = Config::parse(&new_b_text).unwrap();
+
+            let (outcome_a, outcome_b) = tokio::join!(
+                apply_reload(&new_a, &old, &app.reload),
+                apply_reload(&new_b, &old, &app.reload),
+            );
+            assert!(matches!(outcome_a, ReloadOutcome::Applied { .. }));
+            assert!(matches!(outcome_b, ReloadOutcome::Applied { .. }));
+
+            let stored_config = app.reload.config.lock().await.clone();
+            let stored_a = stored_config
+                .listeners
+                .iter()
+                .find(|l| l.name == "a")
+                .unwrap();
+            let live_a = http_ctx_arc(&app.reload, "a");
+            let live_ids: std::collections::HashSet<_> =
+                live_a.pool.all_backend_ids().into_iter().collect();
+            let stored_ids: std::collections::HashSet<_> = stored_a
+                .backends
+                .iter()
+                .map(|b| lb_core::BackendId::new(b.id.clone()))
+                .collect();
+            assert_eq!(
+                live_ids, stored_ids,
+                "stored config's backend set for listener 'a' must always match \
+                 the live pool's backend set, even when two reloads race"
+            );
+
+            abort_everything(app).await;
+        }
+    }
+
     /// The listener runtime and the reload handle must always point at the
     /// *same* `ArcSwap` -- checked directly, since every other test in this
     /// module only ever reads through the reload handle and would not catch
