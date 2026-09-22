@@ -44,6 +44,8 @@ enum Cli {
     RetryAmplification,
     Reliability,
     Convergence,
+    FailurePatterns,
+    ConcurrencySignal,
     Help,
 }
 
@@ -57,6 +59,8 @@ fn parse_args(args: &[String]) -> Cli {
         [flag] if flag == "--retry-amplification" => Cli::RetryAmplification,
         [flag] if flag == "--reliability" => Cli::Reliability,
         [flag] if flag == "--convergence" => Cli::Convergence,
+        [flag] if flag == "--failure-patterns" => Cli::FailurePatterns,
+        [flag] if flag == "--concurrency-signal" => Cli::ConcurrencySignal,
         [flag] if flag == "--help" || flag == "-h" => Cli::Help,
         [flag, name] if flag == "--strategy" => {
             match STRATEGIES.iter().copied().find(|s| *s == name.as_str()) {
@@ -79,6 +83,8 @@ fn print_help() {
     println!("    lb-bench-e2e --retry-amplification");
     println!("    lb-bench-e2e --reliability");
     println!("    lb-bench-e2e --convergence");
+    println!("    lb-bench-e2e --failure-patterns");
+    println!("    lb-bench-e2e --concurrency-signal");
     println!("    lb-bench-e2e --help");
     println!();
     println!("STRATEGY one of: {}", STRATEGIES.join(", "));
@@ -97,6 +103,10 @@ struct SpawnedBackend {
     received: Arc<AtomicU64>,
     delay_ms: Arc<AtomicU64>,
     fail_pct: Arc<AtomicU64>,
+    jitter_ms: Arc<AtomicU64>,
+    slow_pct: Arc<AtomicU64>,
+    slow_extra_ms: Arc<AtomicU64>,
+    concurrency_coeff_ms: Arc<AtomicU64>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -119,11 +129,21 @@ async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
     let received = Arc::new(AtomicU64::new(0));
     let delay_ms = Arc::new(AtomicU64::new(initial_delay_ms));
     let fail_pct = Arc::new(AtomicU64::new(0));
+    let jitter_ms = Arc::new(AtomicU64::new(0));
+    let slow_pct = Arc::new(AtomicU64::new(0));
+    let slow_extra_ms = Arc::new(AtomicU64::new(0));
+    let concurrency_coeff_ms = Arc::new(AtomicU64::new(0));
+    let in_flight = Arc::new(AtomicU64::new(0));
     let rng_state = Arc::new(AtomicU64::new(addr.port() as u64));
     let count_for_task = Arc::clone(&count);
     let received_for_task = Arc::clone(&received);
     let delay_for_task = Arc::clone(&delay_ms);
     let fail_for_task = Arc::clone(&fail_pct);
+    let jitter_for_task = Arc::clone(&jitter_ms);
+    let slow_pct_for_task = Arc::clone(&slow_pct);
+    let slow_extra_for_task = Arc::clone(&slow_extra_ms);
+    let concurrency_coeff_for_task = Arc::clone(&concurrency_coeff_ms);
+    let in_flight_for_task = Arc::clone(&in_flight);
     let rng_for_task = Arc::clone(&rng_state);
     let handle = tokio::spawn(async move {
         loop {
@@ -136,6 +156,11 @@ async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
             let received = Arc::clone(&received_for_task);
             let delay_ms = Arc::clone(&delay_for_task);
             let fail_pct = Arc::clone(&fail_for_task);
+            let jitter_ms = Arc::clone(&jitter_for_task);
+            let slow_pct = Arc::clone(&slow_pct_for_task);
+            let slow_extra_ms = Arc::clone(&slow_extra_for_task);
+            let concurrency_coeff_ms = Arc::clone(&concurrency_coeff_for_task);
+            let in_flight = Arc::clone(&in_flight_for_task);
             let rng_state = Arc::clone(&rng_for_task);
             tokio::spawn(async move {
                 let svc = service_fn(move |req: Request<Incoming>| {
@@ -143,6 +168,11 @@ async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
                     let received = Arc::clone(&received);
                     let delay_ms = Arc::clone(&delay_ms);
                     let fail_pct = Arc::clone(&fail_pct);
+                    let jitter_ms = Arc::clone(&jitter_ms);
+                    let slow_pct = Arc::clone(&slow_pct);
+                    let slow_extra_ms = Arc::clone(&slow_extra_ms);
+                    let concurrency_coeff_ms = Arc::clone(&concurrency_coeff_ms);
+                    let in_flight = Arc::clone(&in_flight);
                     let rng_state = Arc::clone(&rng_state);
                     async move {
                         if req.uri().path() == "/health" {
@@ -162,10 +192,24 @@ async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
                                 .body(Full::new(Bytes::from_static(b"err")))
                                 .unwrap());
                         }
-                        let delay = delay_ms.load(Ordering::Relaxed);
+                        let n = in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                        let mut delay = delay_ms.load(Ordering::Relaxed);
+                        let jitter = jitter_ms.load(Ordering::Relaxed);
+                        if jitter > 0 {
+                            delay += roll(&rng_state) % jitter;
+                        }
+                        let slow = slow_pct.load(Ordering::Relaxed);
+                        if slow > 0 && roll(&rng_state) % 100 < slow {
+                            delay += slow_extra_ms.load(Ordering::Relaxed);
+                        }
+                        let coeff = concurrency_coeff_ms.load(Ordering::Relaxed);
+                        if coeff > 0 {
+                            delay += n * coeff;
+                        }
                         if delay > 0 {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
+                        in_flight.fetch_sub(1, Ordering::Relaxed);
                         count.fetch_add(1, Ordering::Relaxed);
                         Ok(Response::builder()
                             .status(StatusCode::OK)
@@ -183,6 +227,10 @@ async fn spawn_backend(initial_delay_ms: u64) -> SpawnedBackend {
         received,
         delay_ms,
         fail_pct,
+        jitter_ms,
+        slow_pct,
+        slow_extra_ms,
+        concurrency_coeff_ms,
         handle,
     }
 }
@@ -1336,6 +1384,316 @@ async fn convergence_characterization() {
     }
 }
 
+async fn spawn_pattern_harness(
+    baseline_delay_ms: u64,
+) -> (Vec<SpawnedBackend>, Child, SocketAddr, ProxyClient) {
+    let mut backends = Vec::with_capacity(4);
+    for _ in 0..4 {
+        backends.push(spawn_backend(baseline_delay_ms).await);
+    }
+    let addrs: Vec<SocketAddr> = backends.iter().map(|b| b.addr).collect();
+    let (child, listen) = start_lb_server_for("peak_ewma_p2c", &addrs).await;
+    let client = build_client();
+    (backends, child, listen, client)
+}
+
+async fn teardown_pattern_harness(mut child: Child, backends: Vec<SpawnedBackend>) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    for backend in backends {
+        backend.handle.abort();
+    }
+}
+
+async fn sample_traffic_shares(
+    backends: &[SpawnedBackend],
+    tick: Duration,
+    ticks: u64,
+    scenario: &str,
+) {
+    println!(
+        "      {:>7} | {:>6} | {:>6} | {:>6} | {:>6}",
+        "t", "A", "B", "C", "D"
+    );
+    let mut last = [0u64; 4];
+    let start = Instant::now();
+    for _ in 0..ticks {
+        tokio::time::sleep(tick).await;
+        let now: Vec<u64> = backends
+            .iter()
+            .map(|b| b.count.load(Ordering::Relaxed))
+            .collect();
+        let deltas: Vec<u64> = now
+            .iter()
+            .zip(last.iter())
+            .map(|(n, l)| n.saturating_sub(*l))
+            .collect();
+        last.copy_from_slice(&now);
+        let t = start.elapsed().as_secs_f64();
+        println!(
+            "      {:>6.1}s | {:>6} | {:>6} | {:>6} | {:>6}",
+            t, deltas[0], deltas[1], deltas[2], deltas[3]
+        );
+        let total: u64 = deltas.iter().sum::<u64>().max(1);
+        let c_share = 100.0 * deltas[2] as f64 / total as f64;
+        results().record(&format!("{scenario}/t={t:.1}"), "c_req_share_pct", c_share);
+    }
+}
+
+async fn failure_pattern_gradual_ramp() {
+    println!(
+        "--- pattern: gradual linear ramp (backend C: 10ms -> 300ms over 6s, holds 3s, ramps back over 3s) ---"
+    );
+    let (backends, child, listen, client) = spawn_pattern_harness(10).await;
+    let c_delay = Arc::clone(&backends[2].delay_ms);
+    let total = Duration::from_secs(18);
+    let load = run_closed_loop(&client, listen, 64, total, Duration::from_secs(0), false);
+    let controller = async {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for step in 0..12u64 {
+            c_delay.store(10 + step * 24, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        c_delay.store(300, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        for step in (0..12u64).rev() {
+            c_delay.store(10 + step * 24, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        c_delay.store(10, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    };
+    let sampler = sample_traffic_shares(
+        &backends,
+        Duration::from_secs(1),
+        18,
+        "failure_patterns/gradual_ramp",
+    );
+    tokio::join!(load, controller, sampler);
+    teardown_pattern_harness(child, backends).await;
+    println!();
+}
+
+async fn failure_pattern_periodic_spikes() {
+    println!("--- pattern: periodic spikes (backend C: every 2s, 200ms spike to 400ms) ---");
+    let (backends, child, listen, client) = spawn_pattern_harness(10).await;
+    let c_delay = Arc::clone(&backends[2].delay_ms);
+    let total = Duration::from_secs(10);
+    let load = run_closed_loop(&client, listen, 64, total, Duration::from_secs(0), false);
+    let controller = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for _ in 0..3 {
+            c_delay.store(400, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            c_delay.store(10, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(1800)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let sampler = sample_traffic_shares(
+        &backends,
+        Duration::from_millis(250),
+        40,
+        "failure_patterns/periodic_spikes",
+    );
+    tokio::join!(load, controller, sampler);
+    teardown_pattern_harness(child, backends).await;
+    println!();
+}
+
+async fn failure_pattern_randomized_jitter() {
+    println!("--- pattern: randomized per-request jitter (backend C: 10ms base + 0-400ms jitter for 6s) ---");
+    let (backends, child, listen, client) = spawn_pattern_harness(10).await;
+    let c_jitter = Arc::clone(&backends[2].jitter_ms);
+    let total = Duration::from_secs(10);
+    let load = run_closed_loop(&client, listen, 64, total, Duration::from_secs(0), false);
+    let controller = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        c_jitter.store(400, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        c_jitter.store(0, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let sampler = sample_traffic_shares(
+        &backends,
+        Duration::from_secs(1),
+        10,
+        "failure_patterns/randomized_jitter",
+    );
+    tokio::join!(load, controller, sampler);
+    teardown_pattern_harness(child, backends).await;
+    println!();
+}
+
+async fn failure_pattern_slow_fraction(pct: u64) {
+    println!("--- pattern: fractional slow requests (backend C: {pct}% of requests take +2000ms for 5s) ---");
+    let (backends, child, listen, client) = spawn_pattern_harness(10).await;
+    let c_slow_pct = Arc::clone(&backends[2].slow_pct);
+    backends[2].slow_extra_ms.store(2000, Ordering::Relaxed);
+    let total = Duration::from_secs(9);
+    let load = run_closed_loop(&client, listen, 64, total, Duration::from_secs(0), false);
+    let controller = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        c_slow_pct.store(pct, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        c_slow_pct.store(0, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    let scenario = format!("failure_patterns/slow_fraction_{pct}pct");
+    let sampler = sample_traffic_shares(&backends, Duration::from_secs(1), 9, &scenario);
+    tokio::join!(load, controller, sampler);
+    teardown_pattern_harness(child, backends).await;
+    println!();
+}
+
+async fn failure_pattern_full_stall() {
+    println!("--- pattern: full backend stall (backend C stops responding for 6s: delay=4000ms), then recovers ---");
+    let (backends, child, listen, client) = spawn_pattern_harness(10).await;
+    let c_delay = Arc::clone(&backends[2].delay_ms);
+    let total = Duration::from_secs(12);
+    let load = run_closed_loop(&client, listen, 64, total, Duration::from_secs(0), false);
+    let controller = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        c_delay.store(4000, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        c_delay.store(10, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    };
+    let sampler = sample_traffic_shares(
+        &backends,
+        Duration::from_secs(1),
+        12,
+        "failure_patterns/full_stall",
+    );
+    tokio::join!(load, controller, sampler);
+    teardown_pattern_harness(child, backends).await;
+    println!();
+}
+
+async fn heterogeneous_failure_patterns() {
+    println!(
+        "=== Adaptive routing under varied failure patterns (peak_ewma_p2c; backend C is degraded each time, A/B/D stay at 10ms) ==="
+    );
+    println!(
+        "      (the sudden-step pattern, C: 10ms -> 300ms -> 10ms, is already covered by --heterogeneous's dynamic scenario; not re-run here)"
+    );
+    println!();
+    failure_pattern_gradual_ramp().await;
+    failure_pattern_periodic_spikes().await;
+    failure_pattern_randomized_jitter().await;
+    for pct in [1u64, 10, 50] {
+        failure_pattern_slow_fraction(pct).await;
+    }
+    failure_pattern_full_stall().await;
+}
+
+const CONCURRENCY_SIGNAL_FAST_MS: u64 = 10;
+const CONCURRENCY_SIGNAL_SLOW_MS: u64 = 150;
+const CONCURRENCY_SIGNAL_COEFF_MS: u64 = 3;
+const CONCURRENCY_SIGNAL_STRATEGIES: &[&str] =
+    &["round_robin", "least_connections", "peak_ewma_p2c"];
+
+async fn heterogeneous_concurrency_signal() {
+    println!(
+        "=== Heterogeneous backends: latency-matched, concurrency-sensitivity-varied (A=fast/low-load B=fast/high-load C=slow/low-load D=slow/high-load) ==="
+    );
+    println!(
+        "    A/C base delay never changes with load; B/D add {}ms of extra delay per concurrently in-flight request on top of their base delay, on the backend itself -- a backend that visibly slows down under its own concurrent load, independent of any routing choice.",
+        CONCURRENCY_SIGNAL_COEFF_MS
+    );
+    println!(
+        "    A/B base delay = {}ms, C/D base delay = {}ms.",
+        CONCURRENCY_SIGNAL_FAST_MS, CONCURRENCY_SIGNAL_SLOW_MS
+    );
+    println!(
+        "{:<22} | {:>6} | {:>6} | {:>6} | {:>6} | {:>10} | {:>7} | {:>7} | {:>7} | {:>7}",
+        "strategy",
+        "A req%",
+        "B req%",
+        "C req%",
+        "D req%",
+        "req/s",
+        "p50ms",
+        "p95ms",
+        "p99ms",
+        "p999ms"
+    );
+    let client = build_client();
+    for strategy in CONCURRENCY_SIGNAL_STRATEGIES {
+        let a = spawn_backend(CONCURRENCY_SIGNAL_FAST_MS).await;
+        let b = spawn_backend(CONCURRENCY_SIGNAL_FAST_MS).await;
+        b.concurrency_coeff_ms
+            .store(CONCURRENCY_SIGNAL_COEFF_MS, Ordering::Relaxed);
+        let c = spawn_backend(CONCURRENCY_SIGNAL_SLOW_MS).await;
+        let d = spawn_backend(CONCURRENCY_SIGNAL_SLOW_MS).await;
+        d.concurrency_coeff_ms
+            .store(CONCURRENCY_SIGNAL_COEFF_MS, Ordering::Relaxed);
+        let backends = vec![a, b, c, d];
+        let addrs: Vec<SocketAddr> = backends.iter().map(|be| be.addr).collect();
+        let (mut child, listen) = start_lb_server_for(strategy, &addrs).await;
+
+        let result = run_closed_loop(
+            &client,
+            listen,
+            64,
+            Duration::from_secs(8),
+            Duration::from_secs(2),
+            false,
+        )
+        .await;
+
+        let counts: Vec<u64> = backends
+            .iter()
+            .map(|b| b.count.load(Ordering::Relaxed))
+            .collect();
+        let total: u64 = counts.iter().sum::<u64>().max(1);
+        let pct: Vec<f64> = counts
+            .iter()
+            .map(|c| 100.0 * *c as f64 / total as f64)
+            .collect();
+        let mut sorted = result.latencies_ns.clone();
+        sorted.sort_unstable();
+        let rps = result.total as f64 / result.wall.as_secs_f64();
+        let scenario = format!("concurrency_signal/{strategy}");
+        results().record(&scenario, "a_req_pct", pct[0]);
+        results().record(&scenario, "b_req_pct", pct[1]);
+        results().record(&scenario, "c_req_pct", pct[2]);
+        results().record(&scenario, "d_req_pct", pct[3]);
+        results().record(&scenario, "req_s", rps);
+        results().record(&scenario, "p50_ms", ms(percentile(&sorted, 0.50)));
+        results().record(&scenario, "p95_ms", ms(percentile(&sorted, 0.95)));
+        results().record(&scenario, "p99_ms", ms(percentile(&sorted, 0.99)));
+        results().record(&scenario, "p999_ms", ms(percentile(&sorted, 0.999)));
+        println!(
+            "{:<22} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>10.0} | {:>7.2} | {:>7.2} | {:>7.2} | {:>7.2}",
+            strategy,
+            pct[0],
+            pct[1],
+            pct[2],
+            pct[3],
+            rps,
+            ms(percentile(&sorted, 0.50)),
+            ms(percentile(&sorted, 0.95)),
+            ms(percentile(&sorted, 0.99)),
+            ms(percentile(&sorted, 0.999)),
+        );
+
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        for backend in backends {
+            backend.handle.abort();
+        }
+    }
+    println!();
+    println!(
+        "    round_robin ignores both latency and pending load, so its split is the baseline for \"no adaptive signal at all\"."
+    );
+    println!(
+        "    least_connections uses pending load only (no latency); peak_ewma_p2c uses both -- comparing B's share across the three shows whether the pending-load signal is doing independent work."
+    );
+    println!();
+}
+
 async fn spawn_amplification_backend(fail_pct: u64) -> (SocketAddr, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1933,6 +2291,16 @@ async fn main() {
             print_methodology();
             convergence_characterization().await;
             Some(("convergence", vec![]))
+        }
+        Cli::FailurePatterns => {
+            print_methodology();
+            heterogeneous_failure_patterns().await;
+            Some(("failure-patterns", vec![]))
+        }
+        Cli::ConcurrencySignal => {
+            print_methodology();
+            heterogeneous_concurrency_signal().await;
+            Some(("concurrency-signal", vec![]))
         }
         Cli::Run { strategy } => {
             print_methodology();
