@@ -241,17 +241,18 @@ impl BackendPool {
     /// (nothing to decrement) if `id` is unknown -- callers should not have
     /// to check `backend()` first just to track load.
     pub fn track_active(self: &Arc<Self>, id: &BackendId) -> ActiveConnGuard {
-        if let Some(s) = self.inner.load().states.get(id) {
+        let state = self.inner.load().states.get(id).cloned();
+        if let Some(s) = &state {
             s.active_conns.fetch_add(1, Ordering::SeqCst);
         }
-        ActiveConnGuard {
-            pool: Arc::clone(self),
-            id: id.clone(),
-        }
+        ActiveConnGuard { state }
     }
 
     pub fn apply_resolved(&self, backends: Vec<Backend>) {
         let previous = self.inner.load();
+        if resolved_set_unchanged(&previous, &backends) {
+            return;
+        }
         let mut order = Vec::with_capacity(backends.len());
         let mut states = HashMap::with_capacity(backends.len());
         for b in backends {
@@ -287,16 +288,30 @@ impl BackendPool {
     }
 }
 
+fn resolved_set_unchanged(previous: &PoolState, backends: &[Backend]) -> bool {
+    if previous.order.len() != backends.len() {
+        return false;
+    }
+    let mut new_sorted: Vec<&Backend> = backends.iter().collect();
+    new_sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut prev_sorted: Vec<&Backend> = previous
+        .order
+        .iter()
+        .filter_map(|id| previous.states.get(id).map(|s| &s.backend))
+        .collect();
+    prev_sorted.sort_by(|a, b| a.id.cmp(&b.id));
+    new_sorted == prev_sorted
+}
+
 /// Returned by `BackendPool::track_active`. Decrements the count on `Drop`
 /// so it cannot be leaked by an early return from the caller's scope.
 pub struct ActiveConnGuard {
-    pool: Arc<BackendPool>,
-    id: BackendId,
+    state: Option<Arc<BackendState>>,
 }
 
 impl Drop for ActiveConnGuard {
     fn drop(&mut self) {
-        if let Some(s) = self.pool.inner.load().states.get(&self.id) {
+        if let Some(s) = &self.state {
             s.active_conns.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -588,6 +603,62 @@ mod tests {
     }
 
     #[test]
+    fn apply_resolved_with_a_real_membership_change_bumps_the_version() {
+        let pool = pool_of(&["b1", "b2"]);
+        let before = pool.version();
+
+        pool.apply_resolved(vec![Backend::new(
+            "b1",
+            "127.0.0.1:9000".parse().unwrap(),
+            1,
+            None,
+        )]);
+
+        assert_eq!(pool.version(), before + 1);
+    }
+
+    #[test]
+    fn apply_resolved_with_the_identical_set_does_not_bump_the_version() {
+        let pool = pool_of(&["b1", "b2"]);
+        let before = pool.version();
+
+        pool.apply_resolved(vec![
+            Backend::new("b1", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("b2", "127.0.0.1:9000".parse().unwrap(), 1, None),
+        ]);
+
+        assert_eq!(pool.version(), before);
+    }
+
+    #[test]
+    fn apply_resolved_with_the_identical_set_in_a_different_order_does_not_bump_the_version() {
+        let pool = pool_of(&["b1", "b2"]);
+        let before = pool.version();
+
+        pool.apply_resolved(vec![
+            Backend::new("b2", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("b1", "127.0.0.1:9000".parse().unwrap(), 1, None),
+        ]);
+
+        assert_eq!(pool.version(), before);
+    }
+
+    #[test]
+    fn apply_resolved_with_a_changed_weight_bumps_the_version() {
+        let pool = pool_of(&["b1"]);
+        let before = pool.version();
+
+        pool.apply_resolved(vec![Backend::new(
+            "b1",
+            "127.0.0.1:9000".parse().unwrap(),
+            2,
+            None,
+        )]);
+
+        assert_eq!(pool.version(), before + 1);
+    }
+
+    #[test]
     fn track_active_increments_and_decrements_on_drop() {
         let pool = Arc::new(pool_of(&["b1"]));
         let id = BackendId::new("b1");
@@ -619,6 +690,28 @@ mod tests {
         )]);
 
         assert_eq!(pool.active_count(&id), 1);
+    }
+
+    #[test]
+    fn a_guard_outliving_a_remove_then_readd_cycle_does_not_corrupt_the_new_backends_count() {
+        let pool = Arc::new(pool_of(&["b1"]));
+        let id = BackendId::new("b1");
+        let guard = pool.track_active(&id);
+        assert_eq!(pool.active_count(&id), 1);
+
+        pool.apply_resolved(vec![]);
+        assert_eq!(pool.active_count(&id), 0);
+
+        pool.apply_resolved(vec![Backend::new(
+            "b1",
+            "127.0.0.1:9000".parse().unwrap(),
+            1,
+            None,
+        )]);
+        assert_eq!(pool.active_count(&id), 0);
+
+        drop(guard);
+        assert_eq!(pool.active_count(&id), 0);
     }
 
     #[test]
