@@ -43,6 +43,7 @@ enum Cli {
     Heterogeneous,
     RetryAmplification,
     Reliability,
+    Convergence,
     Help,
 }
 
@@ -55,6 +56,7 @@ fn parse_args(args: &[String]) -> Cli {
         [flag] if flag == "--heterogeneous" => Cli::Heterogeneous,
         [flag] if flag == "--retry-amplification" => Cli::RetryAmplification,
         [flag] if flag == "--reliability" => Cli::Reliability,
+        [flag] if flag == "--convergence" => Cli::Convergence,
         [flag] if flag == "--help" || flag == "-h" => Cli::Help,
         [flag, name] if flag == "--strategy" => {
             match STRATEGIES.iter().copied().find(|s| *s == name.as_str()) {
@@ -76,6 +78,7 @@ fn print_help() {
     println!("    lb-bench-e2e --heterogeneous");
     println!("    lb-bench-e2e --retry-amplification");
     println!("    lb-bench-e2e --reliability");
+    println!("    lb-bench-e2e --convergence");
     println!("    lb-bench-e2e --help");
     println!();
     println!("STRATEGY one of: {}", STRATEGIES.join(", "));
@@ -1050,6 +1053,289 @@ async fn heterogeneous_dynamic_adaptation() {
     }
 }
 
+fn write_convergence_config(
+    path: &Path,
+    listen: SocketAddr,
+    admin_listen: SocketAddr,
+    backends: &[SocketAddr],
+    strategy: &str,
+) {
+    let backends_toml: String = backends
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            format!("  [[listeners.backends]]\n  id = \"b{i}\"\n  address = \"{addr}\"\n\n")
+        })
+        .collect();
+    let toml = format!(
+        r#"
+[admin]
+listen = "{admin_listen}"
+
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+max_connections = 1000000
+max_connections_per_ip = 1000000
+
+{backends_toml}
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 1000
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 10000000
+  burst = 10000000
+
+  [listeners.load_balancing]
+  strategy = "{strategy}"
+"#
+    );
+    std::fs::write(path, toml).expect("write config");
+}
+
+const CONVERGENCE_NEW_BACKEND_DELAY_MS: u64 = 5;
+
+fn uniformity_verdict(pct: &[f64; 4]) -> &'static str {
+    let avg = pct.iter().sum::<f64>() / 4.0;
+    let max_dev = pct.iter().map(|p| (p - avg).abs()).fold(0.0_f64, f64::max);
+    let fast_share = pct[0] + pct[1];
+    let slow_share = pct[2] + pct[3];
+    if max_dev < 5.0 {
+        "still close to uniform/random across all four backends"
+    } else if fast_share > slow_share * 1.5 {
+        "clearly converged toward favoring the faster backends (A, B)"
+    } else {
+        "partially skewed toward the faster backends, not yet fully converged"
+    }
+}
+
+async fn run_convergence_checkpoints(
+    client: &ProxyClient,
+    target: SocketAddr,
+    backends: &[SpawnedBackend],
+    checkpoints: &[u64],
+    concurrency: usize,
+) {
+    let final_target = *checkpoints.last().unwrap();
+    let total = Arc::new(AtomicU64::new(0));
+    let uri: hyper::Uri = format!("http://{target}/").parse().unwrap();
+
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let client = client.clone();
+        let uri = uri.clone();
+        let total = Arc::clone(&total);
+        handles.push(tokio::spawn(async move {
+            while total.load(Ordering::Relaxed) < final_target {
+                let req = Request::builder()
+                    .uri(uri.clone())
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                if let Ok(resp) = client.request(req).await {
+                    let (_, body) = resp.into_parts();
+                    let _ = body.collect().await;
+                }
+                total.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    println!(
+        "      {:>7} | {:>6} | {:>6} | {:>6} | {:>6} | verdict",
+        "at req", "A req%", "B req%", "C req%", "D req%"
+    );
+    let mut next = 0usize;
+    while next < checkpoints.len() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if total.load(Ordering::Relaxed) < checkpoints[next] {
+            continue;
+        }
+        let counts: Vec<u64> = backends
+            .iter()
+            .map(|b| b.count.load(Ordering::Relaxed))
+            .collect();
+        let sum: u64 = counts.iter().sum::<u64>().max(1);
+        let pct = [
+            100.0 * counts[0] as f64 / sum as f64,
+            100.0 * counts[1] as f64 / sum as f64,
+            100.0 * counts[2] as f64 / sum as f64,
+            100.0 * counts[3] as f64 / sum as f64,
+        ];
+        let verdict = uniformity_verdict(&pct);
+        let scenario = format!("convergence/checkpoint_{}", checkpoints[next]);
+        results().record(&scenario, "a_req_pct", pct[0]);
+        results().record(&scenario, "b_req_pct", pct[1]);
+        results().record(&scenario, "c_req_pct", pct[2]);
+        results().record(&scenario, "d_req_pct", pct[3]);
+        println!(
+            "      {:>7} | {:>5.1}% | {:>5.1}% | {:>5.1}% | {:>5.1}% | {}",
+            checkpoints[next], pct[0], pct[1], pct[2], pct[3], verdict
+        );
+        next += 1;
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
+async fn run_discovery_phase(
+    client: &ProxyClient,
+    target: SocketAddr,
+    backends: &[SpawnedBackend],
+    concurrency: usize,
+    extra_requests: u64,
+    window: u64,
+) {
+    let total = Arc::new(AtomicU64::new(0));
+    let uri: hyper::Uri = format!("http://{target}/").parse().unwrap();
+
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let client = client.clone();
+        let uri = uri.clone();
+        let total = Arc::clone(&total);
+        handles.push(tokio::spawn(async move {
+            while total.load(Ordering::Relaxed) < extra_requests {
+                let req = Request::builder()
+                    .uri(uri.clone())
+                    .body(Full::new(Bytes::new()))
+                    .unwrap();
+                if let Ok(resp) = client.request(req).await {
+                    let (_, body) = resp.into_parts();
+                    let _ = body.collect().await;
+                }
+                total.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    println!("      {:>10} | {:>10}", "since undrain", "E (new) req%");
+    let mut last_e = 0u64;
+    let mut last_total = 0u64;
+    let mut windows: Vec<f64> = Vec::new();
+    let mut window_ends: Vec<u64> = Vec::new();
+    loop {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let t = total.load(Ordering::Relaxed);
+        if t < last_total + window && t < extra_requests {
+            continue;
+        }
+        let e_now = backends[4].count.load(Ordering::Relaxed);
+        let delta_e = e_now.saturating_sub(last_e);
+        let delta_total = t.saturating_sub(last_total).max(1);
+        let e_share = 100.0 * delta_e as f64 / delta_total as f64;
+        println!("      {:>10} | {:>9.1}%", t, e_share);
+        results().record(
+            &format!("convergence/discovery/at_req={t}"),
+            "e_req_pct",
+            e_share,
+        );
+        windows.push(e_share);
+        window_ends.push(t);
+        last_e = e_now;
+        last_total = t;
+        if t >= extra_requests {
+            break;
+        }
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    if let Some(steady) = windows.last().copied() {
+        let mut stabilized_at = None;
+        for i in 0..windows.len() {
+            if windows[i..]
+                .iter()
+                .all(|share| (share - steady).abs() <= 3.0)
+            {
+                stabilized_at = Some(window_ends[i]);
+                break;
+            }
+        }
+        match stabilized_at {
+            Some(req) => println!(
+                "      -- backend E's traffic share first settled within 3pp of its steady-state ({steady:.1}%) by request #{req} after being undrained --"
+            ),
+            None => println!(
+                "      -- backend E's traffic share ({steady:.1}% at the end) never settled within 3pp of itself for two consecutive windows --"
+            ),
+        }
+        results().record("convergence/discovery", "steady_state_e_req_pct", steady);
+    }
+}
+
+async fn convergence_characterization() {
+    println!(
+        "=== Cold-start convergence: peak_ewma_p2c from zero samples against the heterogeneous profile (A={}ms B={}ms C={}ms D={}ms) ===",
+        HETEROGENEOUS_DELAYS_MS[0],
+        HETEROGENEOUS_DELAYS_MS[1],
+        HETEROGENEOUS_DELAYS_MS[2],
+        HETEROGENEOUS_DELAYS_MS[3]
+    );
+    let mut backends = Vec::with_capacity(5);
+    for delay in HETEROGENEOUS_DELAYS_MS {
+        backends.push(spawn_backend(delay).await);
+    }
+    backends.push(spawn_backend(CONVERGENCE_NEW_BACKEND_DELAY_MS).await);
+    let addrs: Vec<SocketAddr> = backends.iter().map(|b| b.addr).collect();
+
+    let listen_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = listen_listener.local_addr().unwrap();
+    drop(listen_listener);
+    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    drop(admin_listener);
+
+    let config_dir = std::env::temp_dir().join("lb-bench-e2e-convergence");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    write_convergence_config(&config_path, listen, admin_addr, &addrs, "peak_ewma_p2c");
+
+    let mut child = spawn_lb_server(&config_path).await;
+    wait_until_listening(listen).await;
+    wait_until_listening(admin_addr).await;
+    let client = build_client();
+
+    let drained = post_admin(&client, admin_addr, "/backends/web/b4/drain").await;
+    println!(
+        "      backend E ({}ms, id=b4) added to the pool but drained -- excluded from routing until discovery phase: {}",
+        CONVERGENCE_NEW_BACKEND_DELAY_MS,
+        if drained { "ok" } else { "FAILED" }
+    );
+    println!();
+
+    let checkpoints = [100u64, 1000, 10_000];
+    run_convergence_checkpoints(&client, listen, &backends, &checkpoints, 16).await;
+    println!();
+
+    println!(
+        "=== Discovery speed: backend E ({}ms) undrained into an already-warmed-up pool ===",
+        CONVERGENCE_NEW_BACKEND_DELAY_MS
+    );
+    let undrained = post_admin(&client, admin_addr, "/backends/web/b4/undrain").await;
+    println!(
+        "      backend E undrained: {}",
+        if undrained { "ok" } else { "FAILED" }
+    );
+    run_discovery_phase(&client, listen, &backends, 16, 20_000, 500).await;
+    println!();
+
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    for backend in backends {
+        backend.handle.abort();
+    }
+}
+
 async fn spawn_amplification_backend(fail_pct: u64) -> (SocketAddr, Arc<AtomicU64>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1259,6 +1545,22 @@ async fn fetch_admin_text(client: &ProxyClient, admin_addr: SocketAddr) -> Optio
     }
     let bytes = body.collect().await.ok()?.to_bytes();
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+async fn post_admin(client: &ProxyClient, admin_addr: SocketAddr, path: &str) -> bool {
+    let uri: hyper::Uri = match format!("http://{admin_addr}{path}").parse() {
+        Ok(uri) => uri,
+        Err(_) => return false,
+    };
+    let req = match Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(Full::new(Bytes::new()))
+    {
+        Ok(req) => req,
+        Err(_) => return false,
+    };
+    matches!(client.request(req).await, Ok(resp) if resp.status().is_success())
 }
 
 fn extract_gauge(text: &str, key: &str) -> Option<i64> {
@@ -1626,6 +1928,11 @@ async fn main() {
             print_methodology();
             reliability_characterization().await;
             Some(("reliability", vec![]))
+        }
+        Cli::Convergence => {
+            print_methodology();
+            convergence_characterization().await;
+            Some(("convergence", vec![]))
         }
         Cli::Run { strategy } => {
             print_methodology();
