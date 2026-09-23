@@ -8,11 +8,10 @@ pub use handles::{
 
 /// Re-exported so consumer crates can hold metric handles without taking a
 /// direct dependency on the metrics backend.
-pub use prometheus::{IntCounter, IntGauge};
+pub use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts};
 
 use prometheus::{
-    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntGaugeVec, Registry, TextEncoder,
 };
 
 /// Process-wide metric families. Per-listener and per-backend handles are
@@ -37,7 +36,7 @@ pub struct Metrics {
     ratelimit_tracked_keys: IntGaugeVec,
     pub cluster_auth_failures: IntCounterVec,
     ratelimit_cluster_convergence_bound: IntGaugeVec,
-    pub cluster_future_skew_rejections: IntCounter,
+    pub cluster_future_skew_rejections: IntCounterVec,
 
     // TLS (Phase 6)
     tls_handshakes: IntCounterVec,
@@ -185,9 +184,12 @@ impl Metrics {
             ),
             &["listener"],
         )?;
-        let cluster_future_skew_rejections = IntCounter::new(
-            "lb_cluster_future_skew_rejections_total",
-            "Peer-sync cells rejected at merge time for exceeding the future-clock-skew tolerance",
+        let cluster_future_skew_rejections = IntCounterVec::new(
+            Opts::new(
+                "lb_cluster_future_skew_rejections_total",
+                "Peer-sync cells rejected at merge time for exceeding the future-clock-skew tolerance",
+            ),
+            &["peer"],
         )?;
         // `outcome` separates "we are being probed" (failed) from "clients
         // cannot finish" (timeout) from "our configuration is wrong" (no
@@ -687,13 +689,24 @@ mod tests {
     }
 
     #[test]
-    fn cluster_future_skew_rejections_is_exposed() {
+    fn cluster_future_skew_rejections_is_exposed_per_peer() {
         let metrics = Metrics::new().unwrap();
-        metrics.cluster_future_skew_rejections.inc();
-        metrics.cluster_future_skew_rejections.inc_by(2);
+        metrics
+            .cluster_future_skew_rejections
+            .with_label_values(&["n1"])
+            .inc();
+        metrics
+            .cluster_future_skew_rejections
+            .with_label_values(&["n1"])
+            .inc_by(2);
+        metrics
+            .cluster_future_skew_rejections
+            .with_label_values(&["n2"])
+            .inc();
 
         let text = metrics.gather_text();
-        assert!(text.contains("lb_cluster_future_skew_rejections_total 3"));
+        assert!(text.contains("lb_cluster_future_skew_rejections_total{peer=\"n1\"} 3"));
+        assert!(text.contains("lb_cluster_future_skew_rejections_total{peer=\"n2\"} 1"));
     }
 
     /// A rising `rejected` count means renewal is broken while the

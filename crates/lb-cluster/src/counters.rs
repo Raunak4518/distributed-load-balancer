@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use lb_metrics::IntCounter;
+use lb_metrics::IntCounterVec;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -20,7 +20,7 @@ pub struct CounterStore {
     window_secs: u64,
     keys: DashMap<String, KeyCounts>,
     snapshot_cursor: AtomicUsize,
-    skew_rejections: Option<IntCounter>,
+    skew_rejections: Option<IntCounterVec>,
 }
 
 pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
@@ -65,7 +65,7 @@ impl CounterStore {
         }
     }
 
-    pub fn with_skew_rejection_counter(mut self, counter: IntCounter) -> Self {
+    pub fn with_skew_rejection_counter(mut self, counter: IntCounterVec) -> Self {
         self.skew_rejections = Some(counter);
         self
     }
@@ -143,12 +143,12 @@ impl CounterStore {
             .filter(|(epoch, _)| *epoch <= max_epoch)
             .count();
         if in_window == 0 {
-            self.record_skew_rejections(buckets.len());
+            self.record_skew_rejections(node_id, buckets.len());
             return;
         }
         if let Some(mut counts) = self.keys.get_mut(key) {
             let rejected = Self::merge_into(&mut counts, node_id, buckets, max_epoch);
-            self.record_skew_rejections(rejected);
+            self.record_skew_rejections(node_id, rejected);
             return;
         }
         if self.keys.len() >= MAX_TRACKED_KEYS {
@@ -156,15 +156,17 @@ impl CounterStore {
         }
         let mut counts = self.keys.entry(key.to_string()).or_default();
         let rejected = Self::merge_into(&mut counts, node_id, buckets, max_epoch);
-        self.record_skew_rejections(rejected);
+        self.record_skew_rejections(node_id, rejected);
     }
 
-    fn record_skew_rejections(&self, rejected: usize) {
+    fn record_skew_rejections(&self, node_id: &str, rejected: usize) {
         if rejected == 0 {
             return;
         }
         if let Some(counter) = &self.skew_rejections {
-            counter.inc_by(rejected as u64);
+            counter
+                .with_label_values(&[node_id])
+                .inc_by(rejected as u64);
         }
     }
 
@@ -483,26 +485,51 @@ mod tests {
 
     #[test]
     fn a_persistently_skewed_peer_increments_the_rejection_counter_each_time() {
-        let counter = IntCounter::new("test_skew_rejections", "test").unwrap();
+        let counter = IntCounterVec::new(
+            lb_metrics::Opts::new("test_skew_rejections", "test"),
+            &["peer"],
+        )
+        .unwrap();
         let store = CounterStore::new(10).with_skew_rejection_counter(counter.clone());
 
         store.merge("k", "n1", &[(NOW + 1_000_000, 5)], NOW);
-        assert_eq!(counter.get(), 1);
+        assert_eq!(counter.with_label_values(&["n1"]).get(), 1);
 
         store.merge("k", "n1", &[(NOW + 1_000_000, 5)], NOW);
-        assert_eq!(counter.get(), 2);
+        assert_eq!(counter.with_label_values(&["n1"]).get(), 2);
 
         store.merge("k", "n1", &[(NOW + 1_000_000, 5)], NOW);
-        assert_eq!(counter.get(), 3);
+        assert_eq!(counter.with_label_values(&["n1"]).get(), 3);
+    }
+
+    #[test]
+    fn skew_rejections_from_different_peers_are_tracked_independently() {
+        let counter = IntCounterVec::new(
+            lb_metrics::Opts::new("test_skew_rejections_multi", "test"),
+            &["peer"],
+        )
+        .unwrap();
+        let store = CounterStore::new(10).with_skew_rejection_counter(counter.clone());
+
+        store.merge("k", "n1", &[(NOW + 1_000_000, 5)], NOW);
+        store.merge("k", "n2", &[(NOW + 1_000_000, 5)], NOW);
+        store.merge("k", "n2", &[(NOW + 1_000_000, 5)], NOW);
+
+        assert_eq!(counter.with_label_values(&["n1"]).get(), 1);
+        assert_eq!(counter.with_label_values(&["n2"]).get(), 2);
     }
 
     #[test]
     fn a_cell_within_tolerance_does_not_increment_the_rejection_counter() {
-        let counter = IntCounter::new("test_skew_rejections_ok", "test").unwrap();
+        let counter = IntCounterVec::new(
+            lb_metrics::Opts::new("test_skew_rejections_ok", "test"),
+            &["peer"],
+        )
+        .unwrap();
         let store = CounterStore::new(10).with_skew_rejection_counter(counter.clone());
 
         store.merge("k", "n1", &[(NOW + 2, 5)], NOW);
-        assert_eq!(counter.get(), 0);
+        assert_eq!(counter.with_label_values(&["n1"]).get(), 0);
     }
 
     #[test]
