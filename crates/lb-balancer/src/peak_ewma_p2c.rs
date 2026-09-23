@@ -1,7 +1,7 @@
 use lb_core::{BackendId, BackendPool, Clock, LoadBalancer};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 const DEFAULT_DECAY: Duration = Duration::from_secs(10);
@@ -11,6 +11,7 @@ const NO_SAMPLE: u64 = u64::MAX;
 struct EwmaEntry {
     estimate_nanos: AtomicU64,
     last_update_nanos: AtomicU64,
+    update_lock: Mutex<()>,
 }
 
 /// Power-of-two-choices load balancing weighted by a decaying latency
@@ -149,12 +150,14 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
         let entry = entries.entry(id.clone()).or_insert_with(|| EwmaEntry {
             estimate_nanos: AtomicU64::new(NO_SAMPLE),
             last_update_nanos: AtomicU64::new(0),
+            update_lock: Mutex::new(()),
         });
         store_sample(entry, sample_nanos, now_nanos, self.decay);
     }
 }
 
 fn store_sample(entry: &EwmaEntry, sample_nanos: u64, now_nanos: u64, decay: Duration) {
+    let _guard = entry.update_lock.lock().unwrap();
     let prev = entry.estimate_nanos.load(Ordering::Relaxed);
     let new_estimate = if prev == NO_SAMPLE {
         sample_nanos
@@ -471,6 +474,41 @@ mod tests {
             (60_000_000..=61_000_000).contains(&estimate),
             "at a 10s decay constant a 5s gap gives weight=exp(-0.5)=~0.6065, so 100ms of \
              prior estimate weighted against a 0ns sample should land around 60.65ms, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn heavy_concurrent_record_latency_on_one_backend_never_panics_or_leaves_a_stale_pairing() {
+        use lb_core::SystemClock;
+        use std::thread;
+
+        let lb = Arc::new(PeakEwmaP2c::new(SystemClock));
+        let id = BackendId::new("b1");
+        let low = Duration::from_millis(1).as_nanos() as u64;
+        let high = Duration::from_millis(100).as_nanos() as u64;
+
+        let handles: Vec<_> = (0..16)
+            .map(|t| {
+                let lb = Arc::clone(&lb);
+                let id = id.clone();
+                thread::spawn(move || {
+                    for i in 0..500u64 {
+                        let sample = if (t + i) % 2 == 0 { low } else { high };
+                        lb.record_latency(&id, Duration::from_nanos(sample));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let estimate = lb.estimate_nanos(&id);
+        assert!(
+            (low..=high).contains(&estimate),
+            "8000 concurrent updates from 16 real threads, every sample in [{low}, {high}], \
+             produced an out-of-band estimate {estimate} -- a torn read/compute/write would \
+             surface here as a corrupted value, not just a lost update"
         );
     }
 
