@@ -29,28 +29,34 @@ struct BackendState {
 
 struct PoolState {
     order: Vec<BackendId>,
+    ordered: Vec<Arc<BackendState>>,
     states: HashMap<BackendId, Arc<BackendState>>,
 }
 
 impl PoolState {
     fn from_backends(backends: Vec<Backend>) -> Self {
         let mut order = Vec::with_capacity(backends.len());
+        let mut ordered = Vec::with_capacity(backends.len());
         let mut states = HashMap::with_capacity(backends.len());
         for b in backends {
-            order.push(b.id.clone());
-            states.insert(
-                b.id.clone(),
-                Arc::new(BackendState {
-                    backend: b,
-                    active_healthy: AtomicBool::new(true),
-                    circuit_open: AtomicBool::new(false),
-                    manually_drained: AtomicBool::new(false),
-                    outlier_ejected: AtomicBool::new(false),
-                    active_conns: AtomicUsize::new(0),
-                }),
-            );
+            let id = b.id.clone();
+            let state = Arc::new(BackendState {
+                backend: b,
+                active_healthy: AtomicBool::new(true),
+                circuit_open: AtomicBool::new(false),
+                manually_drained: AtomicBool::new(false),
+                outlier_ejected: AtomicBool::new(false),
+                active_conns: AtomicUsize::new(0),
+            });
+            order.push(id.clone());
+            ordered.push(Arc::clone(&state));
+            states.insert(id, state);
         }
-        PoolState { order, states }
+        PoolState {
+            order,
+            ordered,
+            states,
+        }
     }
 }
 
@@ -194,28 +200,30 @@ impl BackendPool {
     }
 
     pub fn is_eligible(&self, id: &BackendId) -> bool {
-        self.inner.load().states.get(id).is_some_and(|s| {
-            s.active_healthy.load(Ordering::SeqCst)
-                && !s.circuit_open.load(Ordering::SeqCst)
-                && !s.manually_drained.load(Ordering::SeqCst)
-                && !s.outlier_ejected.load(Ordering::SeqCst)
-        })
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .is_some_and(|s| state_is_eligible(s))
     }
 
     pub fn eligible_backends(&self) -> Vec<BackendId> {
-        let snapshot = self.inner.load();
-        snapshot
-            .order
+        self.inner
+            .load()
+            .ordered
             .iter()
-            .filter(|id| {
-                snapshot.states.get(*id).is_some_and(|s| {
-                    s.active_healthy.load(Ordering::SeqCst)
-                        && !s.circuit_open.load(Ordering::SeqCst)
-                        && !s.manually_drained.load(Ordering::SeqCst)
-                        && !s.outlier_ejected.load(Ordering::SeqCst)
-                })
-            })
-            .cloned()
+            .filter(|s| state_is_eligible(s))
+            .map(|s| s.backend.id.clone())
+            .collect()
+    }
+
+    pub fn eligible_with_weights(&self) -> Vec<(BackendId, u32)> {
+        self.inner
+            .load()
+            .ordered
+            .iter()
+            .filter(|s| state_is_eligible(s))
+            .map(|s| (s.backend.id.clone(), s.backend.weight))
             .collect()
     }
 
@@ -254,6 +262,7 @@ impl BackendPool {
             return;
         }
         let mut order = Vec::with_capacity(backends.len());
+        let mut ordered = Vec::with_capacity(backends.len());
         let mut states = HashMap::with_capacity(backends.len());
         for b in backends {
             order.push(b.id.clone());
@@ -281,11 +290,23 @@ impl BackendPool {
                     active_conns: AtomicUsize::new(0),
                 }),
             };
+            ordered.push(Arc::clone(&state));
             states.insert(order.last().unwrap().clone(), state);
         }
-        self.inner.store(Arc::new(PoolState { order, states }));
+        self.inner.store(Arc::new(PoolState {
+            order,
+            ordered,
+            states,
+        }));
         self.version.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+fn state_is_eligible(s: &BackendState) -> bool {
+    s.active_healthy.load(Ordering::SeqCst)
+        && !s.circuit_open.load(Ordering::SeqCst)
+        && !s.manually_drained.load(Ordering::SeqCst)
+        && !s.outlier_ejected.load(Ordering::SeqCst)
 }
 
 fn resolved_set_unchanged(previous: &PoolState, backends: &[Backend]) -> bool {

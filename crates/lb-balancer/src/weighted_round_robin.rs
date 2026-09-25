@@ -32,19 +32,23 @@ impl WeightedRoundRobin {
 
 impl LoadBalancer for WeightedRoundRobin {
     fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
-        let mut expanded = Vec::new();
-        for id in pool.eligible_backends() {
-            let weight = pool.backend(&id).map(|b| b.weight).unwrap_or(1);
-            let weight = weight.min(MAX_WEIGHT);
-            for _ in 0..weight {
-                expanded.push(id.clone());
-            }
-        }
-        if expanded.is_empty() {
+        let weighted: Vec<(BackendId, usize)> = pool
+            .eligible_with_weights()
+            .into_iter()
+            .map(|(id, weight)| (id, weight.min(MAX_WEIGHT) as usize))
+            .collect();
+        let total: usize = weighted.iter().map(|(_, w)| *w).sum();
+        if total == 0 {
             return None;
         }
-        let idx = self.cursor.fetch_add(1, Ordering::Relaxed) % expanded.len();
-        Some(expanded[idx].clone())
+        let mut remaining = self.cursor.fetch_add(1, Ordering::Relaxed) % total;
+        for (id, weight) in weighted {
+            if remaining < weight {
+                return Some(id);
+            }
+            remaining -= weight;
+        }
+        None
     }
 }
 
