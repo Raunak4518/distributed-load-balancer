@@ -2891,6 +2891,311 @@ mod tests {
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
+    fn cache_ctx(
+        backend: &Backend,
+        cache: Arc<ResponseCache<FakeClock>>,
+        sticky: Option<StickyRuntime>,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool: Arc::new(BackendPool::new(vec![backend.clone()])),
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky,
+            cache: Some(cache),
+            waf: None,
+            waf_inspect_headers: false,
+            retry_budget: None,
+            circuit_breakers: HashMap::<BackendId, CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: HashMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        })
+    }
+
+    async fn cached_proxy(
+        body: &'static str,
+        extra_headers: &'static [(&'static str, &'static str)],
+        cache: Arc<ResponseCache<FakeClock>>,
+        sticky: Option<StickyRuntime>,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let (backend_addr, count) = spawn_counting_cacheable_backend(body, extra_headers).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let addr = spawn_proxy_listener(cache_ctx(&backend, cache, sticky)).await;
+        (addr, count)
+    }
+
+    async fn cache_send(
+        addr: SocketAddr,
+        method: Method,
+        path_and_query: impl AsRef<str>,
+        host: Option<&str>,
+    ) -> Response<Bytes> {
+        let client = build_client(None, HashMap::new(), false, None);
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("http://{addr}{}", path_and_query.as_ref()));
+        if let Some(host) = host {
+            builder = builder.header(header::HOST, host);
+        }
+        let resp = client
+            .request(builder.body(Full::new(Bytes::new())).unwrap())
+            .await
+            .unwrap();
+        let (parts, body) = resp.into_parts();
+        Response::from_parts(parts, body.collect().await.unwrap().to_bytes())
+    }
+
+    fn backend_hits(count: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_misses_on_one_key_all_get_the_body_and_settle_into_a_hit() {
+        let cache = test_cache();
+        let (addr, count) = cached_proxy("hello", &[], cache.clone(), None).await;
+        let tasks: Vec<_> = (0..16)
+            .map(|_| tokio::spawn(cache_send(addr, Method::GET, "/", None)))
+            .collect();
+        for task in tasks {
+            let resp = task.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.body(), "hello");
+        }
+        let settled = backend_hits(&count);
+        assert!((1..=16).contains(&settled));
+        let stored = cache.accounted_bytes();
+        assert!(stored > 0);
+        assert_eq!(
+            cache_send(addr, Method::GET, "/", None).await.body(),
+            "hello"
+        );
+        assert_eq!(backend_hits(&count), settled);
+        assert_eq!(cache.accounted_bytes(), stored);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_for_distinct_keys_are_each_cached_once() {
+        let cache = test_cache();
+        let (addr, count) = cached_proxy("hello", &[], cache.clone(), None).await;
+        let tasks: Vec<_> = (0..12)
+            .map(|i| tokio::spawn(cache_send(addr, Method::GET, format!("/k{i}"), None)))
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap().body(), "hello");
+        }
+        assert_eq!(backend_hits(&count), 12);
+        for i in 0..12 {
+            cache_send(addr, Method::GET, &format!("/k{i}"), None).await;
+        }
+        assert_eq!(backend_hits(&count), 12);
+    }
+
+    #[tokio::test]
+    async fn different_hosts_on_the_same_path_are_cached_separately() {
+        let (addr, count) = cached_proxy("hello", &[], test_cache(), None).await;
+        cache_send(addr, Method::GET, "/", Some("a.example")).await;
+        cache_send(addr, Method::GET, "/", Some("b.example")).await;
+        assert_eq!(backend_hits(&count), 2);
+        cache_send(addr, Method::GET, "/", Some("a.example")).await;
+        cache_send(addr, Method::GET, "/", Some("b.example")).await;
+        assert_eq!(backend_hits(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn different_query_strings_on_the_same_path_are_cached_separately() {
+        let (addr, count) = cached_proxy("hello", &[], test_cache(), None).await;
+        cache_send(addr, Method::GET, "/q?page=2", None).await;
+        cache_send(addr, Method::GET, "/q?page=3", None).await;
+        cache_send(addr, Method::GET, "/q", None).await;
+        assert_eq!(backend_hits(&count), 3);
+        cache_send(addr, Method::GET, "/q?page=2", None).await;
+        cache_send(addr, Method::GET, "/q?page=3", None).await;
+        cache_send(addr, Method::GET, "/q", None).await;
+        assert_eq!(backend_hits(&count), 3);
+    }
+
+    #[tokio::test]
+    async fn a_post_neither_reads_from_nor_populates_the_get_cache() {
+        let (addr, count) = cached_proxy("hello", &[], test_cache(), None).await;
+        cache_send(addr, Method::GET, "/r", None).await;
+        assert_eq!(backend_hits(&count), 1);
+        cache_send(addr, Method::POST, "/r", None).await;
+        assert_eq!(backend_hits(&count), 2);
+        cache_send(addr, Method::POST, "/r", None).await;
+        assert_eq!(backend_hits(&count), 3);
+        cache_send(addr, Method::GET, "/r", None).await;
+        assert_eq!(backend_hits(&count), 3);
+    }
+
+    #[tokio::test]
+    async fn a_post_first_never_populates_a_later_get() {
+        let (addr, count) = cached_proxy("hello", &[], test_cache(), None).await;
+        cache_send(addr, Method::POST, "/r", None).await;
+        cache_send(addr, Method::GET, "/r", None).await;
+        assert_eq!(backend_hits(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn a_response_over_max_entry_bytes_is_streamed_but_never_cached() {
+        let cache = Arc::new(ResponseCache::new(
+            4,
+            1024 * 1024,
+            Duration::from_secs(60),
+            FakeClock::new(),
+        ));
+        let (addr, count) = cached_proxy("hello", &[], cache.clone(), None).await;
+        assert_eq!(
+            cache_send(addr, Method::GET, "/", None).await.body(),
+            "hello"
+        );
+        assert_eq!(
+            cache_send(addr, Method::GET, "/", None).await.body(),
+            "hello"
+        );
+        assert_eq!(backend_hits(&count), 2);
+        assert_eq!(cache.accounted_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_response_exactly_at_max_entry_bytes_is_cached() {
+        let cache = Arc::new(ResponseCache::new(
+            5,
+            1024 * 1024,
+            Duration::from_secs(60),
+            FakeClock::new(),
+        ));
+        let (addr, count) = cached_proxy("hello", &[], cache, None).await;
+        cache_send(addr, Method::GET, "/", None).await;
+        cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 1);
+    }
+
+    #[tokio::test]
+    async fn a_full_cache_keeps_serving_stored_entries_and_proxies_the_rest_uncached() {
+        let one_entry = {
+            let probe = test_cache();
+            let (addr, _) = cached_proxy("hello", &[], probe.clone(), None).await;
+            cache_send(addr, Method::GET, "/k0", None).await;
+            probe.accounted_bytes()
+        };
+        let cache = Arc::new(ResponseCache::new(
+            1024,
+            one_entry,
+            Duration::from_secs(60),
+            FakeClock::new(),
+        ));
+        let (addr, count) = cached_proxy("hello", &[], cache.clone(), None).await;
+        cache_send(addr, Method::GET, "/k0", None).await;
+        assert_eq!(cache.accounted_bytes(), one_entry);
+        assert_eq!(
+            cache_send(addr, Method::GET, "/k1", None).await.body(),
+            "hello"
+        );
+        assert_eq!(
+            cache_send(addr, Method::GET, "/k1", None).await.body(),
+            "hello"
+        );
+        assert_eq!(backend_hits(&count), 3);
+        assert_eq!(
+            cache_send(addr, Method::GET, "/k0", None).await.body(),
+            "hello"
+        );
+        assert_eq!(backend_hits(&count), 3);
+        assert_eq!(cache.accounted_bytes(), one_entry);
+    }
+
+    #[tokio::test]
+    async fn an_entry_expires_after_the_default_ttl_and_is_refetched() {
+        let clock = FakeClock::new();
+        let cache = Arc::new(ResponseCache::new(
+            1024,
+            1024 * 1024,
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let (addr, count) = cached_proxy("hello", &[], cache, None).await;
+        cache_send(addr, Method::GET, "/", None).await;
+        cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 1);
+        clock.advance(Duration::from_secs(61));
+        cache_send(addr, Method::GET, "/", None).await;
+        cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn a_max_age_shorter_than_the_default_ttl_wins() {
+        let clock = FakeClock::new();
+        let cache = Arc::new(ResponseCache::new(
+            1024,
+            1024 * 1024,
+            Duration::from_secs(60),
+            clock.clone(),
+        ));
+        let (addr, count) =
+            cached_proxy("hello", &[("cache-control", "max-age=5")], cache, None).await;
+        cache_send(addr, Method::GET, "/", None).await;
+        clock.advance(Duration::from_secs(4));
+        cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 1);
+        clock.advance(Duration::from_secs(2));
+        cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn a_cache_hit_serves_stored_headers_without_hop_by_hop_ones() {
+        let (addr, count) = cached_proxy(
+            "hello",
+            &[
+                ("keep-alive", "timeout=5"),
+                ("x-custom", "v"),
+                ("content-type", "text/plain"),
+            ],
+            test_cache(),
+            None,
+        )
+        .await;
+        let miss = cache_send(addr, Method::GET, "/", None).await;
+        let hit = cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 1);
+        for resp in [&miss, &hit] {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get("x-custom").unwrap(), "v");
+            assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain");
+            assert!(resp.headers().get("keep-alive").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stored_entry_never_carries_the_sticky_set_cookie() {
+        let (addr, count) =
+            cached_proxy("hello", &[], test_cache(), Some(test_sticky_runtime())).await;
+        let miss = cache_send(addr, Method::GET, "/", None).await;
+        assert!(miss.headers().get(header::SET_COOKIE).is_some());
+        let hit = cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 1);
+        assert_eq!(hit.body(), "hello");
+        assert!(hit.headers().get(header::SET_COOKIE).is_none());
+    }
+
     #[tokio::test]
     async fn no_cache_config_means_every_request_reaches_the_backend() {
         let (backend_addr, count) = spawn_counting_cacheable_backend("hello", &[]).await;
