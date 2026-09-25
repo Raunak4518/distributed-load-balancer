@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use lb_metrics::IntCounterVec;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,6 +21,7 @@ pub struct CounterStore {
     keys: DashMap<String, KeyCounts>,
     snapshot_cursor: AtomicUsize,
     skew_rejections: Option<IntCounterVec>,
+    skew_labeled_peers: DashSet<String>,
 }
 
 pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
@@ -28,6 +29,10 @@ pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
 const MAX_SNAPSHOT_BUCKET_ENTRIES: usize = 5_000;
 
 const FUTURE_SKEW_TOLERANCE_SECS: u64 = 5;
+
+const MAX_SKEW_PEER_LABELS: usize = 64;
+
+const OVERFLOW_PEER_LABEL: &str = "other";
 
 #[derive(Default)]
 struct KeyCounts {
@@ -62,6 +67,7 @@ impl CounterStore {
             keys: DashMap::new(),
             snapshot_cursor: AtomicUsize::new(0),
             skew_rejections: None,
+            skew_labeled_peers: DashSet::new(),
         }
     }
 
@@ -165,9 +171,20 @@ impl CounterStore {
         }
         if let Some(counter) = &self.skew_rejections {
             counter
-                .with_label_values(&[node_id])
+                .with_label_values(&[self.skew_peer_label(node_id)])
                 .inc_by(rejected as u64);
         }
+    }
+
+    fn skew_peer_label<'a>(&self, node_id: &'a str) -> &'a str {
+        if self.skew_labeled_peers.contains(node_id) {
+            return node_id;
+        }
+        if self.skew_labeled_peers.len() < MAX_SKEW_PEER_LABELS {
+            self.skew_labeled_peers.insert(node_id.to_string());
+            return node_id;
+        }
+        OVERFLOW_PEER_LABEL
     }
 
     fn merge_into(
@@ -216,7 +233,12 @@ impl CounterStore {
         max_entries: usize,
     ) -> Vec<(String, Vec<(u64, u64)>)> {
         let cutoff = now_secs.saturating_sub(self.window_secs.saturating_sub(1));
-        let mut keys: Vec<String> = self.keys.iter().map(|item| item.key().clone()).collect();
+        let mut keys: Vec<String> = self
+            .keys
+            .iter()
+            .filter(|item| item.value().per_node.contains_key(node_id))
+            .map(|item| item.key().clone())
+            .collect();
         keys.sort_unstable();
         if keys.is_empty() {
             return Vec::new();
@@ -517,6 +539,29 @@ mod tests {
 
         assert_eq!(counter.with_label_values(&["n1"]).get(), 1);
         assert_eq!(counter.with_label_values(&["n2"]).get(), 2);
+    }
+
+    #[test]
+    fn skew_rejection_label_cardinality_is_bounded_however_many_peer_ids_appear() {
+        let metrics = lb_metrics::Metrics::new().unwrap();
+        let store = CounterStore::new(10)
+            .with_skew_rejection_counter(metrics.cluster_future_skew_rejections.clone());
+
+        for i in 0..5_000 {
+            store.merge("k", &format!("attacker-{i}"), &[(NOW + 1_000_000, 1)], NOW);
+        }
+
+        let series = metrics
+            .gather_text()
+            .lines()
+            .filter(|l| l.starts_with("lb_cluster_future_skew_rejections_total{"))
+            .count();
+        assert_eq!(series, MAX_SKEW_PEER_LABELS + 1);
+        let text = metrics.gather_text();
+        assert!(text.contains(&format!(
+            "lb_cluster_future_skew_rejections_total{{peer=\"{OVERFLOW_PEER_LABEL}\"}} {}",
+            5_000 - MAX_SKEW_PEER_LABELS
+        )));
     }
 
     #[test]
