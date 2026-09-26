@@ -13,6 +13,14 @@ A backend is a candidate for a request only when four independent flags all agre
 
 A backend is eligible only if `active_healthy` is true and the other three are false. Each flag is independently observable (e.g. through `GET /backends`), because an operator needs to know *why* a backend is excluded — drained, circuit-tripped, and outlier-ejected are different operational facts even though all three produce the same routing outcome.
 
+### Awaiting the first probe
+
+A backend that joins a pool while the process is already serving — resolved by a later DNS poll, or added by a config reload — starts in an **awaiting-first-probe** state. It passes every flag above (nothing has failed yet), but it has not yet been confirmed by a health check. The state clears on the backend's first completed probe: a success makes it an ordinary eligible backend, a failure makes it unhealthy.
+
+While any confirmed backend in the same pool is eligible, awaiting backends receive no traffic. If none is — at startup of a DNS listener, when DNS returns an entirely new set, or when every confirmed backend has failed — awaiting backends are used instead, rather than answering `503`. The race this closes is a newly discovered instance that accepts connections before it is ready: it is never selected until a probe says it is healthy, unless there is nothing better to send the request to. Backends listed in the configuration at startup are not held back, since nothing is serving yet.
+
+`GET /backends` reports the state as `awaiting_first_probe`.
+
 ## Active health checks
 
 One task, spawned by [`spawn_active_checker`](../crates/lb-healthcheck/src/active.rs), runs per backend. It ticks on `health_check.interval_ms`, runs the configured probe, and writes the boolean result into the pool's `active_healthy` flag — nothing else about "healthy" lives in this loop; that decision belongs entirely to the probe.
@@ -102,7 +110,7 @@ The admin API exposes two endpoints, implemented in [`admin_backends.rs`](../cra
 - `POST /backends/{listener}/{backend_id}/drain` sets `manually_drained` true.
 - `POST /backends/{listener}/{backend_id}/undrain` sets it false.
 
-`GET /backends` lists every listener's backends (default pool, plus each `[[listeners.routes]]` and `[[listeners.canary]]` pool) with their address and all four flags plus in-flight connection count.
+`GET /backends` lists every listener's backends (default pool, plus each `[[listeners.routes]]` and `[[listeners.canary]]` pool) with their address, all four flags, `awaiting_first_probe`, overall eligibility, and in-flight connection count.
 
 `manually_drained` is a flag independent of `active_healthy`, deliberately not folded into it: the active checker writes `active_healthy` on its own probe schedule, oblivious to an operator's drain request, so if a drain shared that flag the very next successful probe would silently undo it. A drain removes the backend from `eligible_backends()` for *new* traffic without touching connections already in flight and without forgetting the backend the way removing it from config would (which requires a reload to reintroduce). It composes with the other three flags exactly as eligibility requires: draining a backend that is also circuit-open or outlier-ejected changes nothing observable until every excluding flag clears.
 
@@ -110,15 +118,23 @@ The admin API exposes two endpoints, implemented in [`admin_backends.rs`](../cra
 
 ### DNS-discovered backends
 
-A `dns_discovery` listener's poller ([`dns.rs`](../crates/lb-server/src/dns.rs)) resolves its configured name on `poll_interval_secs` (default 10s) and calls `BackendPool::apply_resolved` with the result. On each successful poll it also reconciles the active-checker set: it spawns a real `spawn_active_checker` task for every backend id newly present in the resolved set, and aborts the checker task for any id no longer present. A backend that disappears from DNS is not just excluded from routing — its checker task and, for a TLS listener, its cached per-backend client are also torn down. A failed DNS lookup logs a warning and leaves the current backend set (and its checkers) untouched rather than emptying the pool.
+A `dns_discovery` listener's poller ([`dns.rs`](../crates/lb-server/src/dns.rs)) resolves its configured name on `poll_interval_secs` (default 10s). On each successful poll it brings every piece of per-backend state into line with the resolved set, so a DNS-discovered backend is protected exactly like a static one:
 
-`apply_resolved` starts a genuinely new backend id eligible (`active_healthy = true`, no circuit open, not drained, not outlier-ejected) until its first probe runs; for a backend id that persists across a poll (same id, possibly a new address or weight), every flag — `active_healthy`, `circuit_open`, `outlier_ejected`, `manually_drained`, and the in-flight connection count — carries over unchanged from the previous state.
+1. Each newly resolved backend gets a circuit breaker built from the listener's `health_check` settings (so passive latency and concurrency thresholds apply too), its per-backend metrics, and — if configured — outlier-detection tracking. This happens before the backend is added to the pool, so no request can select a backend that has no breaker yet.
+2. `BackendPool::apply_resolved` updates the pool. A new backend enters in the [awaiting-first-probe](#awaiting-the-first-probe) state.
+3. A real `spawn_active_checker` task is started for every new backend, and the checker of every departed backend is aborted.
+
+A backend that disappears from DNS loses its breaker, outlier tracking and — for a TLS listener — its cached per-backend client, and its per-backend metric series are removed from `/metrics`, so autoscaling churn does not accumulate stale series. A backend that persists across a poll keeps its breaker instance and every flag (`active_healthy`, `circuit_open`, `outlier_ejected`, `manually_drained`, awaiting state) and its in-flight count. A failed DNS lookup logs a warning and leaves the current backend set, and all of its state, untouched.
 
 ### Config reload
 
-A reload that changes a listener's configuration (`crates/lb-server/src/reload.rs`, triggered by SIGHUP) rebuilds that listener's `BackendPool` and circuit breakers from scratch — it does not call `apply_resolved` the way DNS churn does. Two, and only two, pieces of live state are deliberately carried forward via [`PreviousListenerState`](../crates/lb-server/src/wiring.rs), captured just before the rebuild:
+A reload that changes a listener's configuration (`crates/lb-server/src/reload.rs`, triggered by SIGHUP) rebuilds that listener's `BackendPool` and circuit breakers. Live state is carried forward from the running listener via [`PreviousListenerState`](../crates/lb-server/src/wiring.rs), captured just before the rebuild, so an unrelated change does not return known-bad backends to rotation:
 
-- Every backend's `manually_drained` flag, reapplied to the new pool by `seed_drained`.
-- Every circuit breaker's full snapshot (state, failure/success counters, flap streak, cooldown clock), used to reconstruct each breaker via `CircuitBreaker::from_snapshot` with the *new* config's thresholds/cooldowns but the *carried-over* live state — a backend mid-cooldown when an unrelated field on its listener changes does not get a clean bill of health and go straight back into rotation.
+- Every backend's `manually_drained` flag.
+- Every backend's `active_healthy` verdict and awaiting-first-probe state. A backend that failed its last probe stays out of rotation until a probe succeeds.
+- Every circuit breaker's full snapshot (state, failure/success counters, flap streak, cooldown clock), used to reconstruct each breaker via `CircuitBreaker::from_snapshot` with the *new* config's thresholds/cooldowns but the *carried-over* live state.
+- For a `dns_discovery` listener whose `[listeners.dns_discovery]` settings did not change, the currently resolved backend set itself, so the rebuilt listener keeps serving the same backends, with their health and breakers, until its next successful poll. Their health checks restart immediately, so they stay under active checking even while DNS lookups are failing.
 
-`active_healthy` and `outlier_ejected` are **not** preserved across a reload: the freshly built pool starts every backend `active_healthy = true` and not outlier-ejected, the same as at initial startup, until the new active checker's next probe and the outlier detector's next recompute round re-establish them. This differs from DNS churn, where a persisting backend id keeps every flag (including `outlier_ejected`) via `apply_resolved`. A reload that only touches, say, `rate_limit` still momentarily resets outlier-ejection state for every backend on that listener.
+A backend that is new in the reloaded configuration starts [awaiting its first probe](#awaiting-the-first-probe).
+
+`outlier_ejected` is deliberately **not** carried: the outlier detector is rebuilt with the pool, and an ejection it did not make itself could never be lifted by its recompute rounds. An ejected backend therefore returns to rotation on reload and is re-evaluated from fresh traffic; if it is still failing, its carried-over circuit breaker and the next recompute round exclude it again.

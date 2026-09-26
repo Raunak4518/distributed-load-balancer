@@ -114,8 +114,8 @@ curl http://127.0.0.1:9090/backends  # JSON: every listener's backends and their
 ```json
 {
   "web": [
-    {"id": "web1", "route": "default", "address": "127.0.0.1:9001", "active_healthy": true, "circuit_open": false, "manually_drained": false, "eligible": true, "active_conns": 0},
-    {"id": "web2", "route": "default", "address": "127.0.0.1:9002", "active_healthy": true, "circuit_open": false, "manually_drained": false, "eligible": true, "active_conns": 0}
+    {"id": "web1", "route": "default", "address": "127.0.0.1:9001", "active_healthy": true, "circuit_open": false, "manually_drained": false, "outlier_ejected": false, "awaiting_first_probe": false, "eligible": true, "active_conns": 0},
+    {"id": "web2", "route": "default", "address": "127.0.0.1:9002", "active_healthy": true, "circuit_open": false, "manually_drained": false, "outlier_ejected": false, "awaiting_first_probe": false, "eligible": true, "active_conns": 0}
   ]
 }
 ```

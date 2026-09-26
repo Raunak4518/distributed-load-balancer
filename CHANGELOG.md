@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Awaiting-first-probe state for new backends.** A backend that joins a
+  pool while the process is serving (a later DNS poll or a config reload)
+  receives no traffic until its first health probe succeeds, as long as
+  another confirmed backend in the pool is eligible. When none is, awaiting
+  backends are used rather than returning `503`, so cold starts and complete
+  DNS replacements keep serving.
+- `GET /backends` now reports `outlier_ejected` and `awaiting_first_probe`
+  for every backend.
+
+### Fixed
+
+- **DNS-discovered backends had no circuit breaker, passive health checks,
+  outlier detection or per-backend metrics.** These were built once from the
+  static backend list, which is empty on a `dns_discovery` listener, so a
+  DNS backend that timed out or returned errors was never ejected. They are
+  now created for each backend as DNS resolves it, before it can be
+  selected, kept for as long as it stays resolved, and removed (including
+  its metric series) when it leaves DNS.
+- **A config reload returned failing backends to rotation.** Reload rebuilt
+  each changed listener's pool with every backend marked healthy. Each
+  backend's last health-check verdict is now carried over, a `dns_discovery`
+  listener with unchanged discovery settings keeps its resolved backends,
+  and a backend newly added by the reload waits for its first probe.
+
 ## [0.3.0] - 2026-09-26
 
 ### Added

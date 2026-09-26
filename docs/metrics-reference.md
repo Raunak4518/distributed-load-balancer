@@ -69,6 +69,8 @@ Only `phase="body"` is ever incremented, from `lb_proxy::service::handle_inner` 
 
 See [`health-checking.md`](health-checking.md) and [`load-balancing.md`](load-balancing.md) for the mechanisms behind these metrics.
 
+Every metric in this section is labeled per backend and exists for statically configured and DNS-discovered backends alike. When a DNS-discovered backend leaves the resolved set, all of its series in this section are removed from the exposition, so autoscaling churn does not accumulate stale `backend` label values.
+
 ### `lb_backend_healthy` — gauge
 
 Labels: `listener`, `backend`.
