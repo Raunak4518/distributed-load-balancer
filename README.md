@@ -1,266 +1,302 @@
-# Distributed Load Balancer — Phases 1–8
+<div align="center">
 
-A multi-protocol load balancer in Rust. Terminates TLS, speaks HTTP/1.1 and HTTP/2, rate-limits by IP or header, health-checks backends, and forwards traffic over HTTP or raw TCP. Multiple instances share rate-limit counters through a gossip-based CRDT protocol — no central data store required.
+# Distributed Load Balancer
 
-```
-Client → TLS termination → Rate limiter → Backend selection → Forward
-                              │                                  │
-                         (local GCRA +                    (retry once on
-                          cluster CRDT)                    failure)
-```
+**A multi-protocol L4/L7 load balancer written in Rust, with cluster-wide rate limiting coordinated over gossip — no central data store required.**
 
-## What It Does
+[![CI](https://github.com/Raunak4518/distributed-load-balancer/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Raunak4518/distributed-load-balancer/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Raunak4518/distributed-load-balancer?sort=semver)](https://github.com/Raunak4518/distributed-load-balancer/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org)
+[![Container](https://img.shields.io/badge/ghcr.io-amd64%20%7C%20arm64-2496ED?logo=docker&logoColor=white)](https://github.com/Raunak4518/distributed-load-balancer/pkgs/container/distributed-load-balancer)
 
-- **HTTP/1.1 and HTTP/2** (ALPN-negotiated over TLS), plus raw **TCP** proxying.
-- **TLS termination** at the edge via rustls. Optional **backend re-encryption** with certificate verification.
-- **GCRA rate limiting** per key, with bounded state. An overflow bucket prevents memory exhaustion under address-spray attacks.
-- **Cluster-wide rate limiting** via a G-Counter CRDT, synchronized over HMAC-authenticated gossip, with optional mutual TLS on the peer channel.
-- **Active health checking**: HTTP probes (GET, 2xx = healthy) or TCP connect probes, using the *same* transport as real traffic.
-- **Circuit breaking** per backend: Closed → Open → HalfOpen, with configurable threshold and cooldown.
-- **Weighted traffic-split / canary pools**: hold back a percentage of HTTP traffic for one or more independently health-checked pools, with sticky sessions (when configured) keeping a client on whichever pool it first landed in for the rest of its session.
-- **PROXY protocol** (v1 and v2, auto-detected) on either listener type, for sitting behind another proxy/ELB/CDN while still seeing the real client IP.
-- **TCP keepalive tuning** (`SO_KEEPALIVE`/`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT`), independently configurable for the client-facing and backend-facing socket, on either listener type.
-- **Response compression** (gzip/brotli/deflate/zstd), negotiated against the client's `Accept-Encoding`, off by default.
-- **Prometheus metrics** on a private admin port. Separate `/healthz` (liveness, always 200) and `/ready` (readiness, 503 when no backend is eligible).
-- **Connection hardening**: global + per-IP caps, slowloris timeout (both directions — sending and reading the response), HTTP/2 Rapid Reset mitigation, body size and read-time limits.
-- **Graceful shutdown**: SIGTERM/SIGINT drains in-flight connections within a configurable timeout.
+[Getting started](docs/getting-started.md) ·
+[Documentation](docs/README.md) ·
+[Configuration](docs/configuration-reference.md) ·
+[Benchmarks](docs/benchmarks.md) ·
+[Contributing](CONTRIBUTING.md)
 
-## Architecture
+</div>
 
-Twelve crates. `lb-server` is the binary; the rest are libraries with narrow responsibilities:
+---
 
-```
-lb-server          Binary. Config, binding, wiring, shutdown.
-├── lb-core        Traits (LoadBalancer, RateLimiter, HealthProbe, Clock, etc.),
-│                  types (Backend, BackendPool), config parsing and validation.
-├── lb-proxy       L7 forwarding, body limits, hop-by-hop stripping, DNS-pinned resolver.
-├── lb-tcp         L4 proxying: bidirectional pump with idle timeout.
-├── lb-balancer    Round-robin, least-connections, weighted round-robin,
-│                  consistent hashing (all skip ineligible backends).
-├── lb-ratelimit   GCRA with bounded key tracking and periodic sweep.
-├── lb-healthcheck Active health checks, HTTP/TCP probes, circuit breaker.
-├── lb-cluster     G-Counter CRDT, HMAC-authenticated gossip, peer sync,
-│                  optional mutual TLS on the peer channel.
-├── lb-tls         TLS termination (rustls), backend connector, cert reloading.
-├── lb-metrics     Prometheus registry, admin HTTP server (/metrics, /healthz, /ready).
-├── lb-tracing     Structured logging plus OpenTelemetry trace export (OTLP).
-└── lb-bench       Micro-benchmarks (pool selection, GCRA, cluster admit, circuit
-                   refresh) plus two real-traffic evaluation harnesses:
-                   lb-bench-e2e (strategy comparison, heterogeneous backends,
-                   retry amplification, reliability characterization) and
-                   lb-bench-cluster (gossip convergence-bound validation).
-```
+`lb-server` terminates TLS, serves HTTP/1.1 and HTTP/2, proxies raw TCP, and spreads traffic across backends using one of five selection strategies — including a latency-aware Peak-EWMA power-of-two-choices balancer. It health-checks backends actively and passively, ejects failing ones through a circuit breaker and statistical outlier detection, and rate-limits clients with GCRA. When several instances run side by side, they share rate-limit state through an HMAC-authenticated G-Counter CRDT, so a client's budget holds across the whole fleet.
 
-Dependencies flow strictly downward. `lb-core` depends on nothing inside the workspace. The data-plane crates (`lb-proxy`, `lb-tcp`) never import each other and never import `lb-tls`. `lb-tcp` has no `rustls` in its dependency tree — it asks an `OutboundTransport` trait object to wrap its stream and pumps whatever comes back.
+It is built to be operated: memory that clients can influence is bounded, rejections and backend failures are exported as Prometheus metrics, configuration reloads on `SIGHUP` without dropping connections, and shutdown drains in-flight requests.
 
-`lb-server` is the only crate that knows the concrete types. It wires `Gcra<SystemClock>`, `RoundRobin`, `ClusterNode<SystemClock>`, and `BackendTlsTransport` into a `ProxyContext` or `TcpContext` and hands them to the data plane as trait objects.
+## Table of contents
 
-## Quick Start
+- [Features](#features)
+- [Quick start](#quick-start)
+- [Installation](#installation)
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Observability](#observability)
+- [Performance](#performance)
+- [Documentation](#documentation)
+- [Project status](#project-status)
+- [Contributing](#contributing)
+- [Security](#security)
+- [License](#license)
 
-**Build:**
+## Features
+
+**Traffic management**
+- HTTP/1.1 and HTTP/2 (negotiated with ALPN), raw TCP passthrough, and WebSocket / `Upgrade` proxying.
+- Five selection strategies: round robin, least connections, weighted round robin, consistent hashing, and Peak-EWMA with power-of-two choices.
+- Path-prefix and `Host` routing to independent backend pools; percentage-based canary splits; cookie-based sticky sessions.
+- DNS-based backend discovery with state preserved across re-resolution.
+- Retries to a freshly picked backend, restricted to idempotent methods and bounded by a retry budget.
+- In-memory response caching and gzip / brotli / deflate / zstd response compression.
+
+**Resilience**
+- Active HTTP and TCP health checks that use the same transport as real traffic.
+- Passive health signals (latency and concurrency thresholds) feeding a lock-free circuit breaker with flap backoff.
+- Statistical outlier detection, with a pool-wide ejection ceiling so a correlated failure cannot eject every backend.
+- Manual drain and undrain through the admin API.
+- Live configuration reload on `SIGHUP`, validated all-or-nothing; graceful shutdown with a drain deadline.
+
+**Security at the edge**
+- TLS termination on rustls (`ring`), SNI with multiple certificates, automatic certificates via ACME (HTTP-01), and certificate hot reload.
+- Backend re-encryption with certificate verification and DNS-pinned dialing.
+- Global and per-IP connection caps, read- and write-side slowloris timeouts, body size limits, and HTTP/2 limits including the Rapid Reset (CVE-2023-44487) mitigation.
+- PROXY protocol v1 and v2, a built-in WAF (block or log mode), and bearer-token authentication on the admin API with constant-time comparison.
+
+**Distributed rate limiting**
+- Per-key GCRA with bounded memory: new keys beyond the cap share an overflow bucket instead of evicting established clients.
+- Cluster-wide budgets via a G-Counter CRDT gossiped between nodes, authenticated with HMAC-SHA256, optionally over mutual TLS, with clock-skew and memory bounds.
+
+**Observability**
+- Prometheus metrics, liveness (`/healthz`) and readiness (`/ready`) endpoints, and a JSON backend inspection API.
+- Structured JSON logging with sampled access logs, and OpenTelemetry trace export over OTLP/HTTP.
+
+## Quick start
+
+Build the binary (or [install a release](#installation)):
+
 ```bash
-cargo build --release
+cargo build --release -p lb-server
 ```
 
-**Run:**
+Save this as `lb.toml` — it balances two backends on ports 9001 and 9002 and exposes the admin API on 9090:
+
+```toml
+[[listeners]]
+name     = "web"
+protocol = "http"
+listen   = "127.0.0.1:8080"
+
+[[listeners.backends]]
+id      = "web1"
+address = "127.0.0.1:9001"
+
+[[listeners.backends]]
+id      = "web2"
+address = "127.0.0.1:9002"
+
+[listeners.health_check]
+path              = "/health"
+interval_ms       = 2000
+timeout_ms        = 500
+failure_threshold = 3
+cooldown_ms       = 5000
+
+[listeners.rate_limit]
+key          = "source_ip"
+rate_per_sec = 50
+burst        = 100
+
+[listeners.load_balancing]
+strategy = "round_robin"
+
+[admin]
+listen = "127.0.0.1:9090"
+```
+
+Validate it, run it, and send traffic:
+
 ```bash
-# Uses ./config.toml by default
-./target/release/lb-server
+./target/release/lb-server --check-config lb.toml
+./target/release/lb-server lb.toml
 
-# Or specify a path
-./target/release/lb-server /etc/lb/config.toml
+curl http://127.0.0.1:8080/            # alternates between web1 and web2
+curl http://127.0.0.1:9090/backends    # live backend state as JSON
+curl http://127.0.0.1:9090/metrics     # Prometheus metrics
 ```
 
-**Test:**
-```bash
-cargo test --workspace --features lb-core/test-util
-```
+The [getting-started guide](docs/getting-started.md) walks through this end to end, including starting throwaway backends, watching a backend fail and recover, and reloading the configuration.
 
-**Benchmark:**
-```bash
-# Micro-benchmarks: pool selection, GCRA, cluster admit, circuit refresh
-cargo run --release -p lb-bench
+## Installation
 
-# Real-traffic evaluation harness against a real lb-server: strategy
-# comparison, heterogeneous backends, retry amplification, reliability/
-# outlier-detection characterization
-cargo run --release -p lb-bench --bin lb-bench-e2e -- --help
+Every tagged release publishes the following through [`.github/workflows/release.yml`](.github/workflows/release.yml):
 
-# Gossip convergence-bound validation across a real multi-node cluster
-cargo run --release -p lb-bench --bin lb-bench-cluster
-```
-`lb-bench-e2e` runs are persisted to `results/<timestamp>/{metadata.json,results.csv}` (git SHA, rustc version, OS, run params) for comparing across runs.
+| Artifact | Platforms |
+|---|---|
+| Static binaries (`musl`) | Linux `x86_64`, `aarch64` |
+| Native binaries | macOS `x86_64`, `aarch64` (Apple Silicon) |
+| `.deb` / `.rpm` packages | Linux `x86_64` (binary, systemd unit, default config) |
+| Container image | `ghcr.io/raunak4518/distributed-load-balancer`, `linux/amd64` and `linux/arm64` |
 
-**CLI flags:**
-```bash
-lb-server --check-config /etc/lb-server/config.toml   # validate and exit
-lb-server --version
-lb-server --help
-```
+**Install script** (Linux or macOS; selects the right release asset):
 
-### Running it
-
-Several ways to run `lb-server`, none tied to a particular platform:
-
-**`.deb` / `.rpm`** (Debian/Ubuntu or Fedora/RHEL — installs the binary, the systemd unit, and a default config in one step):
-```bash
-sudo dpkg -i lb-server_*.deb        # Debian/Ubuntu
-sudo rpm -i lb-server-*.rpm         # Fedora/RHEL
-sudo $EDITOR /etc/lb-server/config.toml
-sudo systemctl enable --now lb-server
-```
-
-**Docker** (published for `linux/amd64` and `linux/arm64`):
-```bash
-docker run -v $(pwd)/config.toml:/etc/lb-server/config.toml:ro -p 8080:8080 \
-  ghcr.io/raunak4518/distributed-load-balancer:latest
-```
-Or build locally: `docker build -t lb-server .`
-
-**systemd** (any Linux distro, from a prebuilt binary or `cargo build --release`):
-```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin lb-server
-sudo install -m755 target/release/lb-server /usr/local/bin/lb-server
-sudo mkdir -p /etc/lb-server && sudo cp config.toml /etc/lb-server/config.toml
-sudo cp packaging/systemd/lb-server.service /etc/systemd/system/
-sudo systemctl enable --now lb-server
-```
-
-**From source**, on anything `rustc`/Tokio supports: `cargo build --release -p lb-server`.
-
-**Install script** (Linux or macOS, `x86_64` or `arm64` — picks the right release asset automatically):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Raunak4518/distributed-load-balancer/main/scripts/install.sh | sh
 ```
 
-Prebuilt binaries and packages are published on each [GitHub Release](https://github.com/Raunak4518/distributed-load-balancer/releases) by [`.github/workflows/release.yml`](.github/workflows/release.yml): static, dependency-free `musl` builds for `x86_64`/`aarch64` Linux (run on any distro, any glibc version, containers included), native builds for `x86_64`/`aarch64` (Apple Silicon) macOS, and `x86_64` `.deb`/`.rpm` packages.
+**Container** (mount your config over the default; listeners must bind `0.0.0.0` inside the container):
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$(pwd)/lb.toml:/etc/lb-server/config.toml:ro" \
+  ghcr.io/raunak4518/distributed-load-balancer:latest
+```
+
+**Debian / Ubuntu or Fedora / RHEL:**
+
+```bash
+sudo dpkg -i lb-server_*.deb        # or: sudo rpm -i lb-server-*.rpm
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin lb-server
+sudo $EDITOR /etc/lb-server/config.toml
+sudo systemctl enable --now lb-server
+```
+
+**From source**, on any platform supported by Rust and Tokio:
+
+```bash
+cargo install --git https://github.com/Raunak4518/distributed-load-balancer lb-server
+```
+
+Deployment details — the hardened systemd unit, reload and shutdown semantics, and the admin API — are in [docs/operations.md](docs/operations.md).
+
+## How it works
+
+Every HTTP request passes through a fixed, ordered pipeline, and each stage can end the request early:
+
+```mermaid
+flowchart LR
+    A[Accept<br/>connection caps] --> B[PROXY protocol<br/>TLS + ALPN]
+    B --> C[Rate limit<br/>local GCRA]
+    C --> D[WAF]
+    D --> E[Cluster<br/>budget]
+    E --> F[Cache<br/>lookup]
+    F --> G[Route / canary<br/>pool selection]
+    G --> H[Pick backend<br/>strategy + sticky]
+    H --> I[Forward<br/>retry once]
+    I --> J[Response<br/>headers, cache, compression]
+```
+
+The workspace is split into twelve crates with one-directional dependencies. `lb-core` defines the traits every component is built against — `LoadBalancer`, `RateLimiter`, `HealthProbe`, `Clock`, `OutboundTransport` — and `lb-server` is the only crate that knows the concrete types:
+
+| Crate | Responsibility |
+|---|---|
+| `lb-server` | The binary: configuration, listener binding, wiring, reload and shutdown. |
+| `lb-core` | Traits, the backend pool, and configuration parsing and validation. |
+| `lb-proxy` / `lb-tcp` | The L7 and L4 data planes. |
+| `lb-balancer` | Selection strategies. |
+| `lb-healthcheck` | Health probes, circuit breaker, outlier detection. |
+| `lb-ratelimit` / `lb-cluster` | Local GCRA and gossip-based cluster coordination. |
+| `lb-tls` | Termination, re-encryption, ACME, certificate reload, peer mTLS. |
+| `lb-metrics` / `lb-tracing` | Metrics and admin server; logging and trace export. |
+| `lb-bench` | Micro-benchmarks and real-traffic evaluation harnesses. |
+
+See [docs/architecture.md](docs/architecture.md) for the dependency rules and concurrency model, and [docs/request-lifecycle.md](docs/request-lifecycle.md) for the full step-by-step trace.
 
 ## Configuration
 
-All configuration lives in a single TOML file. A bad config fails the process at startup — no partial or default-assumed settings are served.
+Configuration is a single TOML file, validated in full at startup: an invalid file stops the process before it binds a socket, and `lb-server --check-config <path>` runs the same validation without starting. The main sections are:
 
-Send `SIGHUP` (`systemctl reload lb-server`, or `kill -HUP <pid>`) to reload without a restart: a listener's backends, `dns_discovery`, health checks, and rate limit apply live, with no dropped connections. Adding, removing, or re-addressing a listener, its TLS/HTTP2/connection-limit settings, and anything under `[server]`/`[admin]`/`[cluster]`/`[logging]`/`[tracing]` still need a restart — a reload that would require one is refused outright, logged with the reason, and changes nothing.
+| Section | Purpose |
+|---|---|
+| `[[listeners]]` | An entry point: protocol, bind address, backends, and per-listener limits and timeouts. |
+| `[listeners.health_check]`, `[listeners.rate_limit]`, `[listeners.load_balancing]` | Required on every listener. |
+| `[[listeners.routes]]`, `[[listeners.canary]]`, `[listeners.sticky]` | Routing, traffic splitting and session affinity (HTTP). |
+| `[listeners.tls]`, `[listeners.backend_tls]`, `[listeners.http2]` | Edge TLS, backend re-encryption and HTTP/2 limits. |
+| `[listeners.cache]`, `[listeners.waf]`, `[listeners.retry_budget]` | Optional HTTP features. |
+| `[cluster]`, `[admin]`, `[logging]`, `[tracing]` | Process-wide settings. |
 
-**Pick your setup**: [`examples/`](examples/) has one minimal, runnable config per common deployment shape — plain HTTP reverse proxy, TCP passthrough, TLS termination with backend re-encryption, DNS-discovered backends, and a two-node cluster. Copy the one closest to your use case and adjust the addresses.
-
-See [`config.example.toml`](config.example.toml) for the authoritative reference with inline commentary. The major sections:
-
-- **`[[listeners]]`** — one per entry point: protocol (`http`/`tcp`), bind address, backends, rate limits, health checks, optional TLS.
-- **`[[listeners.routes]]`** — HTTP-only, optional. Routes a request to a different backend set by path prefix and/or `Host` header, first match wins — nginx's `location` blocks, HAProxy's ACL-based backend selection. A listener with none behaves exactly as it did before routes existed.
-- **`[[listeners.canary]]`** — HTTP-only, optional. Splits traffic that matched no route across one or more independently health-checked, independently load-balanced pools by percentage (`percent`, summing to at most 99) — a canary/blue-green rollout construct, distinct from a backend's own `weight` (which biases selection *within* one pool). When `[listeners.sticky]` is also configured, a client's pinned backend id keeps them on whichever pool they first landed in, rather than re-rolling the split every request.
-- **`[listeners.sticky]`** — HTTP-only, optional. Sticky-cookie session affinity: once a client lands on a backend, prefers that backend on their next request, falling back to the underlying `load_balancing.strategy` when the cookie is absent, invalid, or names an ineligible backend.
-- **`[listeners.cache]`** — HTTP-only, optional. Answers a repeated `GET` straight from memory instead of forwarding it to a backend — nginx's `proxy_cache`, Varnish. Only a `GET` request, a `200` response with a `Content-Length` inside `max_entry_bytes` is ever cached; everything else is proxied exactly as it is with the section absent.
-- **`[listeners.waf]`** — HTTP-only, optional. A WAF first slice: blocks (or, in `log` mode, records) a request whose path or query string matches a small, fixed, built-in set of SQL-injection/XSS/path-traversal tokens, before it reaches a route, the cache, or a backend.
-- **WebSocket / `Upgrade` proxying** — no config section, no toggle: any HTTP/1.1 request carrying `Connection: Upgrade` + `Upgrade: websocket` is proxied correctly on every HTTP listener, dialed to the backend over its own dedicated connection and relayed byte-for-byte once the backend answers `101`. `websocket_idle_timeout_ms` (a flat field alongside `write_timeout_ms`, default 300s) is the only knob, governing how long the connection may sit idle post-handshake.
-- **`[listeners.client_tcp_keepalive]` / `[listeners.backend_tcp_keepalive]`** — optional, independent, valid on either listener type. `SO_KEEPALIVE`/`TCP_KEEPIDLE`/`TCP_KEEPINTVL`/`TCP_KEEPCNT` tuning for the client-facing and backend-facing socket respectively (`time_secs`/`interval_secs`/`retries`, defaults 60/10/6). Omitting either leaves that socket at OS defaults, exactly as before this existed.
-- **`[listeners.tls]`** — edge TLS termination. ALPN, handshake timeout, HSTS, cert reload interval.
-- **`[listeners.backend_tls]`** — re-encryption to backends. Custom CA or system roots. `danger_accept_invalid_certs` is logged as a warning and exported as a metric.
-- **`[listeners.http2]`** — per-listener HTTP/2 settings. Every field has a safe default; omitting the section still gets full protection.
-- **`[cluster]`** — distributed rate limiting. Node ID, peer addresses, sliding window, pre-shared key (mandatory).
-- **`[cluster.tls]`** — optional mutual TLS on the peer channel. Without it the peer port is authenticated but not encrypted; every node presents the same cert (signed by a shared CA) to every peer.
-- **`[admin]`** — private admin listener for metrics, health endpoints, and backend drain/undrain. Optional `token`/`token_env` gate the whole surface behind an `Authorization: Bearer` header, checked in constant time; absent (the default), the listener stays exactly as unauthenticated as it always was, logged as a startup warning and exported on the `lb_admin_auth_disabled` gauge. There is no TLS on this listener, so the token is defense *in addition to* binding privately, not a replacement for it.
-
-Full field-by-field reference: [docs/configuration-reference.md](docs/configuration-reference.md)
-
-## How Requests Move
-
-### HTTP
-
-1. Accept loop acquires a global semaphore *before* `accept()`. At capacity, the kernel refuses for us.
-2. Per-IP slot checked after accept. Rejection drops the socket. If `client_tcp_keepalive` is configured, it's applied to the raw socket here too, before anything else touches it (PROXY protocol included).
-3. TLS handshake runs in the spawned task, not the accept loop. Both limit guards held across it.
-4. ALPN result dispatches to HTTP/1.1 (`header_read_timeout`) or HTTP/2 (stream limits, PING keep-alive, `FirstByteDeadline`). Both are additionally wrapped in `write_timeout` — the read-side timeouts bound how long a client may take to *send*; this bounds how long it may take to *read the response*, so a client that stops draining its socket can't hold the connection open forever either.
-5. Local GCRA check — free, in-process.
-6. If `[listeners.waf]` is configured, the request's path+query is checked against the built-in rule set; a match in `block` mode returns `403` immediately, skipping everything below (cluster budget, cache, route resolution, the backend) — a match in `log` mode is recorded and falls through.
-7. Cluster budget checked next, if configured.
-8. If `[listeners.cache]` is configured and this is a `GET`, the cache is checked for a still-fresh entry keyed on method/Host/path+query; a hit returns immediately, skipping everything below — no route resolution, no backend, no retry loop.
-9. If `[[listeners.routes]]` is configured, the request's path/Host is matched against each rule in order; the first match's backend pool and strategy are used for everything below. A request matching no rule falls through to `[[listeners.canary]]`, if configured: a sticky pin naming a backend in one of those pools (or the listener's own default) keeps it there, otherwise a deterministic weighted roll picks between them by `percent`. With neither routes nor canary matched, the listener's own default pool is used, exactly as before either existed.
-10. Circuit-breaker states refreshed from the breakers to the (matched or default) pool.
-11. If the request carries `Connection: Upgrade` + `Upgrade: websocket`, everything below (body read, sticky pin, retry loop, caching) is bypassed: the backend is dialed over its own dedicated, non-pooled HTTP/1.1 connection, and on a `101` both legs are relayed byte-for-byte until either side closes or `websocket_idle_timeout_ms` elapses.
-12. Body read with size cap and timeout.
-13. If `[listeners.sticky]` is configured and the request carries a cookie naming a still-eligible backend, that backend is used on the first attempt instead of asking the strategy; otherwise (or on the retry) the configured strategy (`round_robin`, `least_connections`, `weighted_round_robin`, or `consistent_hash`) picks an eligible backend. Request forwarded through a `hyper_util::Client` with connection pooling.
-14. On backend failure, one retry to a different backend. On success, hop-by-hop headers stripped, `X-Request-Id` added, HSTS injected if configured, `Set-Cookie` naming whichever backend served it (if sticky), and (if the response is `GET`+`200`+cacheable) stored in the cache before returning.
-
-### TCP
-
-Same accept/TLS flow. Source-IP rate limit only (no headers at L4). Backend connection established, then bidirectional pump with `tokio::try_join!` (not `select!` — half-close is preserved). One retry on connect failure.
-
-## HTTP/2
-
-HTTP/2 is negotiated over ALPN during the TLS handshake and is **on by default for every TLS listener** — an operator who writes no `[listeners.http2]` section still gets it, fully protected by the defaults below. Set `[listeners.http2] enabled = false` to keep a TLS listener on HTTP/1.1 only.
-
-A **plaintext listener always stays HTTP/1.1**, deliberately: ALPN only exists inside a TLS handshake, so there is nothing to negotiate over on an unencrypted port. This node is also the edge, so prior-knowledge h2c on a plaintext listener — starting the HTTP/2 preface with no negotiation at all — is surface nobody asked for and isn't offered; `[listeners.http2]` is rejected outright on a `tcp` listener and has no effect on the client-facing side if written under a `protocol = "http"` listener with no `[listeners.tls]`. `backend_h2c` is the one exception: see Backends below.
-
-Which protocol a connection got is decided once, right after the TLS handshake, by reading the negotiated ALPN protocol off the still-concrete `TlsStream` — there is no preface-sniffing. That result feeds two independent things: the `hyper` server builder used to drive the connection (HTTP/1.1's `header_read_timeout`, or HTTP/2's stream limits and PING keep-alive), and the `protocol` label (`http1`/`http2`) recorded on `lb_requests_total` — the same counter every request already incremented, not a new metric.
-
-### Limits
-
-Every field is optional; the values below are the defaults an unconfigured `[listeners.http2]` section gets.
-
-| Setting | Default | Bounds |
-|---|---:|---|
-| `max_concurrent_streams` | 128 | Concurrent requests per connection. Under HTTP/2, one connection carries many concurrent requests, so a per-IP *connection* cap alone no longer bounds per-IP *work*: at the defaults here, `max_connections_per_ip` (100) times `max_concurrent_streams` (128) puts the per-IP concurrency ceiling at 12,800 requests, and since each in-flight request buffers its body up to `max_request_body_bytes` (1 MiB by default), that is a per-IP memory ceiling of roughly 12.8 GiB, not the ~100 MiB HTTP/1.1 implied. `max_concurrent_streams` does not restore Phase 5's per-IP bound on its own. The mandatory `[listeners.rate_limit]` is what actually keeps admitted concurrency down: it runs before the body is read, and with `key = "source_ip"` its `burst` setting is the real per-IP concurrency bound under HTTP/2. |
-| `max_pending_accept_reset_streams` | 20 | Rapid Reset (CVE-2023-44487): a client opens streams and cancels them immediately, which evades `max_concurrent_streams` precisely by never being concurrent. 20 is deliberately h2's own built-in default (`DEFAULT_REMOTE_RESET_STREAM_MAX`) — looser is inert, since h2 enforces its own bound underneath regardless, and tighter starts cutting off ordinary client-initiated cancellations. |
-| `max_local_error_reset_streams` | 128 | Bounds resets this side is forced to send back to a client whose frames keep failing protocol validation — h2's own default here is 1024; 128 is deliberately tighter. |
-| `max_header_list_size` | 16384 | Bounds HPACK/`CONTINUATION` expansion, where a few frames can inflate into a lot of server-side header state. |
-| `max_frame_size` | 16384 | Per-frame size ceiling. |
-| `keep_alive_interval_secs` / `keep_alive_timeout_secs` | 20 / 10 | HTTP/2's liveness check, sent as PING frames on an established connection. There is deliberately no `header_read_timeout` equivalent here: an idle HTTP/2 connection is normal where an idle HTTP/1.1 one is not, and PING is what tells the two apart. |
-
-hyper's PING keep-alive only arms once the client's h2 preface has actually arrived, which leaves the window between "TLS handshake done" and "preface received" uncovered — a client that negotiates `h2` and then goes silent would otherwise hold its connection and per-IP slot forever. A `FirstByteDeadline` stream adapter (`crates/lb-server/src/first_byte.rs`) closes that gap on the HTTP/2 branch by arming a deadline at connection start and disarming it on the first byte read.
-
-The disarm condition is "a byte arrived," not "the preface completed," so a client that sends one byte and then stalls mid-preface still disarms the deadline; from there it is bounded only by the per-IP connection cap from Phase 5, not by anything h2-specific. This residual is left alone deliberately: raising the disarm threshold to the full 24-byte h2 preface would only move the attacker's cost from one byte to 24 and close nothing structurally, and a true deadline on handshake *completion* isn't something hyper exposes.
-
-### Backends
-
-Backend HTTP/2 needs no configuration when the backend is reached over `[listeners.backend_tls]`: ALPN negotiates `h2` vs. `http/1.1` per connection during the backend handshake, so a mixed fleet — some backends on HTTP/2, some not — works automatically. `[listeners.http2] backend_h2c = true` is for plaintext backends only, which have no ALPN and so no other way to advertise `h2`; it makes every backend connection prior-knowledge HTTP/2 (`http2_only(true)` on the client builder), which is only sound when the backend is known out of band to actually speak it. `backend_h2c` together with `backend_tls` is rejected at config-parse time, since a TLS backend already negotiates HTTP/2 on its own.
-
-Unlike the rest of `[listeners.http2]`, `backend_h2c` works independently of `[listeners.tls]` and of this listener's own `http2.enabled`: it is read straight off the config and applied to the outbound backend client regardless of what the frontend negotiates. Only the client-facing side needs TLS, because that side's ALPN negotiation is what TLS provides — the backend leg has no ALPN either way. A plaintext-front, plaintext-h2c-backend listener genuinely gets prior-knowledge h2c to its backends.
-
-Because an HTTP/1.1 backend's response can now land on an HTTP/2 client stream (and vice versa), hop-by-hop headers (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`, plus anything named inside `Connection`) are stripped in both directions regardless of which protocol either side used.
+- [docs/configuration-reference.md](docs/configuration-reference.md) documents every field, default and validation rule, and which fields reload live on `SIGHUP`.
+- [`config.example.toml`](config.example.toml) is an annotated configuration covering every section.
+- [`examples/`](examples/) has minimal configurations for an HTTP reverse proxy, TCP passthrough, TLS with backend re-encryption, DNS discovery, and a two-node cluster.
 
 ## Observability
 
-The admin port (`/metrics`) exposes Prometheus counters and histograms: requests by status class, latency, active connections, rate-limit rejections (local vs. cluster), backend health, circuit state, TLS handshake outcomes, and certificate expiry.
+The optional admin listener serves:
 
-An optional `[tracing]` section exports one OpenTelemetry span per HTTP request and per TCP session over OTLP/HTTP to a collector — see the commented-out example in [`config.example.toml`](config.example.toml).
+| Endpoint | Purpose |
+|---|---|
+| `GET /metrics` | Prometheus metrics: requests, latency, connections, backend health and circuit state, rate-limit rejections, retries, TLS and certificate expiry, cache, WAF. |
+| `GET /healthz` | Liveness. Always `200` — deliberately independent of backend health, so a backend outage cannot restart the load balancer in a loop. |
+| `GET /ready` | Readiness. `503` when no backend is eligible. |
+| `GET /backends` | Every backend's health, circuit, drain and in-flight state as JSON. |
+| `POST /backends/{listener}/{id}/drain` · `/undrain` | Take a backend out of rotation without a config change. |
 
-`/healthz` is always 200 — liveness must not follow backend health, or a backend outage restarts the load balancer in a loop. `/ready` returns 503 when no backend in any pool is eligible.
+Set `[admin] token_env` to require a bearer token on every admin request. The [metrics reference](docs/metrics-reference.md) lists every metric with suggested Prometheus alert rules.
 
-### Admin API access control
+## Performance
 
-None of the above is authenticated by default — exactly the risk nginx's paywalled stats page and HAProxy's single shared stats password both leave an operator to manage themselves. Set `[admin] token` or `token_env` to require every request on this port (`/metrics`, `/healthz`, `/ready`, and the backend API below) to carry a matching `Authorization: Bearer <token>` header, compared in constant time. Leaving both unset keeps the port exactly as open as it was before this existed, but it doesn't do so silently: a startup warning is logged and the `lb_admin_auth_disabled` gauge reads `1`, so an open admin port shows up on a dashboard rather than being discovered later. This listener has no TLS of its own, so the token is a second layer on top of binding privately — not a substitute for it.
+Measured with the in-repository harness against a real `lb-server` process on loopback — one Windows machine, 16 logical cores, release build, four backends. These are single-machine figures, not capacity guarantees; methodology, caveats and reproduction commands are in [docs/benchmarks.md](docs/benchmarks.md).
 
-### Admin backend API
+| Scenario | Result |
+|---|---|
+| Round robin, 128 concurrent connections | 6,189 req/s; p50 20.2 ms, p99 33.9 ms; 0 errors |
+| Backend killed mid-run (64 connections, 16 s) | 90,823 requests, 0 client-visible errors |
+| Per-request bookkeeping (pick, circuit refresh, GCRA, cluster admit), 5 backends | ≈ 2 µs |
+| Full TLS 1.3 handshake, ECDSA P-256 (client + server CPU) | ≈ 1 ms |
 
-The same private admin port also serves `GET /backends` (every listener's backends, with health/circuit/drain state, in-flight connection counts, and which route each one belongs to — `default` or a `route:N` label — as JSON) and `POST /backends/{listener}/{id}/drain` / `.../undrain` — runtime backend inspection and draining with no config edit or reload, the two things nginx paywalls into nginx Plus's dynamic reconfiguration API. A drain is a separate flag from the active health checker's own healthy/unhealthy verdict, so a passing probe doesn't silently undo an operator's drain request. It doesn't add or remove backends — that still goes through the config file and `SIGHUP`.
+Under load-dependent backend latency, the adaptive strategies shift traffic toward the backend with capacity while round robin cannot:
 
-## Evaluation Findings
-
-Real runs against a real `lb-server`, not synthetic assertions. Full methodology and numbers live in each `results/<timestamp>/` directory; the headline findings so far:
-
-- **Peak-EWMA+P2C beats round-robin under heterogeneous backend latency.** On a 10/20/100/500ms backend mix, round-robin's traffic stayed perfectly even, despite one backend being 30x slower than another (zero adaptation, by design). Peak-EWMA+P2C matched least-connections' throughput while cutting p99 latency from 507ms to 125ms. When a backend's latency jumped 30x mid-run, its share of traffic collapsed within ~1s and recovered over ~10s once it improved — a real, measurable convergence lag, not a bug.
-- **The gossip-based cluster rate limiter stays within its documented overshoot bound in 11 of 12 tested (node-count, gossip-interval) combinations** (3/5/10 nodes × 100ms/500ms/1s/5s intervals); the one exception (3 nodes, 100ms interval) exceeded it marginally (105 vs. 104 predicted), likely from `tokio::time::interval`'s immediate first tick front-loading admissions. Partition-and-restore scenarios confirmed the underlying CRDT reconciles with no lost or double-counted admissions.
-- **A bounded retry budget (GCRA-based, off by default) prevents backend-request amplification** under partial and total backend failure — measured directly via `--retry-amplification`.
-- **Circuit-breaker detection/ejection/recovery times scale plausibly with failure severity** across four injected degradation scenarios (100ms/500ms/2000ms latency spikes, 30% intermittent failure).
-- **DNS-discovered backends have a narrow readiness race**: a newly-resolved backend is marked eligible at discovery time, not after its first successful health check, so a request can rarely land on a not-yet-ready backend before its first probe completes. Also found: DNS-discovered backends never get a circuit breaker in the current wiring (health checking still applies; the separate consecutive-failure fast-fail path does not).
-- **Graceful shutdown, live reload, and restart-required-reload all behave correctly under real concurrent load**: shutdown drains in-flight requests within the configured timeout before exiting; a reload that changes the backend list preserves a manually-drained backend's drain state and an already-open circuit breaker's state; a reload that would require a restart (e.g. re-addressing a listener) is refused outright with zero dropped requests.
+| Strategy | Share to fastest backend | Throughput | p50 latency |
+|---|---:|---:|---:|
+| `round_robin` | 25.0% | 523 req/s | 152.5 ms |
+| `least_connections` | 69.9% | 1,427 req/s | 16.5 ms |
+| `peak_ewma_p2c` | 49.2% | 880 req/s | 62.7 ms |
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — crate graph, trait boundaries, wiring
-- [Request Lifecycle](docs/request-lifecycle.md) — step-by-step HTTP and TCP traces
-- [Rate Limiting](docs/rate-limiting.md) — GCRA, bounded state, cluster CRDT
-- [TLS](docs/tls.md) — termination, re-encryption, cert reloading, ALPN, HSTS
-- [Health Checking](docs/health-checking.md) — probes, circuit breaker, shared-transport invariant
-- [Cluster Coordination](docs/cluster-coordination.md) — G-Counter, gossip protocol, security
-- [Configuration Reference](docs/configuration-reference.md) — every field, its default, its validation
-- [Metrics Reference](docs/metrics-reference.md) — every metric, its labels, what to alert on
-- [Edge Hardening](docs/edge-hardening.md) — connection limits, slowloris, HTTP/2, body caps
+| Topic | |
+|---|---|
+| Getting started | [docs/getting-started.md](docs/getting-started.md) |
+| Operations and deployment | [docs/operations.md](docs/operations.md) |
+| Load balancing, routing, canary, sticky sessions | [docs/load-balancing.md](docs/load-balancing.md) |
+| Health checking, circuit breaking, outlier detection | [docs/health-checking.md](docs/health-checking.md) |
+| Rate limiting | [docs/rate-limiting.md](docs/rate-limiting.md) |
+| Cluster coordination | [docs/cluster-coordination.md](docs/cluster-coordination.md) |
+| TLS and ACME | [docs/tls.md](docs/tls.md) |
+| HTTP features: HTTP/2, caching, compression, WebSocket | [docs/http-features.md](docs/http-features.md) |
+| Edge hardening | [docs/edge-hardening.md](docs/edge-hardening.md) |
+| Configuration reference | [docs/configuration-reference.md](docs/configuration-reference.md) |
+| Metrics reference | [docs/metrics-reference.md](docs/metrics-reference.md) |
+| Request lifecycle | [docs/request-lifecycle.md](docs/request-lifecycle.md) |
+| Architecture | [docs/architecture.md](docs/architecture.md) |
+| Benchmarks | [docs/benchmarks.md](docs/benchmarks.md) |
 
-## CI
+## Project status
 
-GitHub Actions runs `cargo fmt`, `cargo clippy`, and `cargo test` on every push to `main` and every pull request.
+The current release is **0.2**. The project follows [Semantic Versioning](https://semver.org/); before 1.0, configuration keys and metric names may change between minor versions, and every such change is recorded in the [changelog](CHANGELOG.md).
+
+Known limitations, each documented on the linked page:
+
+- The proxy does not add `X-Forwarded-For` / `Forwarded` headers; backends see the load balancer's address ([HTTP features](docs/http-features.md#x-forwarded-for--forwarded)).
+- The response cache does not honor `Vary` and does not special-case `Authorization`, `Cookie` or backend `Set-Cookie` ([HTTP features](docs/http-features.md#limitations-set-cookie-authorizationcookie-and-vary)).
+- Unknown configuration keys are ignored rather than rejected ([configuration reference](docs/configuration-reference.md#top-level-structure)).
+- `SIGHUP` reload is Unix-only, and the admin listener has no TLS of its own ([operations](docs/operations.md)).
+- ACME issues single-domain certificates over HTTP-01 only ([TLS](docs/tls.md#acme-automatic-certificates)).
+
+## Contributing
+
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the development setup, the checks CI runs, and the testing standards reviewers apply. Everyone participating is expected to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Do not open public issues for security problems.
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
