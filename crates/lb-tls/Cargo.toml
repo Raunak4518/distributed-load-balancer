@@ -3,6 +3,9 @@ name = "lb-tls"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TLS termination, backend re-encryption, ACME certificates, and certificate reloading on rustls"
 
 [dependencies]
 lb-core = { path = "../lb-core" }

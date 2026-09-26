@@ -3,6 +3,9 @@ name = "lb-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core traits, backend pool, and configuration model for the distributed load balancer"
 
 [features]
 test-util = []

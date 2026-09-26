@@ -3,6 +3,9 @@ name = "lb-cluster"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Gossip-based cluster coordination: an HMAC-authenticated G-Counter CRDT for distributed rate limiting"
 
 [dependencies]
 lb-core = { path = "../lb-core" }

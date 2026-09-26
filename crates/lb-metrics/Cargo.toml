@@ -3,6 +3,9 @@ name = "lb-metrics"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Prometheus metrics registry and admin HTTP server"
 
 [dependencies]
 prometheus = { version = "0.13", default-features = false }

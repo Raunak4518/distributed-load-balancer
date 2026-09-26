@@ -3,6 +3,9 @@ name = "lb-balancer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Load-balancing strategies: round robin, least connections, weighted round robin, consistent hashing, and Peak-EWMA with power-of-two choices"
 
 [dependencies]
 lb-core = { path = "../lb-core" }

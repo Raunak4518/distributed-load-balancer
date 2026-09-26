@@ -3,6 +3,9 @@ name = "lb-bench"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Micro-benchmarks and real-traffic evaluation harnesses for the load balancer"
 
 [dependencies]
 lb-core = { path = "../lb-core" }

@@ -3,6 +3,9 @@ name = "lb-tcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Layer-4 TCP proxy data plane with half-close-preserving bidirectional forwarding"
 
 [dependencies]
 lb-core = { path = "../lb-core" }

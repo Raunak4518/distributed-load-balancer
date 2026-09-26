@@ -3,6 +3,9 @@ name = "lb-tracing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Structured logging and OpenTelemetry (OTLP) trace export"
 
 [dependencies]
 lb-core = { path = "../lb-core" }

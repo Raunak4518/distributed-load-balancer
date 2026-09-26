@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "A multi-protocol load balancer: TLS termination, HTTP/1.1 and HTTP/2, rate limiting, health checks, and distributed rate-limit coordination"
-repository = "https://github.com/Raunak4518/distributed-load-balancer"
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["load-balancer", "reverse-proxy", "rate-limiting", "http2", "tls"]
+categories = ["network-programming", "web-programming::http-server", "command-line-utilities"]
 
 [package.metadata.deb]
 maintainer = "Raunak4518 <u24ai109@aid.svnit.ac.in>"
