@@ -272,7 +272,7 @@ Under load-dependent backend latency, the adaptive strategies shift traffic towa
 
 ## Project status
 
-The current release is **0.2**. The project follows [Semantic Versioning](https://semver.org/); before 1.0, configuration keys and metric names may change between minor versions, and every such change is recorded in the [changelog](CHANGELOG.md).
+The current release is **0.3**. The project follows [Semantic Versioning](https://semver.org/); before 1.0, configuration keys and metric names may change between minor versions, and every such change is recorded in the [changelog](CHANGELOG.md).
 
 Known limitations, each documented on the linked page:
 

@@ -8,7 +8,7 @@ Security fixes are applied to the latest release and to `main`.
 
 | Version | Supported |
 |---|---|
-| Latest release (`0.2.x`) | Yes |
+| Latest release (`0.3.x`) | Yes |
 | Older releases | No — upgrade to the latest release |
 
 ## Reporting a vulnerability

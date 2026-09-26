@@ -7,28 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **WebSocket/`Upgrade` proxying.** Previously, `strip_hop_by_hop` removed
-  the `Connection` and `Upgrade` headers on every request and response
-  unconditionally, so a WebSocket handshake was silently mangled and any
-  client routed through this load balancer for WebSocket traffic simply
-  broke. A request carrying `Connection: Upgrade` + `Upgrade: websocket` is
-  now detected before that stripping happens, dialed to the backend over
-  its own dedicated, non-pooled HTTP/1.1 connection (never the shared
-  pooled client -- reusing a pooled connection that's mid-WebSocket-stream
-  for an unrelated request would be a cross-talk bug), and on a `101`, both
-  legs are handed off (`hyper::upgrade`) to a background byte-pump reusing
-  `lb_tcp::pump` verbatim. HTTP/1.1 only on both legs for v1 -- h2's own
-  upgrade mechanism (RFC 8441 extended CONNECT) is a different bootstrapping
-  protocol and out of scope; an h2 client connection has no `Upgrade` header
-  semantics anyway. New `websocket_idle_timeout_ms` (HTTP listeners,
-  default 300s) governs the post-upgrade connection once the request-shaped
-  timeouts stop applying. New `lb_websocket_upgrades_total{listener,result}`
-  metric.
+## [0.3.0] - 2026-09-26
 
 ### Added
 
+- **ACME automatic certificates** (`[listeners.tls.certificates.acme]`):
+  per-certificate issuance and renewal over HTTP-01, with a self-signed
+  bootstrap certificate so the listener can serve before the first order
+  completes, a retry ladder across an optional fallback and staging
+  directory with exponential backoff, and hand-off to the existing
+  certificate hot-reloader.
+- **`peak_ewma_p2c` load-balancing strategy**: power-of-two-choices over a
+  decaying per-backend latency estimate multiplied by in-flight requests,
+  so traffic shifts away from slow or overloaded backends without any
+  configured weights.
+- **Passive health signals** (`health_check.unhealthy_latency_ms`,
+  `health_check.unhealthy_request_count`): a slow or over-loaded backend
+  trips its circuit breaker even when every response succeeds.
+- **Circuit-breaker recovery controls**: `half_open_successes_required`
+  (N consecutive successes to close) and flap backoff
+  (`flap_backoff_multiplier`, `max_flap_cooldown_ms`,
+  `flap_streak_reset_ms`) that lengthens the cooldown for a backend that
+  keeps re-tripping.
+- **Outlier detection** (`[listeners.health_check.outlier_detection]`):
+  ejects a backend whose success rate falls a configurable number of
+  standard deviations below its peers'. `health_check.max_ejected_fraction`
+  caps how much of a pool circuit trips and outlier ejections may remove at
+  once, so a correlated failure cannot empty the pool.
+- **Retry budget** (`[listeners.retry_budget]`): a listener-wide GCRA
+  bucket that caps retries, preventing retry-driven load amplification
+  during a backend outage. New `lb_retry_*` counters record attempts,
+  outcomes, budget admits/denials, and skipped non-idempotent retries.
+- **`waf.inspect_headers`**: optionally applies the WAF rules to the
+  `User-Agent`, `Referer` and `Cookie` headers as well as the path and
+  query.
+- **`proxy_protocol_timeout_ms`** (default 1000): bounds how long a
+  listener waits for a PROXY protocol header.
+- **Cluster metrics**: `lb_ratelimit_cluster_convergence_bound` exposes the
+  theoretical gossip over-admission bound per listener, and
+  `lb_cluster_future_skew_rejections_total{peer}` counts peer counter cells
+  dropped for being too far in the future (label bounded to 64 peers plus
+  `other`).
+- **Evaluation harnesses**: `lb-bench-e2e` (strategy comparison,
+  heterogeneous backends, retry amplification, reliability, convergence,
+  failure patterns, concurrency signal), `lb-bench-cluster` (gossip
+  convergence bound and partition recovery) and `lb-bench-h2-stress`
+  (HTTP/2 Rapid Reset). Runs are persisted to
+  `results/<timestamp>/{metadata.json,results.csv}`.
+- **Windows**: `Ctrl+Break` now triggers graceful shutdown alongside
+  `Ctrl+C`.
+- **Documentation and project files**: every page under `docs/` rewritten
+  against the code, new getting-started, operations, load-balancing and
+  HTTP-features guides, a documentation index, `CONTRIBUTING.md`,
+  `SECURITY.md`, `CODE_OF_CONDUCT.md`, GitHub issue and pull-request
+  templates, Dependabot, and a pinned `stable` toolchain.
 - **`[admin] token` / `token_env`**: optional bearer-token access control
   for the entire admin surface -- `/metrics`, `/healthz`, `/ready`, and
   `GET`/`POST /backends`. Checked once, centrally, in
@@ -223,6 +255,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[tracing]` still require a restart — a reload that would need one is
   refused outright, logged with the reason, and changes nothing.
 
+### Changed
+
+- **Non-idempotent requests are no longer retried.** A failed `POST`,
+  `PATCH` or other non-idempotent request now returns the error instead of
+  being resent to another backend, so a request is never applied twice.
+- **Response cache accounting** now counts the key, every header and a fixed
+  per-entry overhead toward `max_total_bytes`, measured against real
+  allocations. The same budget therefore holds fewer small entries than
+  before, but it now bounds actual memory.
+- **`SIGHUP` reload** now refuses changes to `compression`,
+  `proxy_protocol`, `write_timeout_ms` and `client_tcp_keepalive`, which it
+  previously accepted and silently ignored.
+- **Resource bounds**: the backend client keeps at most 32 idle connections
+  per host; the gossip peer listener accepts at most 4 concurrent
+  connections per peer with a 30s read timeout; a gossip message carries at
+  most 5,000 counter entries, rotating through the rest on later rounds; the
+  cluster counter store tracks at most 100,000 keys.
+- **Performance**: the circuit breaker is lock-free, backend ids are
+  interned, per-call allocations were removed from the rate limiter and
+  cluster store, the consistent-hash ring is cached between membership
+  changes, and backend selection no longer hashes every backend on each
+  pick (3-5x faster `pick()` on large pools).
+
+### Fixed
+
+- **WebSocket/`Upgrade` proxying.** Previously, `strip_hop_by_hop` removed
+  the `Connection` and `Upgrade` headers on every request and response
+  unconditionally, so a WebSocket handshake was silently mangled and any
+  client routed through this load balancer for WebSocket traffic simply
+  broke. A request carrying `Connection: Upgrade` + `Upgrade: websocket` is
+  now detected before that stripping happens, dialed to the backend over
+  its own dedicated, non-pooled HTTP/1.1 connection (never the shared
+  pooled client -- reusing a pooled connection that's mid-WebSocket-stream
+  for an unrelated request would be a cross-talk bug), and on a `101`, both
+  legs are handed off (`hyper::upgrade`) to a background byte-pump reusing
+  `lb_tcp::pump` verbatim. HTTP/1.1 only on both legs for v1 -- h2's own
+  upgrade mechanism (RFC 8441 extended CONNECT) is a different bootstrapping
+  protocol and out of scope; an h2 client connection has no `Upgrade` header
+  semantics anyway. New `websocket_idle_timeout_ms` (HTTP listeners,
+  default 300s) governs the post-upgrade connection once the request-shaped
+  timeouts stop applying. New `lb_websocket_upgrades_total{listener,result}`
+  metric.
+- A `SIGHUP` reload now preserves manually drained backends and in-progress
+  circuit-breaker state instead of returning every backend to rotation.
+- DNS-discovered backends now get real active health checks, and per-backend
+  clients for addresses DNS stopped returning are released.
+- A stale success no longer cancels an open circuit breaker's cooldown.
+- The TCP proxy's idle timeout is now shared across both directions rather
+  than tracked per direction.
+- Cluster counter merge now tolerates ordinary clock skew between nodes (up
+  to 5s) while rejecting further-future cells that could never be pruned.
+- Response cache: fixed races that could evict a freshly stored entry or
+  corrupt the byte counter under concurrent writes, and HTTP/2 requests are
+  now keyed by `:authority`, so two hosts can no longer share an entry.
+- A connection guard outliving a backend's removal and re-addition could
+  corrupt the new backend's in-flight count; re-resolving an unchanged DNS
+  answer no longer invalidates cached balancer state.
+- `peak_ewma_p2c` could lose latency updates under concurrent requests, and
+  its decay math is hardened against overflow and NaN.
+- A client that opened a connection to a `proxy_protocol` listener and sent
+  nothing could hold the connection open indefinitely.
+
 ## [0.2.0] - 2026-09-12
 
 ### Added
@@ -303,3 +397,8 @@ balancer with distributed rate limiting, TLS termination, and HTTP/2 support.
 - Looking up a circuit breaker for a backend with no pre-built entry no
   longer panics; the request now proceeds without circuit-breaker
   bookkeeping for that backend instead of crashing the connection.
+
+[Unreleased]: https://github.com/Raunak4518/distributed-load-balancer/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Raunak4518/distributed-load-balancer/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Raunak4518/distributed-load-balancer/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Raunak4518/distributed-load-balancer/releases/tag/v0.1.0
