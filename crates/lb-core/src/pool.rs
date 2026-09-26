@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 struct BackendState {
-    backend: Backend,
+    id: BackendId,
+    backend: ArcSwap<Backend>,
     active_healthy: AtomicBool,
     circuit_open: AtomicBool,
     /// Operator-requested drain (the admin API's `POST .../drain`),
@@ -42,7 +43,8 @@ impl PoolState {
         for b in backends {
             let id = b.id.clone();
             let state = Arc::new(BackendState {
-                backend: b,
+                id: b.id.clone(),
+                backend: ArcSwap::from_pointee(b),
                 active_healthy: AtomicBool::new(true),
                 circuit_open: AtomicBool::new(false),
                 manually_drained: AtomicBool::new(false),
@@ -91,7 +93,11 @@ impl BackendPool {
     }
 
     pub fn backend(&self, id: &BackendId) -> Option<Backend> {
-        self.inner.load().states.get(id).map(|s| s.backend.clone())
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .map(|s| s.backend.load().as_ref().clone())
     }
 
     pub fn set_active_healthy(&self, id: &BackendId, healthy: bool) {
@@ -247,11 +253,11 @@ impl BackendPool {
     }
 
     pub fn eligible_backends(&self) -> Vec<BackendId> {
-        self.eligible_map(|s| s.backend.id.clone())
+        self.eligible_map(|s| s.id.clone())
     }
 
     pub fn eligible_with_weights(&self) -> Vec<(BackendId, u32)> {
-        self.eligible_map(|s| (s.backend.id.clone(), s.backend.weight))
+        self.eligible_map(|s| (s.id.clone(), s.backend.load().weight))
     }
 
     fn eligible_map<R>(&self, f: impl Fn(&BackendState) -> R) -> Vec<R> {
@@ -317,25 +323,15 @@ impl BackendPool {
         for b in backends {
             order.push(b.id.clone());
             let state = match previous.states.get(&b.id) {
-                Some(existing) => Arc::new(BackendState {
-                    backend: b,
-                    active_healthy: AtomicBool::new(existing.active_healthy.load(Ordering::SeqCst)),
-                    circuit_open: AtomicBool::new(existing.circuit_open.load(Ordering::SeqCst)),
-                    manually_drained: AtomicBool::new(
-                        existing.manually_drained.load(Ordering::SeqCst),
-                    ),
-                    outlier_ejected: AtomicBool::new(
-                        existing.outlier_ejected.load(Ordering::SeqCst),
-                    ),
+                Some(existing) => {
                     // A persisting backend's in-flight work didn't go
                     // anywhere just because the pool was refreshed.
-                    active_conns: AtomicUsize::new(existing.active_conns.load(Ordering::SeqCst)),
-                    awaiting_first_probe: AtomicBool::new(
-                        existing.awaiting_first_probe.load(Ordering::SeqCst),
-                    ),
-                }),
+                    existing.backend.store(Arc::new(b));
+                    Arc::clone(existing)
+                }
                 None => Arc::new(BackendState {
-                    backend: b,
+                    id: b.id.clone(),
+                    backend: ArcSwap::from_pointee(b),
                     active_healthy: AtomicBool::new(true),
                     circuit_open: AtomicBool::new(false),
                     manually_drained: AtomicBool::new(false),
@@ -373,13 +369,16 @@ fn resolved_set_unchanged(previous: &PoolState, backends: &[Backend]) -> bool {
     }
     let mut new_sorted: Vec<&Backend> = backends.iter().collect();
     new_sorted.sort_by(|a, b| a.id.cmp(&b.id));
-    let mut prev_sorted: Vec<&Backend> = previous
+    let mut prev_sorted: Vec<Arc<Backend>> = previous
         .order
         .iter()
-        .filter_map(|id| previous.states.get(id).map(|s| &s.backend))
+        .filter_map(|id| previous.states.get(id).map(|s| s.backend.load_full()))
         .collect();
     prev_sorted.sort_by(|a, b| a.id.cmp(&b.id));
-    new_sorted == prev_sorted
+    new_sorted
+        .iter()
+        .zip(&prev_sorted)
+        .all(|(new, prev)| *new == prev.as_ref())
 }
 
 /// Returned by `BackendPool::track_active`. Decrements the count on `Drop`
@@ -846,6 +845,42 @@ mod tests {
 
     fn backend(id: &str) -> Backend {
         Backend::new(id, "127.0.0.1:9000".parse().unwrap(), 1, None)
+    }
+
+    #[test]
+    fn in_flight_guards_taken_before_a_refresh_still_release_their_count() {
+        let pool = Arc::new(pool_of(&["a"]));
+        let id = BackendId::new("a");
+        let guards: Vec<_> = (0..3).map(|_| pool.track_active(&id)).collect();
+        pool.apply_resolved(vec![Backend::new(
+            "a",
+            "127.0.0.1:9000".parse().unwrap(),
+            2,
+            None,
+        )]);
+        assert_eq!(pool.active_count(&id), 3);
+        let late = pool.track_active(&id);
+        assert_eq!(pool.active_count(&id), 4);
+        drop(guards);
+        drop(late);
+        assert_eq!(pool.active_count(&id), 0);
+        assert_eq!(pool.backend(&id).unwrap().weight, 2);
+    }
+
+    #[test]
+    fn a_write_through_a_pre_refresh_snapshot_is_visible_after_the_refresh() {
+        let pool = pool_of(&["a", "b"]);
+        let id = BackendId::new("a");
+        let stale = pool.inner.load().states.get(&id).cloned().unwrap();
+        pool.apply_resolved(vec![
+            Backend::new("a", "127.0.0.1:9000".parse().unwrap(), 5, None),
+            Backend::new("b", "127.0.0.1:9000".parse().unwrap(), 1, None),
+        ]);
+        stale.manually_drained.store(true, Ordering::SeqCst);
+        stale.active_healthy.store(false, Ordering::SeqCst);
+        assert!(pool.is_manually_drained(&id));
+        assert!(!pool.is_active_healthy(&id));
+        assert_eq!(pool.backend(&id).unwrap().weight, 5);
     }
 
     #[test]
