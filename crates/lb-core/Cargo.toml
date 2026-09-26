@@ -27,3 +27,4 @@ http = "1"
 # some.
 tokio = { version = "1", default-features = false }
 arc-swap = "1"
+ipnet = { version = "2", features = ["serde"] }

@@ -87,13 +87,15 @@ async fn route(
     extension: Option<AdminExtension>,
     admin_token: Option<Arc<[u8]>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    // Checked before anything else, so every route below (including
-    // `extension`'s, which owns everything under /backends) is covered by
-    // one check instead of needing its own. A byte-wise `==` here would leak
-    // how much of the presented token matched through timing -- the same
-    // concern `lb-cluster`'s gossip HMAC check already guards against --
-    // hence `ConstantTimeEq` rather than a plain comparison.
-    if let Some(token) = &admin_token {
+    // Checked before anything else, so every route below except `/healthz`
+    // and `/ready` (including `extension`'s, which owns everything under
+    // /backends) is covered by one check instead of needing its own. A
+    // byte-wise `==` here would leak how much of the presented token matched
+    // through timing -- the same concern `lb-cluster`'s gossip HMAC check
+    // already guards against -- hence `ConstantTimeEq` rather than a plain
+    // comparison.
+    let is_probe = matches!(req.uri().path(), "/healthz" | "/ready");
+    if let Some(token) = admin_token.as_ref().filter(|_| !is_probe) {
         let presented = req
             .headers()
             .get(AUTHORIZATION)
@@ -127,16 +129,14 @@ async fn route(
         // partial outage into a crash loop.
         "/healthz" => text(StatusCode::OK, "ok".to_string()),
 
-        // Readiness: should this instance receive traffic? False when there is
-        // nowhere to forward, which removes it from rotation without killing it.
+        // Readiness: should this instance receive traffic? False when a
+        // listener has nowhere to forward or is serving an expired
+        // certificate, which removes it from rotation without killing it.
         "/ready" => {
             if readiness() {
                 text(StatusCode::OK, "ready".to_string())
             } else {
-                text(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "no eligible backend".to_string(),
-                )
+                text(StatusCode::SERVICE_UNAVAILABLE, "not ready".to_string())
             }
         }
 
@@ -229,6 +229,19 @@ mod tests {
         assert!(metrics
             .gather_text()
             .contains("lb_admin_auth_failures_total 1"));
+    }
+
+    #[tokio::test]
+    async fn the_probes_answer_without_a_token_while_everything_else_requires_it() {
+        let (base, _) = start_with_token("s3cret").await;
+        for path in ["/healthz", "/ready"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 200, "{path} must not require the token");
+        }
+        for path in ["/metrics", "/backends", "/ready/../metrics"] {
+            let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+            assert_eq!(resp.status(), 401, "{path} must require the token");
+        }
     }
 
     #[tokio::test]

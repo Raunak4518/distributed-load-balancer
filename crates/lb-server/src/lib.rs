@@ -4,6 +4,7 @@ mod dns;
 mod first_byte;
 mod limits;
 mod proxy_protocol;
+mod readiness;
 pub mod reload;
 mod shutdown;
 mod wiring;
@@ -81,7 +82,7 @@ pub async fn run_and_report_reload_handle(
         cluster,
         metrics,
         admin_listen,
-        pools,
+        tls_resolvers,
         reload,
     } = build_app(&config, cluster_secret)?;
 
@@ -174,11 +175,14 @@ pub async fn run_and_report_reload_handle(
             );
         }
 
-        // Ready when any listener has somewhere to forward. If every backend
-        // is down, this instance should leave rotation — but stay alive, since
-        // restarting it would not bring the backends back.
-        let readiness: lb_metrics::ReadinessCheck =
-            Arc::new(move || pools.iter().any(|p| !p.eligible_backends().is_empty()));
+        // Ready when every listener has somewhere to forward and none is
+        // serving an expired certificate. Otherwise this instance should leave
+        // rotation — but stay alive, since restarting it would not bring the
+        // backends back or renew the certificate.
+        let ready_state = Arc::clone(&reload);
+        let readiness: lb_metrics::ReadinessCheck = Arc::new(move || {
+            readiness::is_ready(&ready_state, &tls_resolvers, readiness::unix_now())
+        });
         cluster_tasks.push(lb_metrics::spawn_admin_server(
             Arc::clone(&metrics),
             admin_listener,
@@ -270,6 +274,12 @@ async fn serve_listener(
             },
             _ = shutdown.changed() => break,
         };
+
+        if runtime.proxy_protocol() && !runtime.proxy_source_trusted(peer.ip()) {
+            runtime.metrics().connections_rejected_untrusted_proxy.inc();
+            tracing::debug!(listener = %runtime.name(), peer = %peer, "PROXY protocol connection from an untrusted source");
+            continue;
+        }
 
         // Must follow accept(): the peer address is unknowable before it.
         let ip_guard = if runtime.proxy_protocol() {

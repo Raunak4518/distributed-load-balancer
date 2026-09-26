@@ -438,6 +438,9 @@ impl Metrics {
             connections_rejected_per_ip: self
                 .connections_rejected
                 .with_label_values(&[name, "max_per_ip"]),
+            connections_rejected_untrusted_proxy: self
+                .connections_rejected
+                .with_label_values(&[name, "untrusted_proxy"]),
             timeouts_header: self.request_timeouts.with_label_values(&[name, "header"]),
             timeouts_body: self.request_timeouts.with_label_values(&[name, "body"]),
             timeouts_upstream_body: self

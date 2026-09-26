@@ -80,6 +80,7 @@ pub struct ListenerMetrics {
     // limit you only learn about during an incident.
     pub connections_rejected_max: IntCounter,
     pub connections_rejected_per_ip: IntCounter,
+    pub connections_rejected_untrusted_proxy: IntCounter,
     pub timeouts_header: IntCounter,
     pub timeouts_body: IntCounter,
     pub timeouts_upstream_body: IntCounter,

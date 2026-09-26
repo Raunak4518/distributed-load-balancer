@@ -48,9 +48,9 @@ listen = "{traffic_listen}"
 }
 
 /// A real running server with `[admin] token` configured: the admin surface
-/// -- `/metrics`, `/healthz`, `/ready`, and (via the extension) `/backends`
-/// -- all reject a request with no `Authorization` header, and all accept
-/// one with the correct `Bearer` token. Proves the auth check is wired
+/// -- `/metrics` and (via the extension) `/backends` -- rejects a request
+/// with no `Authorization` header and accepts one with the correct `Bearer`
+/// token, while the `/healthz` and `/ready` probes answer without one. Proves the auth check is wired
 /// through the real `lb_server::run` startup path, not just exercised at
 /// the `lb-metrics` unit level.
 #[tokio::test]
@@ -63,7 +63,20 @@ async fn admin_endpoints_require_the_configured_bearer_token() {
 
     let client = reqwest::Client::new();
 
-    for path in ["/metrics", "/healthz", "/ready", "/backends"] {
+    for path in ["/healthz", "/ready"] {
+        let resp = client
+            .get(format!("http://{admin_listen}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "probe {path} must not require the token"
+        );
+    }
+
+    for path in ["/metrics", "/backends"] {
         let resp = client
             .get(format!("http://{admin_listen}{path}"))
             .send()
@@ -93,9 +106,8 @@ async fn admin_endpoints_require_the_configured_bearer_token() {
             .send()
             .await
             .unwrap();
-        // Not necessarily 200 (e.g. `/ready` is 503 with no reachable
-        // backend, which this fixture deliberately has none of) -- the
-        // thing under test is that the correct token isn't rejected.
+        // Not necessarily 200 -- the thing under test is that the correct
+        // token isn't rejected.
         assert_ne!(
             resp.status(),
             StatusCode::UNAUTHORIZED,

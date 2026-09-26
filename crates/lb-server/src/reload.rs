@@ -54,6 +54,7 @@ fn restart_only_fields_changed(old: &ListenerConfig, new: &ListenerConfig) -> bo
         || old.compression != new.compression
         || old.proxy_protocol != new.proxy_protocol
         || old.proxy_protocol_timeout_ms != new.proxy_protocol_timeout_ms
+        || old.proxy_protocol_trusted_cidrs != new.proxy_protocol_trusted_cidrs
         || old.client_tcp_keepalive != new.client_tcp_keepalive
 }
 
@@ -109,8 +110,8 @@ pub async fn apply_reload(
         if restart_only_fields_changed(old_lc, new_lc) {
             return ReloadOutcome::Refused(format!(
                 "listener '{}': tls, backend_tls, http2, connection limits, write_timeout_ms, \
-                 compression, proxy_protocol, proxy_protocol_timeout_ms, or client_tcp_keepalive \
-                 changed -- requires a restart",
+                 compression, proxy_protocol, proxy_protocol_timeout_ms, \
+                 proxy_protocol_trusted_cidrs, or client_tcp_keepalive changed -- requires a restart",
                 new_lc.name
             ));
         }
@@ -452,7 +453,7 @@ mod tests {
 
         let new = Config::parse(&TWO_LISTENERS.replacen(
             "listen = \"127.0.0.1:19801\"",
-            "listen = \"127.0.0.1:19801\"\n        proxy_protocol = true",
+            "listen = \"127.0.0.1:19801\"\n        proxy_protocol = true\n        proxy_protocol_trusted_cidrs = [\"127.0.0.0/8\"]",
             1,
         ))
         .unwrap();

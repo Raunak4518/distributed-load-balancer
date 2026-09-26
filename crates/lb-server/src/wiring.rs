@@ -63,6 +63,7 @@ pub enum ListenerRuntime {
         /// module docs for the trust model this implies.
         proxy_protocol: bool,
         proxy_protocol_timeout: Duration,
+        proxy_protocol_trusted_cidrs: Vec<ipnet::IpNet>,
         /// Whether responses get gzip/brotli/deflate/zstd compression --
         /// see `compression`'s module docs.
         compression: bool,
@@ -90,6 +91,7 @@ pub enum ListenerRuntime {
         metrics: Arc<lb_metrics::ListenerMetrics>,
         proxy_protocol: bool,
         proxy_protocol_timeout: Duration,
+        proxy_protocol_trusted_cidrs: Vec<ipnet::IpNet>,
         tls: Option<Arc<lb_tls::TlsAcceptor>>,
         client_tcp_keepalive: Option<lb_core::TcpKeepaliveConfig>,
     },
@@ -124,6 +126,22 @@ impl ListenerRuntime {
         match self {
             ListenerRuntime::Http { proxy_protocol, .. }
             | ListenerRuntime::Tcp { proxy_protocol, .. } => *proxy_protocol,
+        }
+    }
+
+    pub fn proxy_source_trusted(&self, peer: std::net::IpAddr) -> bool {
+        let peer = peer.to_canonical();
+        match self {
+            ListenerRuntime::Http {
+                proxy_protocol_trusted_cidrs,
+                ..
+            }
+            | ListenerRuntime::Tcp {
+                proxy_protocol_trusted_cidrs,
+                ..
+            } => proxy_protocol_trusted_cidrs
+                .iter()
+                .any(|net| net.contains(&peer)),
         }
     }
 
@@ -210,8 +228,8 @@ pub struct WiredApp {
     /// Always collected; `admin_listen` controls whether it is exposed.
     pub metrics: Arc<Metrics>,
     pub admin_listen: Option<SocketAddr>,
-    /// Every listener's pool, for the readiness check.
-    pub pools: Vec<Arc<BackendPool>>,
+    /// Every TLS listener's certificates, for the readiness check.
+    pub tls_resolvers: Vec<Arc<lb_tls::SniResolver>>,
     /// Everything `reload::apply_reload` needs to reach a running listener's
     /// swappable context and replace its health-checker/DNS-poller/sweeper
     /// tasks. Kept on `WiredApp` (built once, alongside everything else)
@@ -287,7 +305,7 @@ pub fn build_app(
 ) -> Result<WiredApp, std::io::Error> {
     let mut listeners = Vec::with_capacity(config.listeners.len());
     let mut tls_reload_tasks = Vec::new();
-    let mut pools = Vec::with_capacity(config.listeners.len());
+    let mut tls_resolvers = Vec::new();
     let mut reload_listeners = HashMap::with_capacity(config.listeners.len());
     let mut reload_tasks = HashMap::with_capacity(config.listeners.len());
 
@@ -361,13 +379,6 @@ pub fn build_app(
             &acme_challenges,
             None,
         );
-        pools.push(Arc::clone(&core.pool));
-        for route in &core.routes {
-            pools.push(Arc::clone(&route.pool));
-        }
-        for pool in &core.canary {
-            pools.push(Arc::clone(&pool.pool));
-        }
         let tasks = spawn_listener_tasks(lc, &core, &metrics);
         reload_tasks.insert(lc.name.clone(), tasks);
 
@@ -385,6 +396,7 @@ pub fn build_app(
         // touches TLS (see `reload`'s module docs), so this must never be
         // among the tasks a ctx reload aborts and respawns.
         if let (Some(acceptor), Some(tls_cfg)) = (tls.as_ref(), lc.tls.as_ref()) {
+            tls_resolvers.push(Arc::clone(acceptor.resolver()));
             tls_reload_tasks.push(lb_tls::spawn_reloader(
                 lc.name.clone(),
                 tls_cfg.certificates.clone(),
@@ -432,6 +444,7 @@ pub fn build_app(
                     write_timeout: lc.write_timeout(),
                     proxy_protocol: lc.proxy_protocol,
                     proxy_protocol_timeout: lc.proxy_protocol_timeout(),
+                    proxy_protocol_trusted_cidrs: lc.proxy_protocol_trusted_cidrs.clone(),
                     compression: lc.compression,
                     tls,
                     // Built from the same `http2_enabled()` the TLS acceptor's
@@ -459,6 +472,7 @@ pub fn build_app(
                     metrics: Arc::clone(&listener_metrics),
                     proxy_protocol: lc.proxy_protocol,
                     proxy_protocol_timeout: lc.proxy_protocol_timeout(),
+                    proxy_protocol_trusted_cidrs: lc.proxy_protocol_trusted_cidrs.clone(),
                     tls,
                     client_tcp_keepalive: lc.client_tcp_keepalive.clone(),
                 }
@@ -485,7 +499,7 @@ pub fn build_app(
         cluster,
         metrics: Arc::clone(&metrics),
         admin_listen: config.admin.as_ref().map(|a| a.listen),
-        pools,
+        tls_resolvers,
         reload: Arc::new(ReloadState {
             metrics,
             acme_challenges,
@@ -516,14 +530,12 @@ pub(crate) struct ListenerCore {
     /// config validation for `Protocol::Tcp`). Kept alongside the default
     /// `backends`/`pool` above so `spawn_listener_tasks` can spawn health
     /// checkers for every route's backends the same way it does for the
-    /// default set, and so `build_app` can add every route's pool to the
-    /// readiness check.
+    /// default set.
     pub(crate) routes: Vec<RoutePool>,
     /// One entry per `[[listeners.canary]]` pool, in declaration order --
     /// always empty for a TCP listener (canary is HTTP-only, rejected at
     /// config validation for `Protocol::Tcp`). Same role as `routes` above:
-    /// lets `spawn_listener_tasks` spawn each pool's own health checkers and
-    /// `build_app` add each pool to the readiness check.
+    /// lets `spawn_listener_tasks` spawn each pool's own health checkers.
     pub(crate) canary: Vec<CanaryPool>,
 }
 
@@ -545,10 +557,10 @@ pub(crate) struct RoutePool {
 /// One `[[listeners.canary]]` pool's built pool -- see `ListenerCore::canary`.
 /// Mirrors `RoutePool` exactly: no `percent` here, for the same reason
 /// `RoutePool` carries no `path_prefix`/`host` -- this struct exists only for
-/// health-checker spawning and the readiness check, neither of which needs
-/// it. `percent` lives on `lb_proxy::CompiledCanaryPool` instead, the only
-/// place it's ever consulted (request-time pool selection, and the admin
-/// API's label, which reads it from the same live `ProxyContext`).
+/// health-checker spawning, which does not need it. `percent` lives on
+/// `lb_proxy::CompiledCanaryPool` instead, the only place it's ever consulted
+/// (request-time pool selection, and the admin API's label, which reads it
+/// from the same live `ProxyContext`).
 pub(crate) struct CanaryPool {
     pub(crate) backends: Vec<Backend>,
     pub(crate) pool: Arc<BackendPool>,

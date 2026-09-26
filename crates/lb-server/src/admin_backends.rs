@@ -46,7 +46,10 @@ pub fn extension(reload: Arc<ReloadState>) -> lb_metrics::AdminExtension {
 /// across all of them by id -- safe because `Config::validate()` requires
 /// every backend id on a listener to be unique across its default backends,
 /// every route's, and every canary pool's.
-fn pools_for(reload: &ReloadState, listener: &str) -> Option<Vec<(String, Arc<BackendPool>)>> {
+pub(crate) fn pools_for(
+    reload: &ReloadState,
+    listener: &str,
+) -> Option<Vec<(String, Arc<BackendPool>)>> {
     match reload.listeners.get(listener)? {
         ListenerReloadHandle::Http(ctx) => {
             let ctx = ctx.load();

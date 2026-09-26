@@ -44,6 +44,7 @@ assets = [
 
 [dependencies]
 lb-core = { path = "../lb-core" }
+ipnet = "2"
 lb-ratelimit = { path = "../lb-ratelimit" }
 lb-balancer = { path = "../lb-balancer" }
 lb-healthcheck = { path = "../lb-healthcheck" }

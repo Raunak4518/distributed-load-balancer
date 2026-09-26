@@ -28,6 +28,7 @@ name = "web"
 protocol = "http"
 listen = "{listen}"
 proxy_protocol = true
+proxy_protocol_trusted_cidrs = ["127.0.0.0/8"]
 
   [[listeners.backends]]
   id = "b1"
@@ -63,6 +64,7 @@ name = "web"
 protocol = "http"
 listen = "{listen}"
 proxy_protocol = true
+proxy_protocol_trusted_cidrs = ["127.0.0.0/8"]
 proxy_protocol_timeout_ms = {timeout_ms}
 
   [[listeners.backends]]
@@ -532,6 +534,7 @@ name = "web"
 protocol = "http"
 listen = "{listen}"
 proxy_protocol = true
+proxy_protocol_trusted_cidrs = ["127.0.0.0/8"]
 proxy_protocol_timeout_ms = 200
 max_connections_per_ip = 1
 
@@ -606,4 +609,38 @@ Connection: close
         String::from_utf8_lossy(&response)
     );
     drop(held);
+}
+
+#[tokio::test]
+async fn a_proxy_header_from_an_untrusted_source_is_never_read() {
+    let (backend, count) = spawn_counting_backend(StatusCode::OK).await;
+    let trusted = free_addr().await;
+    let untrusted = free_addr().await;
+    for (listen, cidr) in [(trusted, "127.0.0.0/8"), (untrusted, "10.0.0.0/8")] {
+        let text = proxy_protocol_config(listen, backend).replacen("127.0.0.0/8", cidr, 1);
+        tokio::spawn(lb_server::run(Config::parse(&text).unwrap(), None));
+        support::wait_until_listening(listen).await;
+    }
+
+    assert_eq!(
+        get_via_proxy_protocol(trusted, "10.0.0.1").await,
+        StatusCode::OK
+    );
+    let served = count.load(std::sync::atomic::Ordering::SeqCst);
+
+    let mut stream = TcpStream::connect(untrusted).await.unwrap();
+    stream
+        .write_all(b"PROXY TCP4 10.0.0.2 10.0.0.99 51234 443\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("an untrusted connection must be closed, not left open");
+    assert!(
+        read.is_err() || response.is_empty(),
+        "a connection from outside proxy_protocol_trusted_cidrs must be refused, got: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), served);
 }

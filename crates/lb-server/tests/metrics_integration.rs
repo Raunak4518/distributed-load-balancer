@@ -233,3 +233,170 @@ async fn a_stalled_request_head_is_counted_as_a_header_timeout() {
         1.0
     );
 }
+
+fn listener_toml(name: &str, listen: SocketAddr, backend: SocketAddr, tls: &str) -> String {
+    format!(
+        r#"
+[[listeners]]
+name = "{name}"
+protocol = "http"
+listen = "{listen}"
+{tls}
+  [[listeners.backends]]
+  id = "{name}-1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 200
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 1000
+  burst = 1000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    )
+}
+
+async fn ready_status(admin: SocketAddr) -> u16 {
+    reqwest::get(format!("http://{admin}/ready"))
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+async fn admin_post(admin: SocketAddr, path: &str) -> u16 {
+    reqwest::Client::new()
+        .post(format!("http://{admin}{path}"))
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+#[tokio::test]
+async fn ready_fails_when_any_one_listener_has_nowhere_to_forward() {
+    let (web_backend, _) = spawn_counting_backend(StatusCode::OK).await;
+    let (api_backend, _) = spawn_counting_backend(StatusCode::OK).await;
+    let admin = free_addr().await;
+    let web = free_addr().await;
+    let api = free_addr().await;
+    let text = format!(
+        "[admin]\nlisten = \"{admin}\"\n{}{}",
+        listener_toml("web", web, web_backend, ""),
+        listener_toml("api", api, api_backend, "")
+    );
+    tokio::spawn(lb_server::run(Config::parse(&text).unwrap(), None));
+    support::wait_until_listening(web).await;
+    support::wait_until_listening(api).await;
+    support::wait_until_listening(admin).await;
+
+    assert_eq!(ready_status(admin).await, 200);
+    assert_eq!(admin_post(admin, "/backends/api/api-1/drain").await, 200);
+    assert_eq!(
+        ready_status(admin).await,
+        503,
+        "a listener with every backend drained cannot serve, even though another listener can"
+    );
+    assert_eq!(admin_post(admin, "/backends/api/api-1/undrain").await, 200);
+    assert_eq!(ready_status(admin).await, 200);
+}
+
+#[tokio::test]
+async fn ready_reads_the_pools_a_reload_swapped_in() {
+    let (first, _) = spawn_counting_backend(StatusCode::OK).await;
+    let (second, _) = spawn_counting_backend(StatusCode::OK).await;
+    let admin = free_addr().await;
+    let web = free_addr().await;
+    let config_for = |backend| {
+        Config::parse(&format!(
+            "[admin]\nlisten = \"{admin}\"\n{}",
+            listener_toml("web", web, backend, "")
+        ))
+        .unwrap()
+    };
+    let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(lb_server::run_and_report_reload_handle(
+        config_for(first),
+        None,
+        Some(report_tx),
+    ));
+    support::wait_until_listening(web).await;
+    support::wait_until_listening(admin).await;
+    let reload_state = report_rx.await.unwrap();
+
+    let outcome =
+        lb_server::reload::apply_reload(&config_for(second), &config_for(first), &reload_state)
+            .await;
+    assert!(
+        matches!(outcome, lb_server::reload::ReloadOutcome::Applied { .. }),
+        "expected the reload to apply, got {outcome:?}"
+    );
+    assert_eq!(admin_post(admin, "/backends/web/web-1/drain").await, 200);
+    assert_eq!(
+        ready_status(admin).await,
+        503,
+        "readiness must judge the live pool, not the one built at startup"
+    );
+}
+
+#[tokio::test]
+async fn ready_fails_while_a_listener_serves_an_expired_certificate() {
+    let (backend, _) = spawn_counting_backend(StatusCode::OK).await;
+    let admin = free_addr().await;
+    let web = free_addr().await;
+    let dir = std::env::temp_dir().join(format!(
+        "lb-ready-cert-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    lb_tls::ensure_bootstrap_certificate(&cert, &key, "localhost").unwrap();
+    let tls = format!(
+        "\n  [listeners.tls]\n  reload_interval_secs = 1\n    [[listeners.tls.certificates]]\n    name = \"primary\"\n    cert_file = \"{}\"\n    key_file = \"{}\"\n    hostnames = [\"localhost\"]\n",
+        cert.display().to_string().replace('\\', "\\\\"),
+        key.display().to_string().replace('\\', "\\\\"),
+    );
+    let text = format!(
+        "[admin]\nlisten = \"{admin}\"\n{}",
+        listener_toml("web", web, backend, &tls)
+    );
+    tokio::spawn(lb_server::run(Config::parse(&text).unwrap(), None));
+    support::wait_until_listening(web).await;
+    support::wait_until_listening(admin).await;
+
+    assert_eq!(
+        ready_status(admin).await,
+        503,
+        "an instance serving an expired certificate must not take traffic"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    let renewed = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    std::fs::write(&key, renewed.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&cert, renewed.cert.pem()).unwrap();
+    let recovered = tokio::time::timeout(Duration::from_secs(15), async {
+        while ready_status(admin).await != 200 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "readiness must return once a valid certificate is loaded"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

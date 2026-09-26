@@ -42,6 +42,8 @@ pub struct AdminConfig {
     /// environment-variable form is preferred.
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 impl AdminConfig {
@@ -304,6 +306,8 @@ pub struct ListenerConfig {
     #[serde(default)]
     pub proxy_protocol: bool,
     pub proxy_protocol_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub proxy_protocol_trusted_cidrs: Vec<ipnet::IpNet>,
 
     /// Applies to both protocols and both directions independently -- the
     /// socket this listener accepts from clients. `None` (the default)
@@ -1036,14 +1040,26 @@ impl Config {
                     )));
                 }
             }
-            // Unlike cluster's shared_secret above, *neither* set is fine --
-            // an admin token defaults to absent (today's behavior,
-            // unauthenticated) rather than being mandatory, since making it
-            // mandatory would break every existing [admin] config.
+            // Unlike cluster's shared_secret above, *neither* set is fine on
+            // a loopback address, which only this host can reach. Anywhere
+            // else the admin API needs a token unless the operator explicitly
+            // accepts an open port.
             if admin.token_env.is_some() && admin.token.is_some() {
                 return Err(ConfigError::Invalid(
                     "admin requires at most one of token_env or token".into(),
                 ));
+            }
+            if !admin.listen.ip().to_canonical().is_loopback()
+                && admin.token_env.is_none()
+                && admin.token.is_none()
+                && !admin.allow_unauthenticated
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "admin.listen {} is not a loopback address, so the admin API needs a \
+                     token: set admin.token_env (or admin.token), or set \
+                     admin.allow_unauthenticated = true to accept an open admin port",
+                    admin.listen
+                )));
             }
         }
 
@@ -1202,6 +1218,19 @@ impl ListenerConfig {
         }
         if self.proxy_protocol_timeout().is_zero() {
             return Err(invalid("proxy_protocol_timeout_ms must be positive".into()));
+        }
+        if self.proxy_protocol && self.proxy_protocol_trusted_cidrs.is_empty() {
+            return Err(invalid(
+                "proxy_protocol = true requires proxy_protocol_trusted_cidrs, the networks \
+                 of the front-end proxies allowed to send a PROXY header \
+                 (use [\"0.0.0.0/0\", \"::/0\"] to accept one from any source)"
+                    .into(),
+            ));
+        }
+        if !self.proxy_protocol && !self.proxy_protocol_trusted_cidrs.is_empty() {
+            return Err(invalid(
+                "proxy_protocol_trusted_cidrs is set but proxy_protocol is not enabled".into(),
+            ));
         }
 
         match self.protocol {
@@ -2292,6 +2321,37 @@ mod tests {
         Config::parse(&text).expect("keepalive should be valid on a tcp listener");
     }
 
+    fn with_admin(admin: &str) -> String {
+        format!("[admin]\n{admin}\n{VALID}")
+    }
+
+    #[test]
+    fn a_loopback_admin_listener_may_run_without_a_token() {
+        Config::parse(&with_admin("listen = \"127.0.0.1:9100\"")).unwrap();
+        Config::parse(&with_admin("listen = \"[::1]:9100\"")).unwrap();
+    }
+
+    #[test]
+    fn a_non_loopback_admin_listener_requires_a_token() {
+        let err = Config::parse(&with_admin("listen = \"0.0.0.0:9100\"")).unwrap_err();
+        assert!(
+            format!("{err}").contains("allow_unauthenticated"),
+            "error should name the opt-out, got: {err}"
+        );
+        Config::parse(&with_admin(
+            "listen = \"0.0.0.0:9100\"\ntoken_env = \"LB_ADMIN_TOKEN\"",
+        ))
+        .unwrap();
+        Config::parse(&with_admin(
+            "listen = \"10.0.0.5:9100\"\ntoken = \"s3cret\"",
+        ))
+        .unwrap();
+        Config::parse(&with_admin(
+            "listen = \"0.0.0.0:9100\"\nallow_unauthenticated = true",
+        ))
+        .unwrap();
+    }
+
     #[test]
     fn proxy_protocol_defaults_to_disabled() {
         let cfg = Config::parse(VALID).expect("valid config should parse");
@@ -2304,15 +2364,50 @@ mod tests {
         let text = VALID
             .replace(
                 "        listen = \"0.0.0.0:8080\"",
-                "        listen = \"0.0.0.0:8080\"\n        proxy_protocol = true",
+                "        listen = \"0.0.0.0:8080\"\n        proxy_protocol = true\n        proxy_protocol_trusted_cidrs = [\"10.0.0.0/8\"]",
             )
             .replace(
                 "        listen = \"0.0.0.0:5432\"",
-                "        listen = \"0.0.0.0:5432\"\n        proxy_protocol = true",
+                "        listen = \"0.0.0.0:5432\"\n        proxy_protocol = true\n        proxy_protocol_trusted_cidrs = [\"10.0.0.0/8\"]",
             );
         let cfg = Config::parse(&text).expect("valid config should parse");
         assert!(cfg.listeners[0].proxy_protocol);
         assert!(cfg.listeners[1].proxy_protocol);
+        assert_eq!(
+            cfg.listeners[0].proxy_protocol_trusted_cidrs,
+            vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn rejects_proxy_protocol_without_trusted_cidrs() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        proxy_protocol = true",
+        );
+        let err = Config::parse(&text).unwrap_err();
+        assert!(
+            format!("{err}").contains("proxy_protocol_trusted_cidrs"),
+            "error should name proxy_protocol_trusted_cidrs, got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_trusted_cidrs_without_proxy_protocol() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        proxy_protocol_trusted_cidrs = [\"10.0.0.0/8\"]",
+        );
+        assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_a_malformed_trusted_cidr() {
+        let text = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        proxy_protocol = true\n        proxy_protocol_trusted_cidrs = [\"10.0.0.0/33\"]",
+        );
+        assert!(Config::parse(&text).is_err());
     }
 
     #[test]
@@ -2508,7 +2603,7 @@ mod tests {
 
     #[test]
     fn rejects_admin_listen_clashing_with_a_traffic_listener() {
-        let text = format!("[admin]\nlisten = \"0.0.0.0:8080\"\n\n{VALID}");
+        let text = format!("[admin]\nlisten = \"0.0.0.0:8080\"\ntoken = \"t\"\n\n{VALID}");
         assert!(matches!(Config::parse(&text), Err(ConfigError::Invalid(_))));
     }
 
