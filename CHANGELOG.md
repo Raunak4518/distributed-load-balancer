@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **ACME key material was written non-atomically with default permissions.**
+  Account credentials, private keys and certificates are now written to a
+  temporary file, synced and renamed into place, and on Unix the credentials
+  and keys are created `0600`.
 - **Updated rustls to 0.23.45** for RUSTSEC-2026-0285, in which TLS 1.3
   handshake messages were accepted across encryption-level boundaries. The
   edge TLS termination path was affected.
@@ -45,6 +49,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DNS replacements keep serving.
 - `GET /backends` now reports `outlier_ejected` and `awaiting_first_probe`
   for every backend.
+
+### Changed
+
+- **Breaking: `proxy_protocol = true` now requires `proxy_protocol_trusted_cidrs`.**
+  Connections from outside the listed networks are closed before their PROXY
+  header is read (`lb_connections_rejected_total{reason="untrusted_proxy"}`),
+  so a client that can reach the listener directly can no longer forge its
+  source address. List `["0.0.0.0/0", "::/0"]` to keep the old behavior.
+- **Breaking: a non-loopback admin listener requires a token.** Startup fails
+  when `admin.listen` is not a loopback address and neither `token` nor
+  `token_env` is set, unless `allow_unauthenticated = true`. `/healthz` and
+  `/ready` no longer require the token, so probes work without it.
+- **`/ready` now requires every listener to be able to serve.** It reports
+  `503` when any listener has no eligible backend or any TLS listener is
+  serving an expired certificate (including the ACME bootstrap placeholder),
+  and reads the pools a config reload swapped in rather than the ones built at
+  startup. The `503` body is now `not ready`.
+- **`consistent_hash` uses a fixed hash function.** The ring previously used
+  the standard library's `DefaultHasher`, whose algorithm may change between
+  Rust releases. Keys map to backends differently once after upgrading, and
+  then stay stable across rebuilds and toolchains.
 
 ### Fixed
 

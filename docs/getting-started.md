@@ -105,7 +105,7 @@ The `[admin]` section above binds a second, unauthenticated listener at `127.0.0
 
 ```sh
 curl http://127.0.0.1:9090/metrics   # Prometheus exposition format
-curl http://127.0.0.1:9090/ready     # 200 "ready" if at least one backend is eligible, else 503
+curl http://127.0.0.1:9090/ready     # 200 "ready" if every listener has an eligible backend, else 503
 curl http://127.0.0.1:9090/backends  # JSON: every listener's backends and their live state
 ```
 

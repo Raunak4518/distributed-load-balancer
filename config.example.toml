@@ -76,6 +76,7 @@ write_timeout_ms        = 30000  # the write-side mirror of the two above: caps
 # way idle_timeout_ms below governs a TCP listener's whole connection.
 
 # proxy_protocol = true
+# proxy_protocol_trusted_cidrs = ["10.0.0.0/8"]
 # Only turn this on when EVERY connection this listener accepts comes from
 # one specific, trusted front-end (another load balancer, an ELB/NLB, a
 # CDN) that always sends a PROXY protocol header (v1 or v2, auto-detected)
@@ -444,6 +445,7 @@ max_connections        = 10000
 max_connections_per_ip = 100
 
 # proxy_protocol = true
+# proxy_protocol_trusted_cidrs = ["10.0.0.0/8"]
 # See the HTTP listener's comment above -- same option, same trust model,
 # applies identically to a TCP listener.
 
@@ -518,11 +520,12 @@ max_connections_per_ip = 100
 # primary control.
 # [admin]
 # listen = "127.0.0.1:9090"
-# Exactly one of these two, like [cluster]'s shared_secret/shared_secret_env
-# below. Neither set (the default) leaves this listener exactly as
-# unauthenticated as it always was -- logged as a startup warning and
-# exported on the lb_admin_auth_disabled gauge, so an open admin port never
-# ships silently.
+# At most one of these two, like [cluster]'s shared_secret/shared_secret_env
+# below. Neither set is only allowed on a loopback listen address (or with
+# allow_unauthenticated = true) -- logged as a startup warning and exported on
+# the lb_admin_auth_disabled gauge, so an open admin port never ships
+# silently. /healthz and /ready never require the token.
 # token = "..."
 # token_env = "LB_ADMIN_TOKEN"
+# allow_unauthenticated = false
 # A request must then carry: Authorization: Bearer <token>

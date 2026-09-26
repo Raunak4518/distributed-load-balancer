@@ -55,9 +55,9 @@ Both are maintained for every listener. For an HTTP or HTTPS listener they are u
 
 ### `lb_connections_rejected_total` — counter
 
-Labels: `listener`, `reason` (`max_connections` | `max_per_ip`).
+Labels: `listener`, `reason` (`max_connections` | `max_per_ip` | `untrusted_proxy`).
 
-Incremented in `serve_listener` in [`lib.rs`](../crates/lb-server/src/lib.rs): `max_connections` when the listener's global connection-permit semaphore has no permits available at the moment `accept()` would otherwise be called (checked before accepting, so an attacker cannot force an accepted-then-dropped connection); `max_per_ip` when a newly accepted connection's source IP is already at its per-IP cap.
+Incremented in `serve_listener` in [`lib.rs`](../crates/lb-server/src/lib.rs): `max_connections` when the listener's global connection-permit semaphore has no permits available at the moment `accept()` would otherwise be called (checked before accepting, so an attacker cannot force an accepted-then-dropped connection); `max_per_ip` when a newly accepted connection's source IP is already at its per-IP cap; `untrusted_proxy` when a listener with `proxy_protocol = true` accepts a connection from outside `proxy_protocol_trusted_cidrs`.
 
 ### `lb_request_timeouts_total` — counter
 

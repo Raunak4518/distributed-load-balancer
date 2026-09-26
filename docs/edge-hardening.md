@@ -118,6 +118,8 @@ The default of `20` is pinned deliberately in both directions: it is exactly h2'
 
 This is a hard trust boundary, not a best-effort parse. A listener with `proxy_protocol = true` is meant to receive connections from exactly one trusted front-end that always sends this header first. Consequently:
 
+- `proxy_protocol_trusted_cidrs` is **required** with `proxy_protocol = true`: the networks the front-end connects from. A connection whose TCP peer is outside every listed network is closed immediately after `accept()`, before a single byte of it is read, and counted as `lb_connections_rejected_total{reason="untrusted_proxy"}`. Without this, anyone who can reach the listener directly could send a forged header and pick their own client address — defeating per-IP limits, rate limiting keyed on `source_ip`, and `X-Forwarded-For`. To accept a header from any source anyway, list `"0.0.0.0/0"` and `"::/0"` explicitly. IPv4-mapped IPv6 peers (`::ffff:10.0.0.1`) are matched against IPv4 networks.
+
 - A **missing or malformed header** (bad signature, truncated line, unparseable address, wrong protocol keyword, oversized v1 line, v2 length exceeding a 4096-byte sanity bound) is treated as **fatal** — the connection is dropped, never falls back to the raw TCP peer address.
 - v1 `UNKNOWN` and v2 `LOCAL`/`AF_UNSPEC` are valid headers that carry no client identity (e.g. the front-end's own health check); these fall back to the raw TCP peer address, which is the correct behavior for a connection that genuinely has no downstream client.
 
@@ -127,6 +129,7 @@ The fatal-on-malformed choice is deliberate: falling back to the raw peer on a b
 [[listeners]]
 proxy_protocol = true
 proxy_protocol_timeout_ms = 1000
+proxy_protocol_trusted_cidrs = ["10.0.0.0/8"]   # the front-end's addresses
 ```
 
 ## Web application firewall
@@ -150,7 +153,7 @@ Matches are recorded per rule: `lb_waf_blocked_total{listener, rule="sql_injecti
 
 ## Admin API authentication
 
-The admin listener (`[admin]`) serves `/metrics`, `/healthz`, `/ready`, and any `/backends/...` drain/undrain routes on a port meant to stay off the public internet. Configuring `token` or `token_env` under `[admin]` gates every one of those routes behind a bearer token:
+The admin listener (`[admin]`) serves `/metrics`, `/healthz`, `/ready`, and any `/backends/...` drain/undrain routes on a port meant to stay off the public internet. Configuring `token` or `token_env` under `[admin]` gates every one of those routes except the `/healthz` and `/ready` probes behind a bearer token:
 
 ```toml
 [admin]
@@ -163,6 +166,8 @@ token_env = "LB_ADMIN_TOKEN"   # preferred: config files end up in version contr
 - The comparison uses `subtle::ConstantTimeEq` rather than a byte-wise `==`, specifically so that how much of a presented token matches the real one cannot be inferred from response timing.
 - A missing or mismatched token — including one of a different length than the real token, which must not panic the constant-time comparison — returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header, and increments `lb_admin_auth_failures_total`.
 - `token` and `token_env` are mutually exclusive; setting both is a config validation error. An empty resolved token is also rejected at startup.
+- `/healthz` and `/ready` answer without a token, so an orchestrator or load balancer can probe them without holding the secret. Each reveals one bit.
+- A token is **required** when `admin.listen` is not a loopback address: startup fails unless `token`/`token_env` is set or `allow_unauthenticated = true` explicitly accepts an open admin port. A loopback-only admin listener may still run without one.
 
 **No token configured is a valid, common state** — the admin listener runs exactly as unauthenticated as if this feature did not exist, which matters for anyone who fronts the admin port with their own network-level access control. This state is not silent: `lb_admin_auth_disabled` is set to `1` (and to `0` once a token is configured), and a `warn`-level log line is emitted at startup naming exactly what is reachable without a token (metrics, health, and backend drain/undrain) — a deliberate choice to make an unauthenticated admin port visible on a dashboard rather than a config gap nobody notices.
 

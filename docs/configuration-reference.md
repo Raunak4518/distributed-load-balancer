@@ -66,6 +66,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `body_read_timeout_ms` | integer | `10000` | must be > 0 | Max time a client may take to send the request body. |
 | `proxy_protocol` | boolean | `false` | applies to both protocols | Reads the real client address from a PROXY protocol v1/v2 header instead of the raw TCP peer; a connection with a missing/malformed header is dropped. Restart-only. |
 | `proxy_protocol_timeout_ms` | integer | `1000` | must be > 0 | Max time to wait for the PROXY protocol header. Restart-only. |
+| `proxy_protocol_trusted_cidrs` | array of CIDR strings | `[]` | required (non-empty) when `proxy_protocol = true`; rejected otherwise | Networks allowed to send a PROXY header, e.g. `["10.0.0.0/8"]`. A connection from any other address is closed before its header is read. Use `["0.0.0.0/0", "::/0"]` to trust any source. Restart-only. |
 | `client_tcp_keepalive` | table | none | see [`TcpKeepaliveConfig`](#listenersclient_tcp_keepalive--listenersbackend_tcp_keepalive) | TCP keepalive tuning for the client-facing socket. Restart-only. |
 | `backend_tcp_keepalive` | table | none | see below | TCP keepalive tuning for the socket dialed to a backend. |
 | `tls` | table | none | see [`[listeners.tls]`](#listenerstls) | Enables edge TLS termination. Restart-only. |
@@ -340,8 +341,9 @@ Absent by default: no metrics/health endpoints at all. See [operations.md](opera
 | `listen` | socket address | required | must not collide with any listener's `listen` or with `cluster.listen` | Bind address for the admin/metrics listener. Bind privately — this surface exposes internal topology. |
 | `token_env` | string | none | at most one of `token_env`/`token`; named env var must be set and non-empty | Environment variable holding the admin bearer token. |
 | `token` | string | none | at most one of `token_env`/`token`; must not be empty | Literal bearer token. |
+| `allow_unauthenticated` | boolean | `false` | none | Accept an admin listener on a non-loopback address with no token. |
 
-Unlike `cluster`'s secret, leaving *both* `token_env` and `token` unset is valid — it means the admin listener stays unauthenticated, preserving pre-existing behavior for configs that never set either.
+Unlike `cluster`'s secret, leaving *both* `token_env` and `token` unset is valid when `listen` is a loopback address, which only this host can reach. On any other address it is a startup error unless `allow_unauthenticated = true`. `/healthz` and `/ready` never require the token.
 
 ## `[logging]`
 
@@ -369,7 +371,8 @@ Absent by default: spans are still created internally but nothing exports them.
 - At least one `[[listeners]]` entry is required.
 - Listener `name` values must be unique; listener `listen` addresses must be unique.
 - `cluster.node_id` (if `[cluster]` is present) must not be empty, `sync_interval_ms` and `window_secs` must be positive, `peers` must not contain the node's own `listen`, `cluster.listen` must not collide with any listener's `listen`, and exactly one of `shared_secret_env`/`shared_secret` must be set.
-- `admin.listen` (if `[admin]` is present) must not collide with any listener's `listen` or with `cluster.listen`; at most one of `token_env`/`token` may be set.
+- `admin.listen` (if `[admin]` is present) must not collide with any listener's `listen` or with `cluster.listen`; at most one of `token_env`/`token` may be set; a non-loopback `admin.listen` needs a token or `allow_unauthenticated = true`.
+- `proxy_protocol = true` requires a non-empty `proxy_protocol_trusted_cidrs`, and `proxy_protocol_trusted_cidrs` requires `proxy_protocol = true`.
 - `logging.sample_rate` must be within `[0.0, 1.0]`.
 - `tracing.otlp_endpoint` (if `[tracing]` is present) must not be empty, and `sample_ratio` must be within `[0.0, 1.0]`.
 
@@ -415,7 +418,7 @@ Sending `SIGHUP` (Unix only — there is no equivalent signal path on Windows) r
 **Always refused, regardless of what else changed:**
 - Any change to `[server]`, `[admin]`, `[cluster]` (including `[cluster.tls]`), `[logging]`, or `[tracing]` — these are process-wide with no live-swappable state.
 - Adding or removing a listener, or changing a listener's `protocol` or `listen` address — new bind/unbind lifecycle is not supported live.
-- On any listener whose identity is unchanged, a change to: `tls`, `backend_tls`, `http2`, `max_connections`, `max_connections_per_ip`, `header_read_timeout_ms`, `write_timeout_ms`, `compression`, `proxy_protocol`, `proxy_protocol_timeout_ms`, or `client_tcp_keepalive`. These live on the listener's accept-loop runtime, not the swappable per-request context, so changing any of them refuses the entire reload with a message naming the listener.
+- On any listener whose identity is unchanged, a change to: `tls`, `backend_tls`, `http2`, `max_connections`, `max_connections_per_ip`, `header_read_timeout_ms`, `write_timeout_ms`, `compression`, `proxy_protocol`, `proxy_protocol_timeout_ms`, `proxy_protocol_trusted_cidrs`, or `client_tcp_keepalive`. These live on the listener's accept-loop runtime, not the swappable per-request context, so changing any of them refuses the entire reload with a message naming the listener.
 
 **Applies live (no restart) once the fields above are unchanged:** everything else on a listener — `backends`, `dns_discovery`, `health_check` (including `outlier_detection`), `rate_limit`, `load_balancing`, `routes`, `canary`, `sticky`, `cache`, `waf`, `retry_budget`, `forward_timeout_ms`, `max_request_body_bytes`, `body_read_timeout_ms`, `websocket_idle_timeout_ms`, `response_body_idle_timeout_ms`, `connect_timeout_ms`, `idle_timeout_ms`, and `backend_tcp_keepalive`. A changed listener is rebuilt (new backend pool, new circuit breakers only for genuinely new backends, new compiled routes/canary pools) and atomically swapped in; live state that survives an unrelated field's reload includes manually-drained backends and open circuit breakers — only listeners whose config actually differs are rebuilt at all. TLS certificate *content* (the files on disk) reloads independently on its own periodic schedule (`reload_interval_secs`), unrelated to SIGHUP.
 
