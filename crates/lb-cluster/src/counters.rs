@@ -22,6 +22,7 @@ pub struct CounterStore {
     snapshot_cursor: AtomicUsize,
     skew_rejections: Option<IntCounterVec>,
     skew_labeled_peers: DashSet<String>,
+    changed: DashSet<String>,
 }
 
 pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
@@ -69,6 +70,7 @@ impl CounterStore {
             snapshot_cursor: AtomicUsize::new(0),
             skew_rejections: None,
             skew_labeled_peers: DashSet::new(),
+            changed: DashSet::new(),
         }
     }
 
@@ -87,11 +89,27 @@ impl CounterStore {
         // Borrowed lookup first: every key past its first request in this
         // window takes this path and allocates nothing. `key.to_string()`
         // below is only worth paying the first time a key is seen.
-        if let Some(mut counts) = self.keys.get_mut(key) {
-            return Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit);
+        let admitted = if let Some(mut counts) = self.keys.get_mut(key) {
+            Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit)
+        } else {
+            let mut counts = self.keys.entry(key.to_string()).or_default();
+            Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit)
+        };
+        if admitted && !self.changed.contains(key) {
+            self.changed.insert(key.to_string());
         }
-        let mut counts = self.keys.entry(key.to_string()).or_default();
-        Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit)
+        admitted
+    }
+
+    fn own_in_window(&self, key: &str, node_id: &str, cutoff: u64) -> Option<Vec<(u64, u64)>> {
+        let item = self.keys.get(key)?;
+        let buckets = item.per_node.get(node_id)?;
+        let in_window: Vec<(u64, u64)> = buckets
+            .iter()
+            .filter(|(epoch, _)| **epoch >= cutoff)
+            .map(|(epoch, count)| (*epoch, *count))
+            .collect();
+        (!in_window.is_empty()).then_some(in_window)
     }
 
     fn try_record(
@@ -255,7 +273,32 @@ impl CounterStore {
         let mut out = Vec::new();
         let mut total_entries = 0usize;
         let mut total_bytes = 0usize;
+        let mut included = std::collections::HashSet::new();
+        let mut changed: Vec<String> = self.changed.iter().map(|k| k.key().clone()).collect();
+        changed.sort_unstable();
+        for key in changed {
+            self.changed.remove(&key);
+            let Some(in_window) = self.own_in_window(&key, node_id, cutoff) else {
+                continue;
+            };
+            let bytes = estimated_snapshot_bytes(&key, in_window.len());
+            if total_entries > 0
+                && (total_entries + in_window.len() > max_entries
+                    || total_bytes + bytes > max_bytes)
+            {
+                self.changed.insert(key);
+                break;
+            }
+            total_entries += in_window.len();
+            total_bytes += bytes;
+            included.insert(key.clone());
+            out.push((key, in_window));
+        }
         for _ in 0..len {
+            if included.contains(&keys[idx]) {
+                idx = (idx + 1) % len;
+                continue;
+            }
             if let Some(item) = self.keys.get(&keys[idx]) {
                 if let Some(buckets) = item.per_node.get(node_id) {
                     let in_window: Vec<(u64, u64)> = buckets
@@ -293,6 +336,7 @@ impl CounterStore {
             counts.prune(now_secs, window);
             !counts.per_node.is_empty()
         });
+        self.changed.retain(|key| self.keys.contains_key(key));
     }
 
     #[cfg(test)]
@@ -485,6 +529,39 @@ mod tests {
         store.merge(&"y".repeat(10_000), "me", &[(NOW, 1)], NOW);
         let snap = store.snapshot_own_capped("me", NOW, usize::MAX, 10);
         assert_eq!(snap.len(), 1);
+    }
+
+    #[test]
+    fn a_key_admitted_since_the_last_snapshot_is_sent_in_the_next_one() {
+        let store = CounterStore::new(10);
+        for i in 0..100 {
+            assert!(store.try_admit(&format!("k{i:03}"), "me", NOW, 1_000));
+        }
+        for _ in 0..10 {
+            store.snapshot_own_capped("me", NOW, 10, usize::MAX);
+        }
+        assert!(store.try_admit("k050", "me", NOW, 1_000));
+        let next = store.snapshot_own_capped("me", NOW, 10, usize::MAX);
+        assert!(
+            next.iter().any(|(key, _)| key == "k050"),
+            "a changed key must not wait for its turn in the rotation: {:?}",
+            next.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_changed_key_that_does_not_fit_stays_queued_for_the_next_snapshot() {
+        let store = CounterStore::new(10);
+        for i in 0..30 {
+            assert!(store.try_admit(&format!("k{i:03}"), "me", NOW, 1_000));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..3 {
+            for (key, _) in store.snapshot_own_capped("me", NOW, 10, usize::MAX) {
+                seen.insert(key);
+            }
+        }
+        assert_eq!(seen.len(), 30);
     }
 
     #[test]
