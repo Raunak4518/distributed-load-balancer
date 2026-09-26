@@ -80,7 +80,7 @@ serde_json = "1"
 # just explicit about only pulling the compression algorithms, not e.g. its
 # unrelated `fs`/`trace`/`auth` middleware.
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", default-features = false, features = [
+tower-http = { version = "0.7", default-features = false, features = [
     "compression-full",
 ] }
 tokio = { version = "1", features = [
