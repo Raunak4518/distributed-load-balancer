@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `health_check.max_ejected_fraction` could be exceeded under concurrency.
+  Each ejection counted, decided and stored separately, so circuit trips on
+  several request threads at once (the typical shape of a correlated
+  failure) could all pass the check; 4 of 8 backends were observed ejected
+  under a ceiling allowing 2. New ejections now run under a per-pool lock.
 - The response cache honors `s-maxage` (it takes precedence over `max-age`)
   and `Vary`: the key now includes the normalized `Accept-Encoding`, so
   `Vary: Accept-Encoding` responses are cached per encoding, and any other
