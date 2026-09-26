@@ -227,6 +227,10 @@ pub async fn run_and_report_reload_handle(
     Ok(())
 }
 
+fn reap_finished(connections: &mut JoinSet<()>) {
+    while connections.try_join_next().is_some() {}
+}
+
 /// Accept loop for one listener. Owns its own connection JoinSet so it can
 /// drain independently when the shutdown signal arrives.
 async fn serve_listener(
@@ -313,6 +317,7 @@ fn spawn_connection(
     permit: tokio::sync::OwnedSemaphorePermit,
     ip_guard: Option<crate::limits::IpGuard>,
 ) {
+    reap_finished(connections);
     let runtime = Arc::clone(runtime);
     connections.spawn(async move {
         // Held for the life of the connection, handshake included.
@@ -567,5 +572,41 @@ where
             // Loaded fresh per connection, same reasoning as the HTTP arm.
             lb_tcp::handle_connection(stream, peer, ctx.load_full()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn finished_connection_tasks_are_released_before_the_next_spawn() {
+        let mut connections: JoinSet<()> = JoinSet::new();
+        for _ in 0..1_000 {
+            reap_finished(&mut connections);
+            connections.spawn(async {});
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        reap_finished(&mut connections);
+        assert!(
+            connections.len() <= 1,
+            "{} finished connection tasks were still held",
+            connections.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn reaping_never_drops_a_connection_that_is_still_running() {
+        let mut connections: JoinSet<()> = JoinSet::new();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        connections.spawn(async move {
+            let _ = wait.await;
+        });
+        tokio::task::yield_now().await;
+        reap_finished(&mut connections);
+        assert_eq!(connections.len(), 1);
+        release.send(()).unwrap();
+        while connections.join_next().await.is_some() {}
     }
 }
