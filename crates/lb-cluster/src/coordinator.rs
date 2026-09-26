@@ -15,7 +15,26 @@ pub enum MergeOutcome {
 
 /// Process-wide cluster state: one counter store and one identity, shared by
 /// every listener in this process.
+#[derive(Clone)]
+pub struct ClusterMetrics {
+    pub auth_failures: lb_metrics::IntCounterVec,
+    pub peer_sync: lb_metrics::IntCounterVec,
+    pub tracked_keys: lb_metrics::IntGauge,
+    pub known_peers: Vec<std::net::IpAddr>,
+}
+
+impl ClusterMetrics {
+    fn peer_label(&self, peer: std::net::SocketAddr) -> String {
+        if self.known_peers.contains(&peer.ip()) {
+            peer.ip().to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+}
+
 pub struct ClusterNode<C: Clock> {
+    metrics: Option<ClusterMetrics>,
     node_id: String,
     store: CounterStore,
     clock: C,
@@ -28,10 +47,40 @@ pub struct ClusterNode<C: Clock> {
 impl<C: Clock> ClusterNode<C> {
     pub fn new(node_id: impl Into<String>, window_secs: u64, clock: C, secret: Vec<u8>) -> Self {
         ClusterNode {
+            metrics: None,
             node_id: node_id.into(),
             store: CounterStore::new(window_secs),
             clock,
             secret,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: ClusterMetrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub(crate) fn record_peer_sync(&self, peer: std::net::SocketAddr, outcome: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .peer_sync
+                .with_label_values(&[metrics.peer_label(peer).as_str(), outcome])
+                .inc();
+        }
+    }
+
+    pub(crate) fn record_auth_failure(&self, peer: std::net::SocketAddr) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .auth_failures
+                .with_label_values(&[metrics.peer_label(peer).as_str()])
+                .inc();
+        }
+    }
+
+    pub(crate) fn publish_tracked_keys(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.tracked_keys.set(self.store.tracked_keys() as i64);
         }
     }
 

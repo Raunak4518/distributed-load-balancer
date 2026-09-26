@@ -40,6 +40,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Five metrics were registered but never updated**, and two more stayed
+  flat for HTTP listeners. `lb_cluster_auth_failures_total`,
+  `lb_cluster_peer_sync_total`, `lb_cluster_tracked_keys`,
+  `lb_ratelimit_tracked_keys` and `lb_request_timeouts_total{phase="header"}`
+  are now recorded, and `lb_connections_total`/`lb_active_connections` now
+  count HTTP connections as well as TCP ones. The cluster metrics' `peer`
+  label is limited to configured peers plus `unknown`.
 - **A retry could go back to the backend that just failed.** The retry loop
   re-ran the strategy with no exclusion, so under `consistent_hash` (and
   often `least_connections`) it retried the same failing backend. Retries now

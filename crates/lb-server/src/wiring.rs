@@ -321,7 +321,13 @@ pub fn build_app(
     let cluster_node = match (config.cluster.as_ref(), cluster_secret) {
         (Some(c), Some(secret)) => Some(Arc::new(
             ClusterNode::new(c.node_id.clone(), c.window_secs, SystemClock, secret)
-                .with_skew_rejection_counter(metrics.cluster_future_skew_rejections.clone()),
+                .with_skew_rejection_counter(metrics.cluster_future_skew_rejections.clone())
+                .with_metrics(lb_cluster::ClusterMetrics {
+                    auth_failures: metrics.cluster_auth_failures.clone(),
+                    peer_sync: metrics.cluster_peer_sync.clone(),
+                    tracked_keys: metrics.cluster_tracked_keys.clone(),
+                    known_peers: c.peers.iter().map(|p| p.ip()).collect(),
+                }),
         )),
         _ => None,
     };
@@ -1130,6 +1136,10 @@ pub(crate) fn spawn_listener_tasks(
                 ctx.rate_limiter.clone(),
                 Duration::from_secs(30),
                 Duration::from_secs(60),
+                {
+                    let gauge = ctx.metrics.tracked_keys.clone();
+                    move |n| gauge.set(n as i64)
+                },
             ));
             if let Some(cache) = &ctx.cache {
                 tasks.push(spawn_cache_sweeper(
@@ -1207,6 +1217,10 @@ pub(crate) fn spawn_listener_tasks(
                 ctx.rate_limiter.clone(),
                 Duration::from_secs(30),
                 Duration::from_secs(60),
+                {
+                    let gauge = ctx.metrics.tracked_keys.clone();
+                    move |n| gauge.set(n as i64)
+                },
             ));
             let transport = ProbeTransport::Tcp(ctx.backend_tls.clone());
             if let Some(dns) = &lc.dns_discovery {

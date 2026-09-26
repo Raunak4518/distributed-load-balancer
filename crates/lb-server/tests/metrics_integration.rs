@@ -166,3 +166,70 @@ async fn health_endpoints_reflect_liveness_and_readiness() {
         200
     );
 }
+
+fn metric_value(body: &str, series: &str) -> f64 {
+    body.lines()
+        .find(|line| line.starts_with(series))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("series {series} missing from:\n{body}"))
+}
+
+async fn start_with_header_timeout(header_read_timeout_ms: u64) -> (SocketAddr, SocketAddr) {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let admin = free_addr().await;
+    let traffic = free_addr().await;
+    let text = admin_config_toml(admin, traffic, backend, 1000.0, 1000).replacen(
+        &format!("listen = \"{traffic}\""),
+        &format!("listen = \"{traffic}\"\nheader_read_timeout_ms = {header_read_timeout_ms}"),
+        1,
+    );
+    let config = Config::parse(&text).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(traffic).await;
+    support::wait_until_listening(admin).await;
+    (traffic, admin)
+}
+
+#[tokio::test]
+async fn http_connections_are_counted_while_open_and_released_after() {
+    let (traffic, admin) = start(1000.0, 1000).await;
+    let held = tokio::net::TcpStream::connect(traffic).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let body = scrape(admin).await;
+    assert!(metric_value(&body, r#"lb_active_connections{listener="web"}"#) >= 1.0);
+    assert!(metric_value(&body, r#"lb_connections_total{listener="web"}"#) >= 1.0);
+
+    drop(held);
+    let mut released = false;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let body = scrape(admin).await;
+        if metric_value(&body, r#"lb_active_connections{listener="web"}"#) == 0.0 {
+            released = true;
+            break;
+        }
+    }
+    assert!(released, "the active-connection gauge must return to zero");
+}
+
+#[tokio::test]
+async fn a_stalled_request_head_is_counted_as_a_header_timeout() {
+    use tokio::io::AsyncWriteExt;
+    let (traffic, admin) = start_with_header_timeout(200).await;
+    let mut slow = tokio::net::TcpStream::connect(traffic).await.unwrap();
+    slow.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+    let body = scrape(admin).await;
+    assert_eq!(
+        metric_value(
+            &body,
+            r#"lb_request_timeouts_total{listener="web",phase="header"}"#
+        ),
+        1.0
+    );
+}

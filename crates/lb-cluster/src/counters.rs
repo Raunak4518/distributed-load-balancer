@@ -283,6 +283,10 @@ impl CounterStore {
         out
     }
 
+    pub fn tracked_keys(&self) -> usize {
+        self.keys.len()
+    }
+
     pub fn prune(&self, now_secs: u64) {
         let window = self.window_secs;
         self.keys.retain(|_, counts| {

@@ -432,6 +432,14 @@ fn apply_tcp_keepalive(stream: &TcpStream, cfg: &lb_core::TcpKeepaliveConfig) {
 /// `is_h2` is the protocol the handshake negotiated. It is decided by the
 /// caller because only the caller still holds a stream concrete enough to ask,
 /// and it is always `false` for a plaintext connection, which has no ALPN.
+struct ActiveConnection(lb_metrics::IntGauge);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
 async fn drive<S>(runtime: &ListenerRuntime, stream: S, peer: SocketAddr, is_h2: bool)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -452,6 +460,10 @@ where
             // keep whichever snapshot they loaded, while the next one to
             // reach this line sees whatever is current then.
             let ctx = ctx.load_full();
+            let listener_metrics = runtime.metrics();
+            listener_metrics.connections_total.inc();
+            listener_metrics.active_connections.inc();
+            let _active = ActiveConnection(listener_metrics.active_connections.clone());
             let peer_ip = peer.ip();
             // A tower stack rather than a plain hyper `service_fn`, so
             // `tower-http`'s `CompressionLayer` can sit in front of
@@ -484,6 +496,8 @@ where
                 let h2 = http2
                     .as_ref()
                     .expect("h2 is only advertised when http2 config is present");
+                let deadline = first_byte::FirstByteDeadline::new(stream, *header_read_timeout);
+                let deadline_fired = deadline.fired_flag();
                 // Every limit below exists because one HTTP/2 connection
                 // carries many concurrent requests, so Phase 5's per-IP
                 // *connection* cap no longer bounds per-IP *work*. Omitting
@@ -516,16 +530,13 @@ where
                     // sending? Without it a client that negotiates `h2` and
                     // then goes silent holds its connection permit and its
                     // per-IP slot indefinitely, at no cost to itself.
-                    .serve_connection(
-                        TokioIo::new(first_byte::FirstByteDeadline::new(
-                            stream,
-                            *header_read_timeout,
-                        )),
-                        svc,
-                    )
+                    .serve_connection(TokioIo::new(deadline), svc)
                     .await
                 {
                     tracing::debug!(error = %err, "http/2 client connection error");
+                }
+                if deadline_fired.load(std::sync::atomic::Ordering::Relaxed) {
+                    listener_metrics.timeouts_header.inc();
                 }
             } else if let Err(err) = http1::Builder::new()
                 // hyper 1.x has no built-in timer: any timeout feature
@@ -546,6 +557,9 @@ where
                 .with_upgrades()
                 .await
             {
+                if err.is_timeout() {
+                    listener_metrics.timeouts_header.inc();
+                }
                 tracing::debug!(error = %err, "client connection error");
             }
         }

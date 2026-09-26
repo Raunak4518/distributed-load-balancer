@@ -26,6 +26,7 @@ pub struct FirstByteDeadline<S> {
     /// `None` once the first byte has arrived — the deadline is spent, and
     /// this is the flag as well as the timer.
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S> FirstByteDeadline<S> {
@@ -33,7 +34,12 @@ impl<S> FirstByteDeadline<S> {
         FirstByteDeadline {
             inner,
             timer: Some(Box::pin(tokio::time::sleep(within))),
+            fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    pub fn fired_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.fired)
     }
 }
 
@@ -51,6 +57,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<S> {
         // wake us on its own.
         if let Some(timer) = me.timer.as_mut() {
             if timer.as_mut().poll(cx).is_ready() {
+                me.fired.store(true, std::sync::atomic::Ordering::Relaxed);
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "no data before the first-byte deadline",
@@ -151,6 +158,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_stream_that_never_speaks_is_timed_out() {
         let mut stream = FirstByteDeadline::new(NeverReady, Duration::from_millis(300));
+        let fired = stream.fired_flag();
         let mut buf = [0u8; 8];
 
         let err = stream
@@ -158,6 +166,7 @@ mod tests {
             .await
             .expect_err("a silent stream must not read successfully");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(fired.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test(start_paused = true)]

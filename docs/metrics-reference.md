@@ -1,6 +1,6 @@
 # Metrics Reference
 
-The load balancer exposes Prometheus text-format metrics from `GET /metrics` on the admin listener (see [`operations.md`](operations.md) for how to enable and secure that listener). This page documents every metric registered in [`lb-metrics`](../crates/lb-metrics/src/lib.rs): its exact name, type, labels, and the code path that updates it. Metrics that are registered but never updated by any production code path are called out explicitly, as is the "Suggested alerts" section, which uses only metrics verified to be live.
+The load balancer exposes Prometheus text-format metrics from `GET /metrics` on the admin listener (see [`operations.md`](operations.md) for how to enable and secure that listener). This page documents every metric registered in [`lb-metrics`](../crates/lb-metrics/src/lib.rs): its exact name, type, labels, and the code path that updates it. Every metric listed here is updated by production code; the "Suggested alerts" section at the end uses them directly.
 
 All metric names use the `lb_` prefix baked into the metric name itself (there is no separate registry-wide prefix). Counters are Prometheus counters (monotonic, `_total` suffix), gauges are instantaneous values, and histograms use one of two fixed bucket sets defined in [`lib.rs`](../crates/lb-metrics/src/lib.rs).
 
@@ -21,7 +21,7 @@ Every label value in the exposition comes from a fixed, code-known set — never
 
 - `listener` and `backend` come from configuration (operator-controlled, not client-controlled).
 - `status`, `outcome`, `layer`, `reason`, `phase`, `result`, `rule` are fixed enums with 2-4 possible values each.
-- `peer` on `lb_cluster_future_skew_rejections_total` is bounded to 64 distinct peer labels; the 65th and subsequent distinct peer node IDs seen in a merge are folded into a single `peer="other"` overflow label, so a churning or spoofed cluster cannot grow this series unboundedly. See `MAX_SKEW_PEER_LABELS` and `OVERFLOW_PEER_LABEL` in [`counters.rs`](../crates/lb-cluster/src/counters.rs). No equivalent bound exists on `lb_cluster_peer_sync_total`'s or `lb_cluster_auth_failures_total`'s `peer` label, but see below — neither metric is currently updated in production code, so this does not matter today.
+- `peer` on `lb_cluster_future_skew_rejections_total` is bounded to 64 distinct peer labels; the 65th and subsequent distinct peer node IDs seen in a merge are folded into a single `peer="other"` overflow label, so a churning or spoofed cluster cannot grow this series unboundedly. See `MAX_SKEW_PEER_LABELS` and `OVERFLOW_PEER_LABEL` in [`counters.rs`](../crates/lb-cluster/src/counters.rs). `lb_cluster_peer_sync_total` and `lb_cluster_auth_failures_total` bound their `peer` label differently: only IPs listed in `cluster.peers` appear, and every other source is labeled `unknown`.
 - `cert` (on `lb_tls_certificate_expiry_timestamp_seconds`) is an operator-chosen certificate name from `[[listeners.tls.certificates]]`, never the client-supplied SNI hostname.
 - `le` is Prometheus's own histogram bucket-boundary label, bounded by the fixed bucket count above.
 
@@ -49,7 +49,7 @@ Labels: `listener`.
 
 Labels: `listener`.
 
-Both are incremented from a single call site, [`session.rs`](../crates/lb-tcp/src/session.rs), at the start of `handle_connection` — the TCP (L4 passthrough) proxy path. `active_connections` is decremented by a drop guard when the session ends. **These two metrics are wired only into the TCP/L4 listener path.** For an HTTP or HTTPS listener, nothing in [`lb-server`](../crates/lb-server/src/lib.rs) increments either counter — its accept loop and connection driver never call them — so on an HTTP(S) listener both series stay at zero (or absent) regardless of real traffic volume. Do not use these two metrics to gauge HTTP/HTTPS connection volume; there is currently no metric for that. See [`request-lifecycle.md`](request-lifecycle.md) for the accept path on both listener kinds.
+Both are maintained for every listener. For an HTTP or HTTPS listener they are updated in `drive` ([`lib.rs`](../crates/lb-server/src/lib.rs)) once per accepted connection that reaches request serving (after admission, the PROXY header and the TLS handshake), with a drop guard decrementing `lb_active_connections` when the connection ends however it ends. For a TCP listener they are updated at the start of `handle_connection` in [`session.rs`](../crates/lb-tcp/src/session.rs). `lb_connections_total` counts connections, not requests: one HTTP/1.1 keep-alive or HTTP/2 connection carries many requests.
 
 ## Connections and timeouts (edge hardening)
 
@@ -63,7 +63,7 @@ Incremented in `serve_listener` in [`lib.rs`](../crates/lb-server/src/lib.rs): `
 
 Labels: `listener`, `phase` (`header` | `body`).
 
-Only `phase="body"` is ever incremented, from `lb_proxy::service::handle_inner` when reading the request body exceeds `body_read_timeout` (returns `408 Request Timeout` to the client). **`phase="header"` is registered but never incremented anywhere in the codebase.** The slowloris-style header-read timeout it was meant to label (`header_read_timeout`, enforced by hyper's own `header_read_timeout()` builder option for HTTP/1.1 and by `FirstByteDeadline` for HTTP/2, both in [`lib.rs`](../crates/lb-server/src/lib.rs)) fires inside hyper's connection driver and is only logged (`tracing::debug`), never surfaced through this counter. This is a dead label value: an operator alerting on `phase="header"` will never see it fire even when header timeouts are actively happening.
+`phase="body"` is incremented in `lb_proxy::service::handle_inner` when reading the request body exceeds `body_read_timeout` (the client receives `408 Request Timeout`). `phase="header"` is incremented when a connection is closed because the client did not send its request head in time: for HTTP/1.1 when hyper's `header_read_timeout` fires, and for HTTP/2 when `FirstByteDeadline` expires before the client's first byte. A write-side stall (`write_timeout_ms`) is not counted here.
 
 ## Backends, health, and circuit breaking
 
@@ -109,7 +109,7 @@ Labels: `listener`, `layer` (`local` | `cluster`).
 
 Labels: `listener`.
 
-**Registered but never set anywhere in production code.** `Gcra` (in [`gcra.rs`](../crates/lb-ratelimit/src/gcra.rs)) exposes a `tracked_keys()` accessor for exactly this purpose, but nothing in `lb-server` or `lb-proxy` calls it and feeds the result into this gauge — it is only exercised in the `lb-metrics` crate's own unit tests. Do not rely on this metric as an early warning for the rate-limit key cap; it will read zero regardless of actual tracked-key count.
+Set by the rate-limit sweeper after every sweep (every 30 seconds) to the number of distinct keys the listener's limiter tracks. Watch it against `rate_limit.max_tracked_keys`: a value pinned at the cap means new clients are sharing the overflow bucket.
 
 ### `lb_ratelimit_cluster_convergence_bound` — gauge
 
@@ -127,23 +127,23 @@ Labels: `peer`.
 
 The only cluster-gossip counter that is actually wired up. Incremented in `CounterStore::merge` in [`counters.rs`](../crates/lb-cluster/src/counters.rs) whenever a peer's gossiped counter cells are rejected at merge time for being timestamped further than 5 seconds (`FUTURE_SKEW_TOLERANCE_SECS`) ahead of this node's clock. Wired via `CounterStore::with_skew_rejection_counter`, called from `ClusterCoordinator` construction in [`coordinator.rs`](../crates/lb-cluster/src/coordinator.rs). See the cardinality note above for the `peer` label's 64-peer bound and `other` overflow value.
 
-### `lb_cluster_peer_sync_total` — counter (dead)
+### `lb_cluster_peer_sync_total` — counter
 
 Labels: `peer`, `outcome`.
 
-**Registered but never incremented anywhere.** `lb-cluster`'s gossip receive loop (`handle_peer_connection_with_timeout` in [`gossip.rs`](../crates/lb-cluster/src/gossip.rs)) distinguishes a handful of outcomes (a clean merge, an authentication failure, a peer echoing our own node ID, a read timeout) but only logs them via `tracing`; none of these paths touch this counter. There is no gossip-round-count metric in this codebase today.
+Incremented once per message or connection outcome on the gossip receive path ([`gossip.rs`](../crates/lb-cluster/src/gossip.rs)). `outcome` is `merged` (an authenticated message was applied), `own_node_id` (a peer announced this node's own `node_id`), `auth_failed` (the HMAC tag did not verify), `bad_frame` (a malformed or oversized frame) or `timeout` (no complete frame within the read timeout). A peer closing its connection after pushing is a normal end of stream and is not counted. `peer` is the sender's IP when it is one of the configured `cluster.peers`, and `unknown` otherwise, so connections from arbitrary addresses cannot grow the label set.
 
-### `lb_cluster_auth_failures_total` — counter (dead)
+### `lb_cluster_auth_failures_total` — counter
 
 Labels: `peer`.
 
-**Registered but never incremented anywhere.** The gossip receive loop rejects a peer message with a bad authentication tag at `gossip.rs`'s `handle_peer_connection_with_timeout` (`ErrorKind::PermissionDenied`) and logs `tracing::warn!("rejected an unauthenticated peer message")`, but does not increment this counter. Unlike `lb_cluster_future_skew_rejections_total`, no `with_*_counter` builder wires it into `CounterStore` or the gossip loop. An operator cannot currently alert on cluster authentication failures via Prometheus; the tracing log is the only signal.
+Incremented whenever a gossip message fails HMAC verification, alongside a `warn`-level log line. `peer` follows the same bounded rule as `lb_cluster_peer_sync_total`: a configured peer's IP, or `unknown`. A non-zero rate means a misconfigured shared secret or someone probing the peer port.
 
-### `lb_cluster_tracked_keys` — gauge (dead)
+### `lb_cluster_tracked_keys` — gauge
 
 No labels.
 
-**Registered but never set anywhere in production code.** `CounterStore` tracks up to `MAX_TRACKED_KEYS` (100,000) distinct rate-limit keys internally, but nothing publishes that count into this gauge outside `lb-metrics`'s own unit tests.
+Set on every gossip sync tick to the number of distinct keys in this node's cluster counter store, which is capped at `MAX_TRACKED_KEYS` (100,000).
 
 ## TLS and certificates
 
@@ -238,18 +238,6 @@ No labels.
 
 Incremented in [`admin.rs`](../crates/lb-metrics/src/admin.rs)'s `route` function whenever a request to the admin listener is missing its `Authorization: Bearer <token>` header or presents the wrong token (compared in constant time). Only meaningful when an admin token is configured; with no token configured, every request is accepted and this counter never increments.
 
-## Summary: dead metrics
-
-Registered in the Prometheus registry (and visible in `/metrics`, always reading `0`) but never updated by any production code path — verified by grepping every call site of the corresponding field/method outside `lb-metrics`'s own tests:
-
-- `lb_cluster_peer_sync_total`
-- `lb_cluster_auth_failures_total`
-- `lb_cluster_tracked_keys`
-- `lb_ratelimit_tracked_keys`
-- `lb_request_timeouts_total{phase="header"}` (the `body` phase of the same metric family is live)
-
-Additionally, `lb_connections_total` and `lb_active_connections` are live only for TCP (L4) listeners; they never move for HTTP/HTTPS listeners (see above).
-
 ## Suggested alerts
 
 The following use only metrics confirmed live above. Adjust listener/job label matchers to your scrape config.
@@ -304,4 +292,14 @@ sum by (listener) (rate(lb_requests_total{status="5xx"}[5m]))
   / sum by (listener) (rate(lb_requests_total[5m])) > 0.05
 ```
 
-There is currently no working metric-based alert for cluster gossip authentication failures or cluster peer-sync outcomes; both underlying counters are dead (see above). Until they are wired up, that failure mode is only visible via the `tracing::warn!` log line in `lb-cluster`'s gossip receive loop.
+**Cluster peer authentication failing** (mismatched shared secret, or probing of the peer port):
+
+```promql
+rate(lb_cluster_auth_failures_total[5m]) > 0
+```
+
+**A listener's rate-limit key table is full** (new clients are sharing the overflow bucket):
+
+```promql
+lb_ratelimit_tracked_keys >= 100000
+```

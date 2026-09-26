@@ -127,24 +127,35 @@ async fn handle_peer_connection_with_timeout<C, S>(
         match attempt {
             Ok(Ok(msg)) => {
                 if node.merge_message(&msg) == MergeOutcome::OwnNodeIdEcho {
+                    node.record_peer_sync(peer, "own_node_id");
                     tracing::error!(
                         peer = %peer,
                         node_id = %msg.node_id,
                         "peer announced our own node_id — two nodes share a node_id \
                          and their counts will collide"
                     );
+                } else {
+                    node.record_peer_sync(peer, "merged");
                 }
             }
             // A failed tag is worth surfacing: it means either a
             // misconfigured secret or someone probing the peer port.
             Ok(Err(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                 tracing::warn!(peer = %peer, "rejected an unauthenticated peer message");
+                node.record_auth_failure(peer);
+                node.record_peer_sync(peer, "auth_failed");
                 return;
             }
             // Includes clean EOF when the peer closes after pushing. A bad
             // frame closes only this connection, never the listener.
-            Ok(Err(_)) => return,
+            Ok(Err(err)) => {
+                if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                    node.record_peer_sync(peer, "bad_frame");
+                }
+                return;
+            }
             Err(_) => {
+                node.record_peer_sync(peer, "timeout");
                 tracing::warn!(peer = %peer, "closed a peer connection that never completed a frame within the read timeout");
                 return;
             }
@@ -186,6 +197,7 @@ where
             }
 
             node.prune();
+            node.publish_tracked_keys();
         }
     })
 }
@@ -667,6 +679,106 @@ mod tests {
     /// The security property this phase exists to deliver: an attacker who
     /// can reach the peer port but does not hold the secret cannot inflate
     /// counters, and therefore cannot deny service through the limiter.
+    #[tokio::test]
+    async fn peer_outcomes_are_counted_under_a_bounded_peer_label() {
+        let clock = FakeClock::new();
+        let metrics = lb_metrics::Metrics::new().unwrap();
+        let receiver = Arc::new(
+            ClusterNode::new("receiver", 10, clock.clone(), SECRET.to_vec()).with_metrics(
+                crate::ClusterMetrics {
+                    auth_failures: metrics.cluster_auth_failures.clone(),
+                    peer_sync: metrics.cluster_peer_sync.clone(),
+                    tracked_keys: metrics.cluster_tracked_keys.clone(),
+                    known_peers: vec!["127.0.0.1".parse().unwrap()],
+                },
+            ),
+        );
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
+
+        let impostor = Arc::new(ClusterNode::new(
+            "impostor",
+            10,
+            clock.clone(),
+            b"wrong".to_vec(),
+        ));
+        assert!(ListenerCoordinator::new(Arc::clone(&impostor), "web", 10).try_admit("k"));
+        let genuine = Arc::new(ClusterNode::new(
+            "genuine",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        assert!(ListenerCoordinator::new(Arc::clone(&genuine), "web", 10).try_admit("k"));
+        for framed in [
+            encode(&impostor.snapshot_message(), impostor.secret()).unwrap(),
+            encode(&genuine.snapshot_message(), SECRET).unwrap(),
+        ] {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(&framed).await.unwrap();
+            s.shutdown().await.unwrap();
+        }
+
+        let mut settled = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let merged = metrics
+                .cluster_peer_sync
+                .with_label_values(&["127.0.0.1", "merged"])
+                .get();
+            if merged == 1 {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the genuine message should be counted as merged");
+        assert_eq!(
+            metrics
+                .cluster_auth_failures
+                .with_label_values(&["127.0.0.1"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .cluster_peer_sync
+                .with_label_values(&["127.0.0.1", "auth_failed"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .cluster_peer_sync
+                .with_label_values(&["127.0.0.1", "bad_frame"])
+                .get(),
+            0,
+            "a peer closing after its push is a normal end of stream, not a bad frame"
+        );
+        receiver.publish_tracked_keys();
+        assert_eq!(metrics.cluster_tracked_keys.get(), 1);
+    }
+
+    #[test]
+    fn an_unconfigured_source_is_labelled_unknown() {
+        let metrics = lb_metrics::Metrics::new().unwrap();
+        let node = ClusterNode::new("n", 10, FakeClock::new(), SECRET.to_vec()).with_metrics(
+            crate::ClusterMetrics {
+                auth_failures: metrics.cluster_auth_failures.clone(),
+                peer_sync: metrics.cluster_peer_sync.clone(),
+                tracked_keys: metrics.cluster_tracked_keys.clone(),
+                known_peers: vec!["10.0.0.2".parse().unwrap()],
+            },
+        );
+        node.record_auth_failure("198.51.100.7:4000".parse().unwrap());
+        assert_eq!(
+            metrics
+                .cluster_auth_failures
+                .with_label_values(&["unknown"])
+                .get(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn a_peer_with_the_wrong_secret_cannot_influence_counters() {
         let clock = FakeClock::new();

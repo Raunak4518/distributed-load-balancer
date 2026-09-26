@@ -8,12 +8,14 @@ pub fn spawn_sweeper<C: Clock + 'static>(
     limiter: Arc<Gcra<C>>,
     interval: Duration,
     idle_after: Duration,
+    report_tracked_keys: impl Fn(usize) + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = time::interval(interval);
         loop {
             ticker.tick().await;
             limiter.sweep(idle_after);
+            report_tracked_keys(limiter.tracked_keys());
         }
     })
 }
@@ -42,6 +44,7 @@ mod tests {
             limiter.clone(),
             Duration::from_millis(50),
             Duration::from_millis(10),
+            |_| {},
         );
 
         clock.advance(Duration::from_secs(1));
@@ -50,5 +53,30 @@ mod tests {
         time::sleep(Duration::from_millis(1)).await; // yield so the spawned task runs
 
         assert_eq!(limiter.check("stale"), Decision::Allow);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_sweep_reports_the_tracked_key_count() {
+        let clock = FakeClock::new();
+        let limiter = Arc::new(Gcra::new(
+            GcraConfig {
+                rate_per_sec: 10.0,
+                burst: 1,
+                max_tracked_keys: usize::MAX,
+            },
+            clock.clone(),
+        ));
+        limiter.check("a");
+        limiter.check("b");
+        let reported = Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+        let sink = Arc::clone(&reported);
+        let _handle = spawn_sweeper(
+            Arc::clone(&limiter),
+            Duration::from_secs(30),
+            Duration::from_secs(3600),
+            move |n| sink.store(n, std::sync::atomic::Ordering::SeqCst),
+        );
+        time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(reported.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
