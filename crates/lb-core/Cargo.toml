@@ -13,7 +13,7 @@ test-util = []
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-thiserror = "1"
+thiserror = "2"
 # For validating a configured `server_name` as a real `http::uri::Authority`
 # at startup (config.rs) -- the exact type `lb-proxy`'s forwarding path
 # builds its outbound URI authority from, so "what config accepts" and "what
