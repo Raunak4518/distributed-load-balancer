@@ -2,7 +2,7 @@ use crate::backend::{Backend, BackendId};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 struct BackendState {
     backend: Backend,
@@ -66,6 +66,7 @@ pub struct BackendPool {
     inner: ArcSwap<PoolState>,
     max_ejected_fraction: Option<f64>,
     version: AtomicU64,
+    ejection_lock: Mutex<()>,
 }
 
 impl BackendPool {
@@ -81,6 +82,7 @@ impl BackendPool {
             inner: ArcSwap::from_pointee(PoolState::from_backends(backends)),
             max_ejected_fraction,
             version: AtomicU64::new(0),
+            ejection_lock: Mutex::new(()),
         }
     }
 
@@ -114,25 +116,41 @@ impl BackendPool {
     }
 
     pub fn set_circuit_open(&self, id: &BackendId, open: bool) {
-        let snapshot = self.inner.load();
-        let Some(s) = snapshot.states.get(id) else {
-            return;
-        };
-        if open && self.exceeds_ejection_ceiling(&snapshot, id) {
-            return;
-        }
-        s.circuit_open.store(open, Ordering::SeqCst);
+        self.set_ejection_flag(id, open, |s| &s.circuit_open);
     }
 
     pub fn set_outlier_ejected(&self, id: &BackendId, ejected: bool) {
+        self.set_ejection_flag(id, ejected, |s| &s.outlier_ejected);
+    }
+
+    fn set_ejection_flag(
+        &self,
+        id: &BackendId,
+        value: bool,
+        flag: fn(&BackendState) -> &AtomicBool,
+    ) {
+        {
+            let snapshot = self.inner.load();
+            let Some(s) = snapshot.states.get(id) else {
+                return;
+            };
+            if !value || self.max_ejected_fraction.is_none() || flag(s).load(Ordering::SeqCst) {
+                flag(s).store(value, Ordering::SeqCst);
+                return;
+            }
+        }
+        let _guard = self
+            .ejection_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = self.inner.load();
         let Some(s) = snapshot.states.get(id) else {
             return;
         };
-        if ejected && self.exceeds_ejection_ceiling(&snapshot, id) {
+        if self.exceeds_ejection_ceiling(&snapshot, id) {
             return;
         }
-        s.outlier_ejected.store(ejected, Ordering::SeqCst);
+        flag(s).store(true, Ordering::SeqCst);
     }
 
     fn exceeds_ejection_ceiling(&self, snapshot: &PoolState, id: &BackendId) -> bool {
@@ -285,6 +303,10 @@ impl BackendPool {
     }
 
     pub fn apply_resolved(&self, backends: Vec<Backend>) {
+        let _guard = self
+            .ejection_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous = self.inner.load();
         if resolved_set_unchanged(&previous, &backends) {
             return;
@@ -452,6 +474,49 @@ mod tests {
         pool.set_outlier_ejected(&BackendId::new("b2"), true);
         assert!(pool.is_circuit_open(&BackendId::new("b1")));
         assert!(!pool.is_outlier_ejected(&BackendId::new("b2")));
+    }
+
+    fn concurrent_ejections(eject: fn(&BackendPool, &BackendId)) {
+        let ids: Vec<String> = (0..8).map(|i| format!("b{i}")).collect();
+        let names: Vec<&str> = ids.iter().map(String::as_str).collect();
+        for _ in 0..2_000 {
+            let pool = pool_with_ceiling(&names, 0.25);
+            let barrier = std::sync::Barrier::new(names.len());
+            std::thread::scope(|scope| {
+                for name in &names {
+                    let pool = &pool;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        eject(pool, &BackendId::new(*name));
+                    });
+                }
+            });
+            let ejected = names
+                .iter()
+                .filter(|n| {
+                    let id = BackendId::new(**n);
+                    pool.is_circuit_open(&id) || pool.is_outlier_ejected(&id)
+                })
+                .count();
+            assert!(ejected <= 2, "{ejected} of 8 ejected under a 0.25 ceiling");
+        }
+    }
+
+    #[test]
+    fn concurrent_circuit_trips_never_exceed_the_ceiling() {
+        concurrent_ejections(|pool, id| pool.set_circuit_open(id, true));
+    }
+
+    #[test]
+    fn concurrent_mixed_ejections_never_exceed_the_ceiling() {
+        concurrent_ejections(|pool, id| {
+            if id.0.ends_with(['0', '2', '4', '6']) {
+                pool.set_circuit_open(id, true);
+            } else {
+                pool.set_outlier_ejected(id, true);
+            }
+        });
     }
 
     #[test]
