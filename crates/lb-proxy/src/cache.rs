@@ -13,7 +13,9 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use hyper::header::{CACHE_CONTROL, CONTENT_LENGTH, HOST};
+use hyper::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, HOST, SET_COOKIE, VARY,
+};
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 use lb_core::Clock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,18 +54,64 @@ pub fn key_for(method: &Method, uri: &Uri, headers: &HeaderMap) -> String {
         .or_else(|| uri.authority().map(|authority| authority.as_str()))
         .unwrap_or("");
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    format!("{method}|{host}|{path_and_query}")
+    let accept_encoding = normalized_accept_encoding(headers);
+    format!("{method}|{host}|{path_and_query}|{accept_encoding}")
+}
+
+fn normalized_accept_encoding(headers: &HeaderMap) -> String {
+    let mut codings: Vec<String> = headers
+        .get_all(ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|coding| {
+            coding
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .filter(|coding| !coding.is_empty())
+        .collect();
+    codings.sort();
+    codings.dedup();
+    codings.join(",")
+}
+
+pub fn request_is_cacheable(method: &Method, headers: &HeaderMap) -> bool {
+    *method == Method::GET
+        && !headers.contains_key(AUTHORIZATION)
+        && !crate::upgrade::is_upgrade_request(headers)
+}
+
+fn varies_only_on_accept_encoding(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(VARY)
+        .iter()
+        .all(|value| match value.to_str() {
+            Ok(value) => value
+                .split(',')
+                .map(str::trim)
+                .filter(|field| !field.is_empty())
+                .all(|field| field.eq_ignore_ascii_case("accept-encoding")),
+            Err(_) => false,
+        })
+}
+
+fn parse_seconds(value: &str) -> Option<u64> {
+    value.trim().trim_matches('"').parse().ok()
 }
 
 /// Whether this response may be cached, and for how long -- `None` means
 /// "don't cache," `Some(ttl)` means "cache for `ttl`." See the module docs
 /// for why each precondition exists.
 ///
-/// `Cache-Control` directives read: `no-store`, `private`, `no-cache`, and
-/// `max-age=N`. Everything else (`s-maxage`, `must-revalidate`,
-/// `stale-while-revalidate`, `Vary`, `ETag`, conditional requests, ...) is
-/// out of scope for v1 -- not because it's harder, but because it's not what
-/// was found missing yet.
+/// `Cache-Control` directives read, across every `Cache-Control` header line
+/// and in any order: `no-store`, `private`, or `no-cache` anywhere means
+/// "don't cache"; `s-maxage=N` (this is a shared cache) takes precedence
+/// over `max-age=N`. A response carrying `Set-Cookie`, or a `Vary` on
+/// anything other than `Accept-Encoding` (which `key_for` already keys on),
+/// is never cached. `ETag` and conditional requests are not supported.
 pub fn cacheable_ttl(
     method: &Method,
     status: StatusCode,
@@ -81,22 +129,31 @@ pub fn cacheable_ttl(
     if content_length > max_entry_bytes {
         return None;
     }
-    let Some(cache_control) = headers.get(CACHE_CONTROL).and_then(|v| v.to_str().ok()) else {
-        return Some(default_ttl);
-    };
-    for directive in cache_control.split(',') {
-        let directive = directive.trim().to_ascii_lowercase();
-        if directive == "no-store" || directive == "private" || directive == "no-cache" {
-            return None;
-        }
-        if let Some(secs) = directive.strip_prefix("max-age=") {
-            return match secs.trim().parse::<u64>() {
-                Ok(0) | Err(_) => None,
-                Ok(secs) => Some(Duration::from_secs(secs)),
-            };
+    if headers.contains_key(SET_COOKIE) || !varies_only_on_accept_encoding(headers) {
+        return None;
+    }
+    let mut max_age: Option<Option<u64>> = None;
+    let mut s_maxage: Option<Option<u64>> = None;
+    for value in headers.get_all(CACHE_CONTROL) {
+        let value = value.to_str().ok()?;
+        for directive in value.split(',') {
+            let directive = directive.trim().to_ascii_lowercase();
+            let name = directive.split('=').next().unwrap_or("").trim();
+            if name == "no-store" || name == "private" || name == "no-cache" {
+                return None;
+            }
+            if let Some(secs) = directive.strip_prefix("s-maxage=") {
+                s_maxage = Some(parse_seconds(secs));
+            } else if let Some(secs) = directive.strip_prefix("max-age=") {
+                max_age = Some(parse_seconds(secs));
+            }
         }
     }
-    Some(default_ttl)
+    match s_maxage.or(max_age) {
+        None => Some(default_ttl),
+        Some(None) | Some(Some(0)) => None,
+        Some(Some(secs)) => Some(Duration::from_secs(secs)),
+    }
 }
 
 /// A listener-wide response cache. Generic over `Clock` for the same reason
@@ -174,9 +231,16 @@ impl<C: Clock> ResponseCache<C> {
             return;
         }
         let size = accounted_size(&key, &headers, body.len());
-        // A soft cap, not a hard allocator limit: a brief overshoot under
-        // concurrent inserts racing this check is acceptable.
-        if self.total_bytes.load(Ordering::Relaxed) + size > self.max_total_bytes {
+        // A hard cap: the bytes are reserved atomically before the entry is
+        // inserted, so concurrent inserts can never push the total past it.
+        let reserved =
+            self.total_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                    total
+                        .checked_add(size)
+                        .filter(|next| *next <= self.max_total_bytes)
+                });
+        if reserved.is_err() {
             return;
         }
         let expires_at = self.clock.now() + ttl;
@@ -187,7 +251,6 @@ impl<C: Clock> ResponseCache<C> {
             expires_at,
             accounted_size: size,
         };
-        self.total_bytes.fetch_add(size, Ordering::Relaxed);
         if let Some(old) = self.entries.insert(key, entry) {
             self.total_bytes
                 .fetch_sub(old.accounted_size, Ordering::Relaxed);
@@ -751,24 +814,137 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_puts_at_the_cap_overshoot_by_at_most_one_entry_per_thread() {
+    fn concurrent_puts_never_exceed_the_total_budget() {
         let threads = 16usize;
-        let entry = accounted_size("t00-k000", &HeaderMap::new(), 200);
-        let cap = entry * 10;
-        let cache = ResponseCache::new(1024, cap, Duration::from_secs(60), FakeClock::new());
-        std::thread::scope(|scope| {
-            for t in 0..threads {
-                let cache = &cache;
-                scope.spawn(move || {
-                    for i in 0..50usize {
-                        put_body(cache, &format!("t{t:02}-k{i:03}"), 200, 60);
-                    }
-                });
-            }
-        });
-        assert!(cache.accounted_bytes() > cap - entry);
-        assert!(cache.accounted_bytes() <= cap + (threads - 1) * entry);
-        assert_accounting_matches_entries(&cache);
+        let entry = accounted_size("t00", &HeaderMap::new(), 200);
+        let cap = entry * 4;
+        for _ in 0..200 {
+            let cache = ResponseCache::new(1024, cap, Duration::from_secs(60), FakeClock::new());
+            let barrier = std::sync::Barrier::new(threads);
+            std::thread::scope(|scope| {
+                for t in 0..threads {
+                    let cache = &cache;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        put_body(cache, &format!("t{t:02}"), 200, 60);
+                    });
+                }
+            });
+            assert_eq!(cache.entries.len(), 4);
+            assert_eq!(cache.accounted_bytes(), cap);
+            assert_accounting_matches_entries(&cache);
+        }
+    }
+
+    fn ttl_for(pairs: &[(&str, &str)]) -> Option<Duration> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, "5".parse().unwrap());
+        for (name, value) in pairs {
+            headers.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                hyper::header::HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        cacheable_ttl(
+            &Method::GET,
+            StatusCode::OK,
+            &headers,
+            1024,
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn a_forbidding_directive_wins_wherever_it_appears() {
+        assert_eq!(ttl_for(&[("cache-control", "max-age=600, private")]), None);
+        assert_eq!(ttl_for(&[("cache-control", "max-age=600, no-store")]), None);
+        assert_eq!(ttl_for(&[("cache-control", "max-age=600, no-cache")]), None);
+        assert_eq!(
+            ttl_for(&[("cache-control", "max-age=600, private=\"x-user\"")]),
+            None
+        );
+        assert_eq!(
+            ttl_for(&[
+                ("cache-control", "max-age=600"),
+                ("cache-control", "private"),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn s_maxage_takes_precedence_over_max_age() {
+        assert_eq!(
+            ttl_for(&[("cache-control", "max-age=600, s-maxage=30")]),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            ttl_for(&[("cache-control", "s-maxage=30, max-age=600")]),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(ttl_for(&[("cache-control", "public, s-maxage=0")]), None);
+        assert_eq!(
+            ttl_for(&[("cache-control", "public, max-age=0, s-maxage=45")]),
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn a_response_that_sets_a_cookie_is_never_cached() {
+        assert_eq!(ttl_for(&[("set-cookie", "session=abc")]), None);
+        assert_eq!(
+            ttl_for(&[
+                ("set-cookie", "session=abc"),
+                ("cache-control", "public, max-age=600")
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn vary_is_only_accepted_on_accept_encoding() {
+        assert_eq!(
+            ttl_for(&[("vary", "Accept-Encoding")]),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            ttl_for(&[("vary", "accept-encoding"), ("vary", "Accept-Encoding")]),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(ttl_for(&[("vary", "Cookie")]), None);
+        assert_eq!(ttl_for(&[("vary", "*")]), None);
+        assert_eq!(ttl_for(&[("vary", "Accept-Encoding, User-Agent")]), None);
+    }
+
+    #[test]
+    fn the_key_separates_accept_encodings_but_ignores_their_formatting() {
+        let uri: Uri = "/x".parse().unwrap();
+        let gzip = headers_with(&[("host", "a"), ("accept-encoding", "gzip, br")]);
+        let reordered = headers_with(&[("host", "a"), ("accept-encoding", "BR,gzip")]);
+        let identity = headers_with(&[("host", "a")]);
+        assert_eq!(
+            key_for(&Method::GET, &uri, &gzip),
+            key_for(&Method::GET, &uri, &reordered)
+        );
+        assert_ne!(
+            key_for(&Method::GET, &uri, &gzip),
+            key_for(&Method::GET, &uri, &identity)
+        );
+    }
+
+    #[test]
+    fn authorized_and_upgrade_requests_bypass_the_cache() {
+        assert!(request_is_cacheable(&Method::GET, &HeaderMap::new()));
+        assert!(!request_is_cacheable(&Method::POST, &HeaderMap::new()));
+        assert!(!request_is_cacheable(
+            &Method::GET,
+            &headers_with(&[("authorization", "Bearer t")])
+        ));
+        assert!(!request_is_cacheable(
+            &Method::GET,
+            &headers_with(&[("connection", "Upgrade"), ("upgrade", "websocket")])
+        ));
     }
 
     #[test]

@@ -625,7 +625,7 @@ where
     let cache_key = ctx
         .cache
         .as_ref()
-        .filter(|_| req.method() == Method::GET)
+        .filter(|_| cache::request_is_cacheable(req.method(), req.headers()))
         .map(|_| cache::key_for(req.method(), req.uri(), req.headers()));
     if let (Some(cache), Some(key)) = (&ctx.cache, &cache_key) {
         if let Some(cached) = cache.get(key) {
@@ -3197,6 +3197,105 @@ mod tests {
         assert_eq!(backend_hits(&count), 1);
         assert_eq!(hit.body(), "hello");
         assert!(hit.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    async fn cache_send_with(
+        addr: SocketAddr,
+        path: &str,
+        headers: &[(&'static str, &'static str)],
+    ) -> Response<Bytes> {
+        let client = build_client(None, HashMap::new(), false, None);
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri(format!("http://{addr}{path}"));
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = client
+            .request(builder.body(Full::new(Bytes::new())).unwrap())
+            .await
+            .unwrap();
+        let (parts, body) = resp.into_parts();
+        Response::from_parts(parts, body.collect().await.unwrap().to_bytes())
+    }
+
+    #[tokio::test]
+    async fn a_private_directive_after_max_age_still_prevents_caching() {
+        let (addr, count) = cached_proxy(
+            "mine",
+            &[("cache-control", "max-age=600, private")],
+            test_cache(),
+            None,
+        )
+        .await;
+        cache_send(addr, Method::GET, "/me", None).await;
+        cache_send(addr, Method::GET, "/me", None).await;
+        assert_eq!(backend_hits(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn a_response_that_sets_a_cookie_is_never_served_from_the_cache() {
+        let (addr, count) =
+            cached_proxy("hi", &[("set-cookie", "session=abc")], test_cache(), None).await;
+        cache_send(addr, Method::GET, "/", None).await;
+        let second = cache_send(addr, Method::GET, "/", None).await;
+        assert_eq!(backend_hits(&count), 2);
+        assert_eq!(
+            second.headers().get(header::SET_COOKIE).unwrap(),
+            "session=abc"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authorized_request_neither_reads_from_nor_populates_the_cache() {
+        let (addr, count) = cached_proxy("hello", &[], test_cache(), None).await;
+        cache_send_with(addr, "/a", &[("authorization", "Bearer secret")]).await;
+        cache_send_with(addr, "/a", &[]).await;
+        assert_eq!(backend_hits(&count), 2);
+        cache_send_with(addr, "/a", &[("authorization", "Bearer secret")]).await;
+        assert_eq!(backend_hits(&count), 3);
+        cache_send_with(addr, "/a", &[]).await;
+        assert_eq!(backend_hits(&count), 3);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_upgrade_is_never_answered_from_the_cache() {
+        let (addr, count) = cached_proxy("page", &[], test_cache(), None).await;
+        cache_send_with(addr, "/ws", &[]).await;
+        cache_send_with(addr, "/ws", &[]).await;
+        assert_eq!(backend_hits(&count), 1);
+        cache_send_with(
+            addr,
+            "/ws",
+            &[
+                ("connection", "Upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-version", "13"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        )
+        .await;
+        assert_eq!(backend_hits(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn responses_varying_on_accept_encoding_are_cached_per_encoding() {
+        let (addr, count) =
+            cached_proxy("x", &[("vary", "Accept-Encoding")], test_cache(), None).await;
+        cache_send_with(addr, "/v", &[("accept-encoding", "gzip")]).await;
+        cache_send_with(addr, "/v", &[]).await;
+        assert_eq!(backend_hits(&count), 2);
+        cache_send_with(addr, "/v", &[("accept-encoding", "gzip")]).await;
+        cache_send_with(addr, "/v", &[]).await;
+        assert_eq!(backend_hits(&count), 2);
+    }
+
+    #[tokio::test]
+    async fn a_response_varying_on_cookie_is_never_cached() {
+        let (addr, count) = cached_proxy("x", &[("vary", "Cookie")], test_cache(), None).await;
+        cache_send_with(addr, "/c", &[("cookie", "u=1")]).await;
+        cache_send_with(addr, "/c", &[("cookie", "u=2")]).await;
+        assert_eq!(backend_hits(&count), 2);
     }
 
     #[tokio::test]
