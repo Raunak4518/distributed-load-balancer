@@ -4020,6 +4020,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_live_websocket_counts_as_an_active_connection_until_it_closes() {
+        let backend_addr = spawn_upgrade_backend(true).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let observed = Arc::clone(&pool);
+
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            retry_budget: None,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(5),
+            response_body_idle_timeout: Duration::from_secs(60),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(2),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+
+        let addr = spawn_proxy_listener(ctx).await;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (head, mut leftover) = read_response_head(&mut client).await;
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101, got:\n{head}"
+        );
+        let lower = head.to_ascii_lowercase();
+        assert!(lower.contains("connection: upgrade"), "got:\n{head}");
+        assert!(lower.contains("upgrade: websocket"), "got:\n{head}");
+
+        client.write_all(b"ping").await.unwrap();
+        while leftover.len() < 4 {
+            let mut chunk = [0u8; 64];
+            let n = client.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "connection closed before the echo arrived");
+            leftover.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(&leftover[..4], b"ping");
+        assert_eq!(observed.active_count(&backend.id), 1);
+
+        drop(client);
+        let mut released = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if observed.active_count(&backend.id) == 0 {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "a closed WebSocket must release its active-connection count"
+        );
+    }
+
+    #[tokio::test]
     async fn a_declined_upgrade_is_relayed_as_an_ordinary_response() {
         let backend_addr = spawn_upgrade_backend(false).await;
         let backend = Backend::new("b1", backend_addr, 1, None);

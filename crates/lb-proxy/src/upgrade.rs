@@ -84,6 +84,7 @@ where
     let Some(backend) = pool.backend(&backend_id) else {
         return simple_response(StatusCode::SERVICE_UNAVAILABLE, "no healthy backend");
     };
+    let active = pool.track_active(&backend_id);
 
     // Also tells us, by construction, that `backend.server_name` is present
     // whenever `ctx.backend_tls` is set -- `backend_scheme_and_authority`
@@ -195,6 +196,7 @@ where
         .record_websocket_upgrade(WebsocketUpgradeResult::Success);
     let idle_timeout = ctx.websocket_idle_timeout;
     tokio::spawn(async move {
+        let _active = active;
         // Resolves only once hyper has actually sent the `101` response
         // this function is about to return and handed off the connection --
         // the relay cannot start any earlier than that.
