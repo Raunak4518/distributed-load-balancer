@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::Instrument;
 
-pub type ProxyBody = BoxBody<Bytes, hyper::Error>;
+pub type ProxyBody = BoxBody<Bytes, crate::forward::BoxError>;
 
 pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub rate_limiter: Arc<R>,
@@ -110,6 +110,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     /// connection may sit idle once the backend accepts the handshake.
     /// `forward_timeout`/`body_read_timeout` never apply past that point.
     pub websocket_idle_timeout: Duration,
+    pub response_body_idle_timeout: Duration,
     /// See `lb_core::TcpKeepaliveConfig`. Applied to `client`'s pooled
     /// connections via `HttpConnector`'s own native setters at wiring time
     /// (`crate::forward::build_client`) -- this field exists on
@@ -357,14 +358,24 @@ fn hashed_header_key(value: &[u8]) -> String {
     key
 }
 
-async fn read_bounded(body: Incoming, max_bytes: usize) -> Result<Bytes, ()> {
-    let collected = body.collect().await.map_err(|_| ())?;
-    let bytes = collected.to_bytes();
-    if bytes.len() > max_bytes {
-        Err(())
-    } else {
-        Ok(bytes)
-    }
+async fn read_bounded<B>(body: B, max_bytes: usize) -> Result<Bytes, ()>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    http_body_util::Limited::new(body, max_bytes)
+        .collect()
+        .await
+        .map(|collected| collected.to_bytes())
+        .map_err(|_| ())
+}
+
+fn declared_length_exceeds(headers: &hyper::HeaderMap, max_bytes: usize) -> bool {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .is_some_and(|len| len > max_bytes as u64)
 }
 
 /// Removes hop-by-hop headers, which describe a single connection rather than
@@ -720,6 +731,12 @@ where
     }
 
     let (parts, body) = req.into_parts();
+    if declared_length_exceeds(&parts.headers, ctx.max_request_body_bytes) {
+        return Ok(simple_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        ));
+    }
     let bytes = match tokio::time::timeout(
         ctx.body_read_timeout,
         read_bounded(body, ctx.max_request_body_bytes),
@@ -875,7 +892,12 @@ where
                         }
                     }
                 } else {
-                    resp_body.boxed()
+                    crate::forward::IdleTimeoutBody::new(
+                        resp_body,
+                        ctx.response_body_idle_timeout,
+                        Some(ctx.metrics.timeouts_upstream_body.clone()),
+                    )
+                    .boxed()
                 };
 
                 // Refreshed on every successful response, whether or not it
@@ -1316,6 +1338,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1353,6 +1376,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1409,6 +1433,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1450,6 +1475,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1507,6 +1533,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1546,6 +1573,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
@@ -1576,6 +1604,133 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(ctx.metrics.retry_successes.get(), 1);
+    }
+
+    fn ctx_with_body_idle(
+        backend: &Backend,
+        pool: Arc<BackendPool>,
+        idle: Duration,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: idle,
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(2),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        })
+    }
+
+    async fn spawn_trickling_backend(chunks: usize, gap: Duration, stall: bool) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                    }
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                        .await;
+                    for _ in 0..chunks {
+                        let _ = stream.write_all(b"5\r\nhello\r\n").await;
+                        tokio::time::sleep(gap).await;
+                    }
+                    if stall {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    } else {
+                        let _ = stream.write_all(b"0\r\n\r\n").await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn fetch_raw(addr: SocketAddr) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the proxy must end a stalled response instead of holding it open");
+        response
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_stalls_mid_body_is_cut_off_at_the_idle_timeout() {
+        let backend_addr = spawn_trickling_backend(1, Duration::from_millis(10), true).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_with_body_idle(&backend, pool, Duration::from_millis(300));
+        let metrics = ctx.metrics.clone();
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let response = fetch_raw(addr).await;
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("hello"), "{text}");
+        assert!(
+            !text.ends_with("0\r\n\r\n"),
+            "a stalled body must not be presented as complete: {text}"
+        );
+        assert_eq!(metrics.timeouts_upstream_body.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_but_steady_body_is_not_cut_off() {
+        let backend_addr = spawn_trickling_backend(5, Duration::from_millis(100), false).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_with_body_idle(&backend, pool, Duration::from_millis(300));
+        let metrics = ctx.metrics.clone();
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let response = fetch_raw(addr).await;
+
+        let text = String::from_utf8_lossy(&response);
+        assert_eq!(text.matches("hello").count(), 5, "{text}");
+        assert!(text.ends_with("0\r\n\r\n"), "{text}");
+        assert_eq!(metrics.timeouts_upstream_body.get(), 0);
     }
 
     #[tokio::test]
@@ -1774,6 +1929,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1821,6 +1977,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1882,6 +2039,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -1971,6 +2129,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2040,6 +2199,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2109,6 +2269,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2269,6 +2430,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2409,6 +2571,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2450,6 +2613,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2567,6 +2731,7 @@ mod tests {
                 backend_tls: false,
                 backend_tls_connector: None,
                 websocket_idle_timeout: Duration::from_secs(300),
+                response_body_idle_timeout: Duration::from_secs(60),
                 backend_tcp_keepalive: None,
                 rate_limit_key: RateLimitKeySource::SourceIp,
                 forward_timeout: Duration::from_secs(1),
@@ -2640,6 +2805,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2816,6 +2982,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2865,6 +3032,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2910,6 +3078,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -2953,6 +3122,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3358,6 +3528,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3399,6 +3570,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3447,6 +3619,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3495,6 +3668,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3537,6 +3711,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3577,6 +3752,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3623,6 +3799,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3673,6 +3850,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
@@ -3800,6 +3978,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(5),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
@@ -3866,6 +4045,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(5),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
@@ -3892,6 +4072,68 @@ mod tests {
             head.starts_with("HTTP/1.1 200"),
             "expected 200, got:\n{head}"
         );
+    }
+
+    struct EndlessBody {
+        frames_served: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl hyper::body::Body for EndlessBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Infallible>>> {
+            let served = self
+                .frames_served
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if served >= 64 {
+                return std::task::Poll::Ready(None);
+            }
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(
+                vec![0u8; 64 * 1024],
+            )))))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_body_is_rejected_without_being_buffered() {
+        let frames_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = EndlessBody {
+            frames_served: Arc::clone(&frames_served),
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), read_bounded(body, 1024 * 1024))
+            .await
+            .expect("reading must finish");
+        assert!(result.is_err());
+        assert!(
+            frames_served.load(std::sync::atomic::Ordering::SeqCst) <= 17,
+            "read {} frames of 64 KiB against a 1 MiB limit",
+            frames_served.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_within_the_limit_is_read_whole() {
+        let body = Full::new(Bytes::from(vec![7u8; 1000]));
+        assert_eq!(read_bounded(body, 1000).await.unwrap().len(), 1000);
+        let body = Full::new(Bytes::from(vec![7u8; 1001]));
+        assert!(read_bounded(body, 1000).await.is_err());
+    }
+
+    #[test]
+    fn a_declared_length_over_the_limit_is_rejected_before_reading() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, "1048577".parse().unwrap());
+        assert!(declared_length_exceeds(&headers, 1024 * 1024));
+        headers.insert(header::CONTENT_LENGTH, "1048576".parse().unwrap());
+        assert!(!declared_length_exceeds(&headers, 1024 * 1024));
+        assert!(!declared_length_exceeds(
+            &hyper::HeaderMap::new(),
+            1024 * 1024
+        ));
     }
 
     struct RecordingLimiter(std::sync::Mutex<Vec<String>>);
@@ -3944,6 +4186,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::Header("X-Api-Key".to_string()),
             forward_timeout: Duration::from_secs(1),
@@ -4040,6 +4283,7 @@ mod tests {
             backend_tls: false,
             backend_tls_connector: None,
             websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::Header("X-Trigger".to_string()),
             forward_timeout: Duration::from_secs(1),

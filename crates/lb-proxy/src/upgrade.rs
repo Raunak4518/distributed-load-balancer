@@ -181,7 +181,7 @@ where
             .record_websocket_upgrade(WebsocketUpgradeResult::BackendDeclined);
         let (mut parts, body) = backend_resp.into_parts();
         strip_hop_by_hop(&mut parts.headers);
-        return Response::from_parts(parts, body.boxed());
+        return Response::from_parts(parts, body.map_err(Into::into).boxed());
     }
 
     // Must happen before `req`/`backend_resp` are dropped -- `on_upgrade`

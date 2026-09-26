@@ -1044,6 +1044,7 @@ pub(crate) fn build_listener_core(
                 forward_timeout: lc.forward_timeout(),
                 max_request_body_bytes: lc.max_request_body_bytes(),
                 websocket_idle_timeout: lc.websocket_idle_timeout(),
+                response_body_idle_timeout: lc.response_body_idle_timeout(),
                 backend_tcp_keepalive: lc.backend_tcp_keepalive.clone(),
                 cluster: cluster_coordinator,
                 metrics: listener_metrics,

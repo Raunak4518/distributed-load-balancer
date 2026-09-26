@@ -265,6 +265,8 @@ pub struct ListenerConfig {
     pub forward_timeout_ms: Option<u64>,
     pub max_request_body_bytes: Option<usize>,
     pub write_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub response_body_idle_timeout_ms: Option<u64>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -618,6 +620,10 @@ impl ListenerConfig {
     /// See `websocket_idle_timeout_ms`.
     pub fn websocket_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.websocket_idle_timeout_ms.unwrap_or(300_000))
+    }
+
+    pub fn response_body_idle_timeout(&self) -> Duration {
+        Duration::from_millis(self.response_body_idle_timeout_ms.unwrap_or(60_000))
     }
 
     /// Whether this listener serves HTTP/2.
@@ -1187,9 +1193,10 @@ impl ListenerConfig {
         if self.header_read_timeout().is_zero()
             || self.body_read_timeout().is_zero()
             || self.write_timeout().is_zero()
+            || self.response_body_idle_timeout().is_zero()
         {
             return Err(invalid(
-                "header_read_timeout_ms, body_read_timeout_ms and write_timeout_ms must be positive"
+                "header_read_timeout_ms, body_read_timeout_ms, write_timeout_ms and response_body_idle_timeout_ms must be positive"
                     .into(),
             ));
         }
@@ -1323,9 +1330,10 @@ impl ListenerConfig {
                     || self.max_request_body_bytes.is_some()
                     || self.write_timeout_ms.is_some()
                     || self.websocket_idle_timeout_ms.is_some()
+                    || self.response_body_idle_timeout_ms.is_some()
                 {
                     return Err(invalid(
-                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
+                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
                             .into(),
                     ));
                 }
@@ -1614,6 +1622,27 @@ mod tests {
           [listeners.load_balancing]
           strategy = "round_robin"
     "#;
+
+    #[test]
+    fn response_body_idle_timeout_defaults_and_is_http_only() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert_eq!(
+            cfg.listeners[0].response_body_idle_timeout(),
+            Duration::from_secs(60)
+        );
+        let on_tcp = VALID.replacen(
+            "listen = \"0.0.0.0:5432\"",
+            "listen = \"0.0.0.0:5432\"\n        response_body_idle_timeout_ms = 1000",
+            1,
+        );
+        assert!(Config::parse(&on_tcp).is_err());
+        let zero = VALID.replacen(
+            "listen = \"0.0.0.0:8080\"",
+            "listen = \"0.0.0.0:8080\"\n        response_body_idle_timeout_ms = 0",
+            1,
+        );
+        assert!(Config::parse(&zero).is_err());
+    }
 
     #[test]
     fn health_check_thresholds_default_and_validate() {

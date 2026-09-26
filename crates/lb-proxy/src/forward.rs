@@ -265,6 +265,82 @@ pub async fn forward(
     }
 }
 
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug)]
+pub struct UpstreamBodyIdleTimeout;
+
+impl std::fmt::Display for UpstreamBodyIdleTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("backend response body stalled past the idle timeout")
+    }
+}
+
+impl std::error::Error for UpstreamBodyIdleTimeout {}
+
+pub struct IdleTimeoutBody<B> {
+    inner: B,
+    idle: Duration,
+    timer: std::pin::Pin<Box<tokio::time::Sleep>>,
+    on_timeout: Option<lb_metrics::IntCounter>,
+}
+
+impl<B> IdleTimeoutBody<B> {
+    pub fn new(inner: B, idle: Duration, on_timeout: Option<lb_metrics::IntCounter>) -> Self {
+        IdleTimeoutBody {
+            inner,
+            idle,
+            timer: Box::pin(tokio::time::sleep(idle)),
+            on_timeout,
+        }
+    }
+}
+
+impl<B> hyper::body::Body for IdleTimeoutBody<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        use std::future::Future;
+        use std::task::Poll;
+        let me = self.get_mut();
+        match std::pin::Pin::new(&mut me.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                let next = tokio::time::Instant::now() + me.idle;
+                me.timer.as_mut().reset(next);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if me.timer.as_mut().poll(cx).is_ready() {
+                    if let Some(counter) = me.on_timeout.take() {
+                        counter.inc();
+                    }
+                    Poll::Ready(Some(Err(Box::new(UpstreamBodyIdleTimeout))))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

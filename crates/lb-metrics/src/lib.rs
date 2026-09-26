@@ -440,6 +440,9 @@ impl Metrics {
                 .with_label_values(&[name, "max_per_ip"]),
             timeouts_header: self.request_timeouts.with_label_values(&[name, "header"]),
             timeouts_body: self.request_timeouts.with_label_values(&[name, "body"]),
+            timeouts_upstream_body: self
+                .request_timeouts
+                .with_label_values(&[name, "upstream_body"]),
             tracked_keys: self.ratelimit_tracked_keys.with_label_values(&[name]),
             cluster_convergence_bound: self
                 .ratelimit_cluster_convergence_bound

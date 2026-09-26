@@ -355,6 +355,7 @@ async fn dns_churn_experiment() {
         backend_tls: false,
         backend_tls_connector: None,
         websocket_idle_timeout: Duration::from_secs(300),
+        response_body_idle_timeout: Duration::from_secs(60),
         backend_tcp_keepalive: None,
         rate_limit_key: RateLimitKeySource::SourceIp,
         forward_timeout: Duration::from_secs(2),
