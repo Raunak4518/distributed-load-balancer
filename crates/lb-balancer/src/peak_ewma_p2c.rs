@@ -105,8 +105,18 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
     /// of its real relative speed. Treating "no sample yet" as a distinct
     /// explore-me signal, checked before any numeric comparison, is what
     /// guarantees every backend gets tried at least once.
-    fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
-        let eligible = pool.eligible_backends();
+    fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
+        self.pick_excluding(pool, key, &[])
+    }
+
+    fn pick_excluding(
+        &self,
+        pool: &BackendPool,
+        _key: &str,
+        excluded: &[BackendId],
+    ) -> Option<BackendId> {
+        let mut eligible = pool.eligible_backends();
+        eligible.retain(|id| !excluded.contains(id));
         match eligible.len() {
             0 => None,
             1 => Some(eligible[0].clone()),

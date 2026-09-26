@@ -31,10 +31,20 @@ impl WeightedRoundRobin {
 }
 
 impl LoadBalancer for WeightedRoundRobin {
-    fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
+    fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
+        self.pick_excluding(pool, key, &[])
+    }
+
+    fn pick_excluding(
+        &self,
+        pool: &BackendPool,
+        _key: &str,
+        excluded: &[BackendId],
+    ) -> Option<BackendId> {
         let weighted: Vec<(BackendId, usize)> = pool
             .eligible_with_weights()
             .into_iter()
+            .filter(|(id, _)| !excluded.contains(id))
             .map(|(id, weight)| (id, weight.min(MAX_WEIGHT) as usize))
             .collect();
         let total: usize = weighted.iter().map(|(_, w)| *w).sum();

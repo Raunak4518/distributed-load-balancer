@@ -745,17 +745,23 @@ where
     };
 
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
+    let mut tried: Vec<BackendId> = Vec::new();
     for attempt in 0..2u8 {
         let pinned = (attempt == 0)
             .then(|| sticky_pin.clone())
             .flatten()
             .filter(|id| pool.is_eligible(id));
-        let Some(backend_id) = pinned.or_else(|| balancer.pick(pool, &key)) else {
+        let Some(backend_id) = pinned.or_else(|| {
+            balancer
+                .pick_excluding(pool, &key, &tried)
+                .or_else(|| balancer.pick(pool, &key))
+        }) else {
             return Ok(simple_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no healthy backend",
             ));
         };
+        tried.push(backend_id.clone());
         let Some(backend) = pool.backend(&backend_id) else {
             continue;
         };
@@ -1552,6 +1558,24 @@ mod tests {
             hsts_max_age_secs: None,
             retry_budget,
         })
+    }
+
+    #[tokio::test]
+    async fn a_retry_avoids_the_failed_backend_even_when_the_strategy_repicks_it() {
+        let dead_addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let live_addr = spawn_fixed_response_backend(StatusCode::OK, "live").await;
+        let dead = Backend::new("dead", dead_addr, 1, None);
+        let live = Backend::new("live", live_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![dead.clone(), live]));
+        let ctx = ctx_with_retry_budget(&dead, pool, None);
+
+        let resp = run_through_proxy(ctx.clone()).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(ctx.metrics.retry_successes.get(), 1);
     }
 
     #[tokio::test]

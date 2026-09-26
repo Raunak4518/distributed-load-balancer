@@ -10,6 +10,21 @@ pub trait LoadBalancer: Send + Sync {
     /// (`RoundRobin`, `LeastConnections`, `WeightedRoundRobin`) ignore it.
     fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId>;
 
+    fn pick_excluding(
+        &self,
+        pool: &BackendPool,
+        key: &str,
+        excluded: &[BackendId],
+    ) -> Option<BackendId> {
+        match self.pick(pool, key) {
+            Some(id) if !excluded.contains(&id) => Some(id),
+            _ => pool
+                .eligible_backends()
+                .into_iter()
+                .find(|id| !excluded.contains(id)),
+        }
+    }
+
     /// Feedback from one completed attempt against `id` -- called
     /// unconditionally by both the HTTP and TCP data planes after every
     /// attempt, success or failure alike, so a strategy that wants it never

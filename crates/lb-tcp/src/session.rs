@@ -200,10 +200,16 @@ where
     ctx.refresh_circuit_state();
 
     let mut outbound: Option<Box<dyn ProxyStream>> = None;
+    let mut tried: Vec<BackendId> = Vec::new();
     for attempt in 0..2u8 {
-        let Some(backend_id) = ctx.balancer.pick(&ctx.pool, &key) else {
+        let Some(backend_id) = ctx
+            .balancer
+            .pick_excluding(&ctx.pool, &key, &tried)
+            .or_else(|| ctx.balancer.pick(&ctx.pool, &key))
+        else {
             return ConnectionOutcome::NoBackend;
         };
+        tried.push(backend_id.clone());
         let Some(backend) = ctx.pool.backend(&backend_id) else {
             continue;
         };
@@ -660,6 +666,40 @@ mod tests {
             .circuit_breaker(&BackendId::new("dead"))
             .unwrap()
             .is_open());
+    }
+
+    #[tokio::test]
+    async fn a_retry_avoids_the_failed_backend_when_its_circuit_stays_closed() {
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = closed.local_addr().unwrap();
+        drop(closed);
+        let healthy_addr = spawn_echo_backend().await;
+        let base = context(
+            AllowAll,
+            FirstEligible,
+            vec![
+                Backend::new("dead", dead_addr, 1, None),
+                Backend::new("alive", healthy_addr, 1, None),
+            ],
+        );
+        let ctx = Arc::new(TcpContext {
+            rate_limiter: Arc::new(AllowAll),
+            balancer: Arc::new(FirstEligible),
+            pool: Arc::clone(&base.pool),
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            connect_timeout: base.connect_timeout,
+            idle_timeout: base.idle_timeout,
+            backend_tls: None,
+            backend_tcp_keepalive: None,
+            cluster: None,
+            metrics: Arc::clone(&base.metrics),
+            backend_metrics: BackendMap::new(),
+        });
+
+        let (_, echoed) = run_session(ctx, b"retry").await;
+
+        assert_eq!(echoed, b"retry");
     }
 
     /// The point of the seam: `lb-tcp` never names a TLS crate, it asks

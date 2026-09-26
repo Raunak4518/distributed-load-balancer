@@ -92,6 +92,15 @@ fn hash_str(s: &str) -> u64 {
 
 impl LoadBalancer for ConsistentHash {
     fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
+        self.pick_excluding(pool, key, &[])
+    }
+
+    fn pick_excluding(
+        &self,
+        pool: &BackendPool,
+        key: &str,
+        excluded: &[BackendId],
+    ) -> Option<BackendId> {
         let ring = self.ring_for(pool);
         let len = ring.points.len();
         if len == 0 {
@@ -103,7 +112,7 @@ impl LoadBalancer for ConsistentHash {
         for offset in 0..len {
             let idx = (start + offset) % len;
             let (_, id) = &ring.points[idx];
-            if pool.is_eligible(id) {
+            if !excluded.contains(id) && pool.is_eligible(id) {
                 return Some(id.clone());
             }
         }

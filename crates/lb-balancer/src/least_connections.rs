@@ -17,9 +17,19 @@ impl LeastConnections {
 }
 
 impl LoadBalancer for LeastConnections {
-    fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
+    fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
+        self.pick_excluding(pool, key, &[])
+    }
+
+    fn pick_excluding(
+        &self,
+        pool: &BackendPool,
+        _key: &str,
+        excluded: &[BackendId],
+    ) -> Option<BackendId> {
         pool.eligible_backends()
             .into_iter()
+            .filter(|id| !excluded.contains(id))
             .min_by_key(|id| pool.active_count(id))
     }
 }

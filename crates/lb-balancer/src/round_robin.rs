@@ -15,8 +15,18 @@ impl RoundRobin {
 }
 
 impl LoadBalancer for RoundRobin {
-    fn pick(&self, pool: &BackendPool, _key: &str) -> Option<BackendId> {
-        let eligible = pool.eligible_backends();
+    fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
+        self.pick_excluding(pool, key, &[])
+    }
+
+    fn pick_excluding(
+        &self,
+        pool: &BackendPool,
+        _key: &str,
+        excluded: &[BackendId],
+    ) -> Option<BackendId> {
+        let mut eligible = pool.eligible_backends();
+        eligible.retain(|id| !excluded.contains(id));
         if eligible.is_empty() {
             return None;
         }
