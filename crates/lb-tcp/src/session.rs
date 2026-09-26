@@ -1,11 +1,10 @@
 use crate::pump::pump;
 use lb_core::{
-    Backend, BackendId, BackendPool, Clock, Decision, LoadBalancer, OutboundTransport, ProxyStream,
-    RateLimiter,
+    Backend, BackendId, BackendMap, BackendPool, Clock, Decision, LoadBalancer, OutboundTransport,
+    ProxyStream, RateLimiter,
 };
 use lb_healthcheck::{CircuitBreaker, OutlierDetector};
 use lb_metrics::{BackendMetrics, IntGauge, ListenerMetrics};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,7 +14,7 @@ pub struct TcpContext<R: RateLimiter, C: Clock> {
     pub rate_limiter: Arc<R>,
     pub balancer: Arc<dyn LoadBalancer>,
     pub pool: Arc<BackendPool>,
-    pub circuit_breakers: HashMap<BackendId, CircuitBreaker<C>>,
+    pub circuit_breakers: BackendMap<CircuitBreaker<C>>,
     /// See `lb_proxy::ProxyContext::outlier`. TCP has no routes/canary, so
     /// there is only ever this one.
     pub outlier: Option<Arc<OutlierDetector>>,
@@ -38,7 +37,7 @@ pub struct TcpContext<R: RateLimiter, C: Clock> {
     pub cluster: Option<Arc<dyn lb_core::ClusterCoordinator>>,
     /// Always present — see the note on `ProxyContext::metrics`.
     pub metrics: Arc<ListenerMetrics>,
-    pub backend_metrics: HashMap<BackendId, BackendMetrics>,
+    pub backend_metrics: BackendMap<BackendMetrics>,
 }
 
 /// Decrements the active-connection gauge on drop.
@@ -55,7 +54,7 @@ impl Drop for ConnectionGuard {
 }
 
 impl<R: RateLimiter, C: Clock> TcpContext<R, C> {
-    fn circuit_breaker(&self, id: &BackendId) -> Option<&CircuitBreaker<C>> {
+    fn circuit_breaker(&self, id: &BackendId) -> Option<Arc<CircuitBreaker<C>>> {
         self.circuit_breakers.get(id)
     }
 
@@ -64,8 +63,9 @@ impl<R: RateLimiter, C: Clock> TcpContext<R, C> {
     /// cached flag has to be refreshed from it or a tripped backend would
     /// stay excluded forever.
     fn refresh_circuit_state(&self) {
+        let breakers = self.circuit_breakers.snapshot();
         for id in &self.pool.all_backend_ids() {
-            if let Some(breaker) = self.circuit_breakers.get(id) {
+            if let Some(breaker) = breakers.get(id) {
                 self.pool.set_circuit_open(id, breaker.is_open());
             }
         }
@@ -299,6 +299,7 @@ where
 mod tests {
     use super::*;
     use lb_core::test_util::FakeClock;
+    use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -386,7 +387,7 @@ mod tests {
             rate_limiter: Arc::new(rate_limiter),
             balancer: Arc::new(balancer),
             pool,
-            circuit_breakers,
+            circuit_breakers: circuit_breakers.into(),
             outlier: None,
             connect_timeout: Duration::from_millis(500),
             idle_timeout: Duration::from_secs(5),
@@ -397,7 +398,7 @@ mod tests {
                 let registry = lb_metrics::Metrics::new().expect("metrics registry");
                 Arc::new(registry.listener("test"))
             },
-            backend_metrics: HashMap::new(),
+            backend_metrics: BackendMap::new(),
         })
     }
 

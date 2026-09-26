@@ -1,8 +1,14 @@
 use crate::wiring::ProbeTransport;
-use lb_core::{Backend, BackendId, BackendPool, DnsDiscoveryConfig, HealthCheckConfig, Resolve};
-use lb_healthcheck::{spawn_active_checker, ActiveCheckConfig, HttpProbe, TcpConnectProbe};
-use lb_metrics::Metrics;
-use std::collections::HashMap;
+use lb_core::{
+    Backend, BackendId, BackendMap, BackendPool, DnsDiscoveryConfig, HealthCheckConfig, Resolve,
+    SystemClock,
+};
+use lb_healthcheck::{
+    spawn_active_checker, ActiveCheckConfig, CircuitBreaker, HttpProbe, OutlierDetector,
+    TcpConnectProbe,
+};
+use lb_metrics::{BackendMetrics, Metrics};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,6 +36,39 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+pub(crate) struct DnsBackendRuntime {
+    pub(crate) listener_name: String,
+    pub(crate) health_check: HealthCheckConfig,
+    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) breakers: BackendMap<CircuitBreaker<SystemClock>>,
+    pub(crate) backend_metrics: BackendMap<BackendMetrics>,
+    pub(crate) outlier: Option<Arc<OutlierDetector>>,
+}
+
+impl DnsBackendRuntime {
+    fn reconcile(&self, live: &[BackendId]) {
+        let live_set: HashSet<&BackendId> = live.iter().collect();
+        let departed: Vec<BackendId> = self
+            .backend_metrics
+            .snapshot()
+            .keys()
+            .filter(|id| !live_set.contains(id))
+            .cloned()
+            .collect();
+        self.breakers.reconcile(live, |_| {
+            crate::wiring::breaker_for(&self.health_check, None)
+        });
+        self.backend_metrics
+            .reconcile(live, |id| self.metrics.backend(&self.listener_name, &id.0));
+        if let Some(outlier) = &self.outlier {
+            outlier.reconcile(live);
+        }
+        for id in departed {
+            self.metrics.remove_backend(&self.listener_name, &id.0);
+        }
     }
 }
 
@@ -84,20 +123,32 @@ fn spawn_checker_for(
 /// `[[listeners.backends]]` list's does, since a DNS-resolved backend's very
 /// identity (and whether it exists at all) is only known once a poll
 /// resolves it.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_dns_poller<R: Resolve + 'static>(
+pub(crate) fn spawn_dns_poller<R: Resolve + 'static>(
     resolver: R,
     cfg: DnsDiscoveryConfig,
     pool: Arc<BackendPool>,
-    listener_name: String,
     per_backend_client: Option<Arc<lb_proxy::PerBackendClients>>,
-    health_check: HealthCheckConfig,
     transport: ProbeTransport,
-    metrics: Arc<Metrics>,
+    runtime: DnsBackendRuntime,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = time::interval(cfg.poll_interval());
         let mut checkers: HashMap<BackendId, AbortOnDrop> = HashMap::new();
+        for id in pool.all_backend_ids() {
+            if let Some(backend) = pool.backend(&id) {
+                checkers.insert(
+                    id,
+                    spawn_checker_for(
+                        &backend,
+                        &pool,
+                        &runtime.health_check,
+                        &transport,
+                        &runtime.metrics,
+                        &runtime.listener_name,
+                    ),
+                );
+            }
+        }
         loop {
             ticker.tick().await;
             match resolver.resolve(&cfg.name, cfg.port).await {
@@ -109,6 +160,7 @@ pub fn spawn_dns_poller<R: Resolve + 'static>(
                         })
                         .collect();
                     let ids: Vec<BackendId> = backends.iter().map(|b| b.id.clone()).collect();
+                    runtime.reconcile(&ids);
                     pool.apply_resolved(backends.clone());
                     if let Some(per_backend) = &per_backend_client {
                         per_backend.evict_missing(&ids);
@@ -119,17 +171,17 @@ pub fn spawn_dns_poller<R: Resolve + 'static>(
                             spawn_checker_for(
                                 backend,
                                 &pool,
-                                &health_check,
+                                &runtime.health_check,
                                 &transport,
-                                &metrics,
-                                &listener_name,
+                                &runtime.metrics,
+                                &runtime.listener_name,
                             )
                         });
                     }
                 }
                 Err(err) => {
                     tracing::warn!(
-                        listener = %listener_name,
+                        listener = %runtime.listener_name,
                         dns_name = %cfg.name,
                         error = %err,
                         "dns discovery lookup failed; keeping the previous backend set"
@@ -199,6 +251,17 @@ mod tests {
         Arc::new(Metrics::new().unwrap())
     }
 
+    fn runtime_with(health_check: HealthCheckConfig) -> DnsBackendRuntime {
+        DnsBackendRuntime {
+            listener_name: "web".to_string(),
+            health_check,
+            metrics: test_metrics(),
+            breakers: BackendMap::new(),
+            backend_metrics: BackendMap::new(),
+            outlier: None,
+        }
+    }
+
     fn spawn(
         resolver: impl Resolve + 'static,
         pool: Arc<BackendPool>,
@@ -208,11 +271,9 @@ mod tests {
             resolver,
             cfg(),
             pool,
-            "web".to_string(),
             per_backend_client,
-            health_check(),
             no_op_transport(),
-            test_metrics(),
+            runtime_with(health_check()),
         )
     }
 
@@ -298,9 +359,9 @@ mod tests {
                 ..cfg()
             },
             Arc::clone(&pool),
-            "web".to_string(),
             None,
-            HealthCheckConfig {
+            no_op_transport(),
+            runtime_with(HealthCheckConfig {
                 path: None,
                 interval_ms: 10,
                 timeout_ms: 50,
@@ -314,9 +375,7 @@ mod tests {
                 unhealthy_request_count: None,
                 outlier_detection: None,
                 max_ejected_fraction: None,
-            },
-            no_op_transport(),
-            test_metrics(),
+            }),
         );
 
         // Real timers, since the checker itself runs on a real interval
@@ -333,6 +392,183 @@ mod tests {
             "a checker should have marked the unreachable backend unhealthy"
         );
 
+        handle.abort();
+    }
+
+    struct SwitchableResolver {
+        addrs: Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+    }
+
+    impl Resolve for SwitchableResolver {
+        async fn resolve(&self, _host: &str, _port: u16) -> io::Result<Vec<SocketAddr>> {
+            Ok(self.addrs.lock().unwrap().clone())
+        }
+    }
+
+    fn outlier_runtime() -> DnsBackendRuntime {
+        DnsBackendRuntime {
+            outlier: Some(Arc::new(OutlierDetector::new(
+                Vec::new(),
+                lb_healthcheck::OutlierConfig {
+                    min_volume: 1,
+                    min_hosts: 2,
+                    stddev_factor: 1.0,
+                    eject_ticks: 1,
+                },
+            ))),
+            ..runtime_with(health_check())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_resolved_backend_gets_a_circuit_breaker_metrics_and_outlier_tracking() {
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let id = BackendId::new(format!("dns:{addr}"));
+        let pool = Arc::new(BackendPool::new(Vec::new()));
+        let runtime = outlier_runtime();
+        let breakers = runtime.breakers.clone();
+        let backend_metrics = runtime.backend_metrics.clone();
+        let outlier = runtime.outlier.clone().unwrap();
+
+        let _handle = spawn_dns_poller(
+            FakeResolver { addrs: vec![addr] },
+            cfg(),
+            Arc::clone(&pool),
+            None,
+            no_op_transport(),
+            runtime,
+        );
+        time::sleep(StdDuration::from_millis(1)).await;
+
+        let breaker = breakers
+            .get(&id)
+            .expect("a resolved backend must get a circuit breaker");
+        breaker.record_failure();
+        breaker.record_failure();
+        assert!(breaker.is_open());
+        assert!(backend_metrics.contains(&id));
+        assert!(outlier.tracks(&id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_leaves_dns_loses_its_breaker_metrics_and_outlier_tracking() {
+        let gone: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let staying: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let gone_id = BackendId::new(format!("dns:{gone}"));
+        let staying_id = BackendId::new(format!("dns:{staying}"));
+        let addrs = Arc::new(std::sync::Mutex::new(vec![gone, staying]));
+        let pool = Arc::new(BackendPool::new(Vec::new()));
+        let runtime = outlier_runtime();
+        let breakers = runtime.breakers.clone();
+        let backend_metrics = runtime.backend_metrics.clone();
+        let outlier = runtime.outlier.clone().unwrap();
+        let metrics = Arc::clone(&runtime.metrics);
+
+        let _handle = spawn_dns_poller(
+            SwitchableResolver {
+                addrs: Arc::clone(&addrs),
+            },
+            cfg(),
+            Arc::clone(&pool),
+            None,
+            no_op_transport(),
+            runtime,
+        );
+        time::sleep(StdDuration::from_millis(1)).await;
+        backend_metrics
+            .get(&gone_id)
+            .unwrap()
+            .requests_success
+            .inc();
+        let staying_breaker = breakers.get(&staying_id).unwrap();
+        assert!(metrics.gather_text().contains(&*gone_id.0));
+
+        *addrs.lock().unwrap() = vec![staying];
+        time::sleep(StdDuration::from_secs(11)).await;
+
+        assert!(breakers.get(&gone_id).is_none());
+        assert!(!backend_metrics.contains(&gone_id));
+        assert!(!outlier.tracks(&gone_id));
+        assert!(!metrics.gather_text().contains(&*gone_id.0));
+        assert!(Arc::ptr_eq(
+            &breakers.get(&staying_id).unwrap(),
+            &staying_breaker
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_backend_added_by_a_later_poll_never_serves_before_a_successful_probe() {
+        let listening = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first = listening.local_addr().unwrap();
+        let second: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let first_id = BackendId::new(format!("dns:{first}"));
+        let second_id = BackendId::new(format!("dns:{second}"));
+        let addrs = Arc::new(std::sync::Mutex::new(vec![first]));
+        let pool = Arc::new(BackendPool::new(Vec::new()));
+        let handle = spawn_dns_poller(
+            SwitchableResolver {
+                addrs: Arc::clone(&addrs),
+            },
+            DnsDiscoveryConfig {
+                poll_interval_secs: Some(1),
+                ..cfg()
+            },
+            Arc::clone(&pool),
+            None,
+            no_op_transport(),
+            runtime_with(health_check()),
+        );
+        for _ in 0..50 {
+            time::sleep(StdDuration::from_millis(10)).await;
+            if !pool.is_awaiting_first_probe(&first_id) && pool.backend(&first_id).is_some() {
+                break;
+            }
+        }
+        assert!(pool.is_active_healthy(&first_id));
+
+        *addrs.lock().unwrap() = vec![first, second];
+        let mut saw_second = false;
+        for _ in 0..300 {
+            time::sleep(StdDuration::from_millis(5)).await;
+            if pool.backend(&second_id).is_some() {
+                saw_second = true;
+                assert!(
+                    !pool.is_eligible(&second_id),
+                    "a newly resolved backend must not be eligible before a successful probe"
+                );
+                assert_eq!(pool.eligible_backends(), vec![first_id.clone()]);
+            }
+        }
+        assert!(
+            saw_second,
+            "the second poll should have added the new backend"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn a_backend_already_in_the_pool_is_health_checked_while_dns_is_failing() {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let id = BackendId::new(format!("dns:{addr}"));
+        let pool = Arc::new(BackendPool::new(vec![Backend::new(&*id.0, addr, 1, None)]));
+        let handle = spawn_dns_poller(
+            FailingResolver,
+            cfg(),
+            Arc::clone(&pool),
+            None,
+            no_op_transport(),
+            runtime_with(health_check()),
+        );
+        for _ in 0..50 {
+            time::sleep(StdDuration::from_millis(20)).await;
+            if !pool.is_active_healthy(&id) {
+                break;
+            }
+        }
+        assert!(
+            !pool.is_active_healthy(&id),
+            "a carried-over backend must be probed even before DNS succeeds"
+        );
         handle.abort();
     }
 

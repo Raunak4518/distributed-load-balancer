@@ -149,13 +149,19 @@ pub async fn apply_reload(
     // cannot leave some listeners swapped and others not.
     let mut prepared = Vec::with_capacity(resolved.len());
     for (lc, backend_tls) in resolved {
+        let carry_dns_backends = lc.dns_discovery.is_some()
+            && current_config
+                .listeners
+                .iter()
+                .any(|old| old.name == lc.name && old.dns_discovery == lc.dns_discovery);
         let previous = match reload.listeners.get(&lc.name) {
-            Some(ListenerReloadHandle::Http(swap)) => {
-                Some(wiring::PreviousListenerState::from_http(&swap.load()))
-            }
-            Some(ListenerReloadHandle::Tcp(swap)) => {
-                Some(wiring::PreviousListenerState::from_tcp(&swap.load()))
-            }
+            Some(ListenerReloadHandle::Http(swap)) => Some(
+                wiring::PreviousListenerState::from_http(&swap.load(), carry_dns_backends),
+            ),
+            Some(ListenerReloadHandle::Tcp(swap)) => Some(wiring::PreviousListenerState::from_tcp(
+                &swap.load(),
+                carry_dns_backends,
+            )),
             None => None,
         };
         let core = wiring::build_listener_core(
@@ -513,6 +519,65 @@ mod tests {
                 .is_manually_drained(&lb_core::BackendId::new("a1")),
             "a manual drain must not be undone by an unrelated field's reload"
         );
+
+        abort_everything(app).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_health_check_survives_an_unrelated_reload() {
+        let old = Config::parse(TWO_LISTENERS).unwrap();
+        let app = build_app(&old, None).unwrap();
+        let id = lb_core::BackendId::new("a1");
+        http_ctx_arc(&app.reload, "a")
+            .pool
+            .set_active_healthy(&id, false);
+
+        let new =
+            Config::parse(&TWO_LISTENERS.replacen("rate_per_sec = 50", "rate_per_sec = 999", 1))
+                .unwrap();
+        let outcome = apply_reload(&new, &old, &app.reload).await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Applied {
+                changed: vec!["a".to_string()]
+            }
+        );
+
+        let a_after = http_ctx_arc(&app.reload, "a");
+        assert!(!a_after.pool.is_active_healthy(&id));
+        assert!(!a_after.pool.is_eligible(&id));
+
+        abort_everything(app).await;
+    }
+
+    #[tokio::test]
+    async fn a_backend_added_by_reload_waits_for_its_first_probe() {
+        let old = Config::parse(TWO_LISTENERS).unwrap();
+        let app = build_app(&old, None).unwrap();
+        let a1 = lb_core::BackendId::new("a1");
+        let a2 = lb_core::BackendId::new("a2");
+        http_ctx_arc(&app.reload, "a")
+            .pool
+            .set_active_healthy(&a1, true);
+
+        let new_text = TWO_LISTENERS.replacen(
+            "[[listeners.backends]]\n          id = \"a1\"\n          address = \"127.0.0.1:9001\"",
+            "[[listeners.backends]]\n          id = \"a1\"\n          address = \"127.0.0.1:9001\"\n\n          [[listeners.backends]]\n          id = \"a2\"\n          address = \"127.0.0.1:9099\"",
+            1,
+        );
+        let new = Config::parse(&new_text).unwrap();
+        let outcome = apply_reload(&new, &old, &app.reload).await;
+        assert_eq!(
+            outcome,
+            ReloadOutcome::Applied {
+                changed: vec!["a".to_string()]
+            }
+        );
+
+        let a_after = http_ctx_arc(&app.reload, "a");
+        assert!(a_after.pool.is_awaiting_first_probe(&a2));
+        assert!(!a_after.pool.is_awaiting_first_probe(&a1));
+        assert_eq!(a_after.pool.eligible_backends(), vec![a1]);
 
         abort_everything(app).await;
     }

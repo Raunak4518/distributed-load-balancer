@@ -1,5 +1,4 @@
-use lb_core::{BackendId, BackendPool};
-use std::collections::HashMap;
+use lb_core::{BackendId, BackendMap, BackendPool};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,26 +21,35 @@ struct BackendCounts {
 
 pub struct OutlierDetector {
     config: OutlierConfig,
-    counts: HashMap<BackendId, BackendCounts>,
+    counts: BackendMap<BackendCounts>,
+}
+
+impl BackendCounts {
+    fn new() -> Self {
+        BackendCounts {
+            successes: AtomicU32::new(0),
+            total: AtomicU32::new(0),
+            flagged: AtomicBool::new(false),
+            cooldown_ticks_remaining: AtomicU32::new(0),
+        }
+    }
 }
 
 impl OutlierDetector {
     pub fn new(ids: impl IntoIterator<Item = BackendId>, config: OutlierConfig) -> Self {
         let counts = ids
             .into_iter()
-            .map(|id| {
-                (
-                    id,
-                    BackendCounts {
-                        successes: AtomicU32::new(0),
-                        total: AtomicU32::new(0),
-                        flagged: AtomicBool::new(false),
-                        cooldown_ticks_remaining: AtomicU32::new(0),
-                    },
-                )
-            })
+            .map(|id| (id, BackendCounts::new()))
             .collect();
         OutlierDetector { config, counts }
+    }
+
+    pub fn reconcile(&self, live: &[BackendId]) {
+        self.counts.reconcile(live, |_| BackendCounts::new());
+    }
+
+    pub fn tracks(&self, id: &BackendId) -> bool {
+        self.counts.contains(id)
     }
 
     pub fn record_outcome(&self, id: &BackendId, success: bool) {
@@ -61,8 +69,8 @@ impl OutlierDetector {
     }
 
     pub fn recompute(&self, pool: &BackendPool) {
-        let snapshot: Vec<(&BackendId, u32, u32)> = self
-            .counts
+        let counts = self.counts.snapshot();
+        let snapshot: Vec<(&BackendId, u32, u32)> = counts
             .iter()
             .map(|(id, c)| {
                 (
@@ -89,7 +97,7 @@ impl OutlierDetector {
             f64::NEG_INFINITY
         };
 
-        for (id, counts) in &self.counts {
+        for (id, counts) in counts.iter() {
             match rates.iter().find(|(rid, _)| *rid == id) {
                 Some((_, rate)) if active => {
                     let flagged = *rate < cutoff;
@@ -172,6 +180,33 @@ mod tests {
     fn record_outcome_on_an_unknown_id_does_not_panic() {
         let d = detector(&["b1"], default_config());
         d.record_outcome(&BackendId::new("ghost"), true);
+    }
+
+    #[test]
+    fn a_backend_added_by_reconcile_is_judged_and_ejected() {
+        let d = OutlierDetector::new(Vec::new(), default_config());
+        let pool = pool_of(&["b1", "b2", "b3"]);
+        let ids: Vec<BackendId> = ["b1", "b2", "b3"]
+            .iter()
+            .map(|s| BackendId::new(*s))
+            .collect();
+        d.reconcile(&ids);
+        for _ in 0..20 {
+            d.record_outcome(&BackendId::new("b1"), false);
+            d.record_outcome(&BackendId::new("b2"), true);
+            d.record_outcome(&BackendId::new("b3"), true);
+        }
+        d.recompute(&pool);
+        assert!(d.is_outlier(&BackendId::new("b1")));
+        assert!(pool.is_outlier_ejected(&BackendId::new("b1")));
+    }
+
+    #[test]
+    fn reconcile_stops_tracking_a_departed_backend() {
+        let d = detector(&["b1", "b2"], default_config());
+        d.reconcile(&[BackendId::new("b2")]);
+        assert!(!d.tracks(&BackendId::new("b1")));
+        assert!(d.tracks(&BackendId::new("b2")));
     }
 
     #[test]

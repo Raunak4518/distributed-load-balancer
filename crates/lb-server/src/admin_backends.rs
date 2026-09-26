@@ -130,6 +130,8 @@ fn list_all(reload: &ReloadState) -> Response<Full<Bytes>> {
                         "active_healthy": pool.is_active_healthy(&id),
                         "circuit_open": pool.is_circuit_open(&id),
                         "manually_drained": pool.is_manually_drained(&id),
+                        "outlier_ejected": pool.is_outlier_ejected(&id),
+                        "awaiting_first_probe": pool.is_awaiting_first_probe(&id),
                         "eligible": pool.is_eligible(&id),
                         "active_conns": pool.active_count(&id),
                     }))

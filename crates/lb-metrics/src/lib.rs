@@ -515,6 +515,23 @@ impl Metrics {
         }
     }
 
+    pub fn remove_backend(&self, listener: &str, backend: &str) {
+        let _ = self
+            .backend_healthy
+            .remove_label_values(&[listener, backend]);
+        let _ = self
+            .backend_circuit_state
+            .remove_label_values(&[listener, backend]);
+        for outcome in ["success", "failure", "timeout"] {
+            let _ = self
+                .backend_requests
+                .remove_label_values(&[listener, backend, outcome]);
+        }
+        let _ = self
+            .upstream_duration
+            .remove_label_values(&[listener, backend]);
+    }
+
     /// Prometheus text exposition format.
     pub fn gather_text(&self) -> String {
         let mut buf = Vec::new();
@@ -529,6 +546,25 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_backend_drops_every_series_for_that_backend_only() {
+        let m = Metrics::new().unwrap();
+        let gone = m.backend("web", "dns:10.0.0.1:80");
+        let kept = m.backend("web", "dns:10.0.0.2:80");
+        for b in [&gone, &kept] {
+            b.healthy.set(1);
+            b.circuit_state.set(0);
+            b.requests_success.inc();
+            b.requests_failure.inc();
+            b.requests_timeout.inc();
+            b.upstream_duration.observe(0.01);
+        }
+        m.remove_backend("web", "dns:10.0.0.1:80");
+        let text = m.gather_text();
+        assert!(!text.contains("dns:10.0.0.1:80"), "{text}");
+        assert!(text.contains("dns:10.0.0.2:80"));
+    }
 
     #[test]
     fn status_classes_map_correctly() {

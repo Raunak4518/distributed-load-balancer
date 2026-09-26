@@ -56,6 +56,8 @@ async fn lists_every_listeners_backends_with_live_state() {
         assert_eq!(backend["active_healthy"], Value::Bool(true));
         assert_eq!(backend["circuit_open"], Value::Bool(false));
         assert_eq!(backend["manually_drained"], Value::Bool(false));
+        assert_eq!(backend["outlier_ejected"], Value::Bool(false));
+        assert_eq!(backend["awaiting_first_probe"], Value::Bool(false));
         assert_eq!(backend["eligible"], Value::Bool(true));
     }
 }

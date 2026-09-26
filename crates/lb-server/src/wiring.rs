@@ -3,14 +3,15 @@ use lb_balancer::{ConsistentHash, LeastConnections, PeakEwmaP2c, RoundRobin, Wei
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::ClusterCoordinator;
 use lb_core::{
-    Backend, BackendId, BackendPool, ClusterConfig, Config, HealthCheckConfig, Http2Config,
-    ListenerConfig, LoadBalancer, LoadBalancingStrategy, LoggingConfig, Protocol, SystemClock,
+    Backend, BackendId, BackendMap, BackendPool, ClusterConfig, Config, HealthCheckConfig,
+    Http2Config, ListenerConfig, LoadBalancer, LoadBalancingStrategy, LoggingConfig, Protocol,
+    SystemClock,
 };
 use lb_healthcheck::{
     spawn_active_checker, spawn_outlier_detector, ActiveCheckConfig, CircuitBreaker, HttpProbe,
     OutlierConfig, OutlierDetector, TcpConnectProbe,
 };
-use lb_metrics::Metrics;
+use lb_metrics::{BackendMetrics, Metrics};
 use lb_proxy::{spawn_cache_sweeper, CompiledRoute, ProxyContext, ResponseCache, StickyRuntime};
 use lb_ratelimit::{spawn_sweeper, Gcra, GcraConfig};
 use lb_tcp::TcpContext;
@@ -565,53 +566,75 @@ pub(crate) enum ListenerCoreKind {
 /// startup path has any state for, but `apply_reload` does.
 pub(crate) struct PreviousListenerState {
     manually_drained: HashSet<BackendId>,
+    health: HashMap<BackendId, PreviousHealth>,
     circuit_breakers: HashMap<BackendId, lb_healthcheck::CircuitBreakerSnapshot>,
+    dns_backends: Option<Vec<Backend>>,
+}
+
+#[derive(Clone, Copy)]
+struct PreviousHealth {
+    active_healthy: bool,
+    awaiting_first_probe: bool,
 }
 
 impl PreviousListenerState {
-    pub(crate) fn from_http(ctx: &HttpContext) -> Self {
-        let mut manually_drained = HashSet::new();
-        Self::collect_drained(&ctx.pool, &mut manually_drained);
+    pub(crate) fn from_http(ctx: &HttpContext, carry_dns_backends: bool) -> Self {
+        let mut state = Self::empty(&ctx.circuit_breakers);
+        state.collect_pool(&ctx.pool);
         for route in &ctx.routes {
-            Self::collect_drained(&route.pool, &mut manually_drained);
+            state.collect_pool(&route.pool);
         }
         for canary in &ctx.canary {
-            Self::collect_drained(&canary.pool, &mut manually_drained);
+            state.collect_pool(&canary.pool);
         }
+        if carry_dns_backends {
+            state.dns_backends = Some(Self::pool_backends(&ctx.pool));
+        }
+        state
+    }
+
+    pub(crate) fn from_tcp(ctx: &TcpAppContext, carry_dns_backends: bool) -> Self {
+        let mut state = Self::empty(&ctx.circuit_breakers);
+        state.collect_pool(&ctx.pool);
+        if carry_dns_backends {
+            state.dns_backends = Some(Self::pool_backends(&ctx.pool));
+        }
+        state
+    }
+
+    fn empty(breakers: &BackendMap<CircuitBreaker<SystemClock>>) -> Self {
         PreviousListenerState {
-            manually_drained,
-            circuit_breakers: Self::snapshot_breakers(&ctx.circuit_breakers),
+            manually_drained: HashSet::new(),
+            health: HashMap::new(),
+            circuit_breakers: breakers
+                .snapshot()
+                .iter()
+                .map(|(id, cb)| (id.clone(), cb.snapshot()))
+                .collect(),
+            dns_backends: None,
         }
     }
 
-    pub(crate) fn from_tcp(ctx: &TcpAppContext) -> Self {
-        let mut manually_drained = HashSet::new();
-        Self::collect_drained(&ctx.pool, &mut manually_drained);
-        PreviousListenerState {
-            manually_drained,
-            circuit_breakers: Self::snapshot_breakers(&ctx.circuit_breakers),
-        }
-    }
-
-    fn collect_drained(pool: &BackendPool, into: &mut HashSet<BackendId>) {
+    fn collect_pool(&mut self, pool: &BackendPool) {
         for id in pool.all_backend_ids() {
             if pool.is_manually_drained(&id) {
-                into.insert(id);
+                self.manually_drained.insert(id.clone());
             }
+            self.health.insert(
+                id.clone(),
+                PreviousHealth {
+                    active_healthy: pool.is_active_healthy(&id),
+                    awaiting_first_probe: pool.is_awaiting_first_probe(&id),
+                },
+            );
         }
     }
 
-    fn snapshot_breakers(
-        breakers: &HashMap<BackendId, CircuitBreaker<SystemClock>>,
-    ) -> HashMap<BackendId, lb_healthcheck::CircuitBreakerSnapshot> {
-        breakers
+    fn pool_backends(pool: &BackendPool) -> Vec<Backend> {
+        pool.all_backend_ids()
             .iter()
-            .map(|(id, cb)| (id.clone(), cb.snapshot()))
+            .filter_map(|id| pool.backend(id))
             .collect()
-    }
-
-    fn is_drained(&self, id: &BackendId) -> bool {
-        self.manually_drained.contains(id)
     }
 
     fn breaker_snapshot(&self, id: &BackendId) -> Option<lb_healthcheck::CircuitBreakerSnapshot> {
@@ -619,7 +642,7 @@ impl PreviousListenerState {
     }
 }
 
-fn seed_drained(
+fn seed_from_previous(
     pool: &BackendPool,
     backends: &[Backend],
     previous: Option<&PreviousListenerState>,
@@ -628,26 +651,34 @@ fn seed_drained(
         return;
     };
     for b in backends {
-        if previous.is_drained(&b.id) {
+        if previous.manually_drained.contains(&b.id) {
             pool.set_manually_drained(&b.id, true);
+        }
+        match previous.health.get(&b.id) {
+            Some(health) => {
+                pool.set_active_healthy(&b.id, health.active_healthy);
+                if health.awaiting_first_probe {
+                    pool.mark_awaiting_first_probe(&b.id);
+                }
+            }
+            None => pool.mark_awaiting_first_probe(&b.id),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn new_or_migrated_breaker(
-    previous: Option<&PreviousListenerState>,
-    id: &BackendId,
-    failure_threshold: u32,
-    cooldown: Duration,
-    half_open_successes_required: u32,
-    flap_backoff_multiplier: f64,
-    max_flap_cooldown: Duration,
-    flap_streak_reset: Duration,
-    unhealthy_latency: Option<Duration>,
-    unhealthy_request_count: Option<usize>,
+pub(crate) fn breaker_for(
+    health_check: &HealthCheckConfig,
+    snapshot: Option<lb_healthcheck::CircuitBreakerSnapshot>,
 ) -> CircuitBreaker<SystemClock> {
-    match previous.and_then(|p| p.breaker_snapshot(id)) {
+    let failure_threshold = health_check.failure_threshold;
+    let cooldown = Duration::from_millis(health_check.cooldown_ms);
+    let half_open_successes_required = health_check.half_open_successes_required;
+    let flap_backoff_multiplier = health_check.flap_backoff_multiplier;
+    let max_flap_cooldown = Duration::from_millis(health_check.max_flap_cooldown_ms);
+    let flap_streak_reset = Duration::from_millis(health_check.flap_streak_reset_ms);
+    let unhealthy_latency = health_check.unhealthy_latency_ms.map(Duration::from_millis);
+    let unhealthy_request_count = health_check.unhealthy_request_count;
+    match snapshot {
         Some(snapshot) => CircuitBreaker::from_snapshot(
             failure_threshold,
             cooldown,
@@ -672,6 +703,14 @@ fn new_or_migrated_breaker(
             SystemClock,
         ),
     }
+}
+
+fn new_or_migrated_breaker(
+    previous: Option<&PreviousListenerState>,
+    id: &BackendId,
+    health_check: &HealthCheckConfig,
+) -> CircuitBreaker<SystemClock> {
+    breaker_for(health_check, previous.and_then(|p| p.breaker_snapshot(id)))
 }
 
 /// `None` when `health_check.outlier_detection` is unset (the default) --
@@ -726,12 +765,16 @@ pub(crate) fn build_listener_core(
         .iter()
         .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
         .collect();
+    let pool_backends: Vec<Backend> = match previous.and_then(|p| p.dns_backends.as_ref()) {
+        Some(carried) if lc.dns_discovery.is_some() => carried.clone(),
+        _ => backends.clone(),
+    };
     let pool = Arc::new(BackendPool::with_max_ejected_fraction(
-        backends.clone(),
+        pool_backends.clone(),
         lc.health_check.max_ejected_fraction,
     ));
-    seed_drained(&pool, &backends, previous);
-    let outlier = build_outlier_detector(&backends, &lc.health_check);
+    seed_from_previous(&pool, &pool_backends, previous);
+    let outlier = build_outlier_detector(&pool_backends, &lc.health_check);
 
     // Built once per route, the same way the default `backends`/`pool` above
     // are -- `Config::validate()` already guarantees every id here is unique
@@ -757,7 +800,7 @@ pub(crate) fn build_listener_core(
                 route_backends.clone(),
                 r.health_check.max_ejected_fraction,
             ));
-            seed_drained(&route_pool, &route_backends, previous);
+            seed_from_previous(&route_pool, &route_backends, previous);
             let route_outlier = build_outlier_detector(&route_backends, &r.health_check);
             (r, route_backends, route_pool, route_outlier)
         })
@@ -782,13 +825,13 @@ pub(crate) fn build_listener_core(
                 canary_backends.clone(),
                 c.health_check.max_ejected_fraction,
             ));
-            seed_drained(&canary_pool, &canary_backends, previous);
+            seed_from_previous(&canary_pool, &canary_backends, previous);
             let canary_outlier = build_outlier_detector(&canary_backends, &c.health_check);
             (c, canary_backends, canary_pool, canary_outlier)
         })
         .collect();
     let all_backends = || {
-        backends
+        pool_backends
             .iter()
             .chain(route_pools.iter().flat_map(|(_, bs, _, _)| bs.iter()))
             .chain(canary_pools.iter().flat_map(|(_, bs, _, _)| bs.iter()))
@@ -810,77 +853,46 @@ pub(crate) fn build_listener_core(
         .collect();
 
     let listener_metrics = Arc::new(metrics.listener(&lc.name));
-    let backend_metrics: HashMap<_, _> = all_backends()
+    let backend_metrics: BackendMap<BackendMetrics> = all_backends()
         .map(|b| (b.id.clone(), metrics.backend(&lc.name, &b.id.0)))
         .collect();
 
     // Each route's own `health_check.failure_threshold`/`cooldown_ms` governs
     // its own backends' breakers; the default backends keep using the
     // listener's own `health_check` as they always have.
-    let mut circuit_breakers = HashMap::new();
-    for b in &backends {
-        circuit_breakers.insert(
-            b.id.clone(),
-            new_or_migrated_breaker(
-                previous,
-                &b.id,
-                lc.health_check.failure_threshold,
-                Duration::from_millis(lc.health_check.cooldown_ms),
-                lc.health_check.half_open_successes_required,
-                lc.health_check.flap_backoff_multiplier,
-                Duration::from_millis(lc.health_check.max_flap_cooldown_ms),
-                Duration::from_millis(lc.health_check.flap_streak_reset_ms),
-                lc.health_check
-                    .unhealthy_latency_ms
-                    .map(Duration::from_millis),
-                lc.health_check.unhealthy_request_count,
-            ),
-        );
-    }
-    for (route, route_backends, _, _) in &route_pools {
-        for b in route_backends {
-            circuit_breakers.insert(
+    let circuit_breakers: BackendMap<CircuitBreaker<SystemClock>> = pool_backends
+        .iter()
+        .map(|b| {
+            (
                 b.id.clone(),
-                new_or_migrated_breaker(
-                    previous,
-                    &b.id,
-                    route.health_check.failure_threshold,
-                    Duration::from_millis(route.health_check.cooldown_ms),
-                    route.health_check.half_open_successes_required,
-                    route.health_check.flap_backoff_multiplier,
-                    Duration::from_millis(route.health_check.max_flap_cooldown_ms),
-                    Duration::from_millis(route.health_check.flap_streak_reset_ms),
-                    route
-                        .health_check
-                        .unhealthy_latency_ms
-                        .map(Duration::from_millis),
-                    route.health_check.unhealthy_request_count,
-                ),
-            );
-        }
-    }
-    for (canary, canary_backends, _, _) in &canary_pools {
-        for b in canary_backends {
-            circuit_breakers.insert(
-                b.id.clone(),
-                new_or_migrated_breaker(
-                    previous,
-                    &b.id,
-                    canary.health_check.failure_threshold,
-                    Duration::from_millis(canary.health_check.cooldown_ms),
-                    canary.health_check.half_open_successes_required,
-                    canary.health_check.flap_backoff_multiplier,
-                    Duration::from_millis(canary.health_check.max_flap_cooldown_ms),
-                    Duration::from_millis(canary.health_check.flap_streak_reset_ms),
-                    canary
-                        .health_check
-                        .unhealthy_latency_ms
-                        .map(Duration::from_millis),
-                    canary.health_check.unhealthy_request_count,
-                ),
-            );
-        }
-    }
+                new_or_migrated_breaker(previous, &b.id, &lc.health_check),
+            )
+        })
+        .chain(
+            route_pools
+                .iter()
+                .flat_map(|(route, route_backends, _, _)| {
+                    route_backends.iter().map(|b| {
+                        (
+                            b.id.clone(),
+                            new_or_migrated_breaker(previous, &b.id, &route.health_check),
+                        )
+                    })
+                }),
+        )
+        .chain(
+            canary_pools
+                .iter()
+                .flat_map(|(canary, canary_backends, _, _)| {
+                    canary_backends.iter().map(|b| {
+                        (
+                            b.id.clone(),
+                            new_or_migrated_breaker(previous, &b.id, &canary.health_check),
+                        )
+                    })
+                }),
+        )
+        .collect();
 
     let rate_limiter = Arc::new(Gcra::new(
         GcraConfig {
@@ -1138,11 +1150,16 @@ pub(crate) fn spawn_listener_tasks(
                     crate::dns::TokioResolver,
                     dns.clone(),
                     Arc::clone(&core.pool),
-                    lc.name.clone(),
                     ctx.per_backend_client.clone(),
-                    lc.health_check.clone(),
                     transport.clone(),
-                    Arc::clone(metrics),
+                    crate::dns::DnsBackendRuntime {
+                        listener_name: lc.name.clone(),
+                        health_check: lc.health_check.clone(),
+                        metrics: Arc::clone(metrics),
+                        breakers: ctx.circuit_breakers.clone(),
+                        backend_metrics: ctx.backend_metrics.clone(),
+                        outlier: core.outlier.clone(),
+                    },
                 ));
             }
             spawn_health_checkers(
@@ -1197,11 +1214,16 @@ pub(crate) fn spawn_listener_tasks(
                     crate::dns::TokioResolver,
                     dns.clone(),
                     Arc::clone(&core.pool),
-                    lc.name.clone(),
                     None,
-                    lc.health_check.clone(),
                     transport.clone(),
-                    Arc::clone(metrics),
+                    crate::dns::DnsBackendRuntime {
+                        listener_name: lc.name.clone(),
+                        health_check: lc.health_check.clone(),
+                        metrics: Arc::clone(metrics),
+                        breakers: ctx.circuit_breakers.clone(),
+                        backend_metrics: ctx.backend_metrics.clone(),
+                        outlier: core.outlier.clone(),
+                    },
                 ));
             }
             spawn_health_checkers(
@@ -1594,6 +1616,75 @@ mod tests {
     /// each backend its own distinct `server_name`, so it never needs the
     /// per-backend client path -- confirming the new branch in `build_app`
     /// stays off for the case it was never meant to touch.
+    #[tokio::test]
+    async fn dns_resolved_backends_share_the_live_context_breakers_and_metrics() {
+        const CONFIG: &str = r#"
+            [[listeners]]
+            name = "web"
+            protocol = "http"
+            listen = "127.0.0.1:0"
+
+              [listeners.dns_discovery]
+              name = "localhost"
+              port = 9001
+
+              [listeners.health_check]
+              path = "/health"
+              interval_ms = 2000
+              timeout_ms = 500
+              failure_threshold = 3
+              cooldown_ms = 5000
+
+                [listeners.health_check.outlier_detection]
+                min_volume = 5
+                min_hosts = 2
+                stddev_factor = 1.0
+
+              [listeners.rate_limit]
+              key = "source_ip"
+              rate_per_sec = 50
+              burst = 100
+
+              [listeners.load_balancing]
+              strategy = "round_robin"
+        "#;
+        let config = Config::parse(CONFIG).unwrap();
+        let app = build_app(&config, None).unwrap();
+
+        let ctx = match &app.listeners[0] {
+            ListenerRuntime::Http { ctx, .. } => ctx.load_full(),
+            _ => panic!("expected an http listener"),
+        };
+        for _ in 0..200 {
+            if !ctx.pool.all_backend_ids().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let ids = ctx.pool.all_backend_ids();
+        assert!(
+            !ids.is_empty(),
+            "localhost should resolve to at least one address"
+        );
+        let outlier = ctx
+            .outlier
+            .as_ref()
+            .expect("outlier detection is configured");
+        for id in &ids {
+            assert!(
+                ctx.circuit_breakers.get(id).is_some(),
+                "{id:?} has no breaker"
+            );
+            assert!(ctx.backend_metrics.contains(id), "{id:?} has no metrics");
+            assert!(
+                outlier.tracks(id),
+                "{id:?} is not tracked by outlier detection"
+            );
+        }
+
+        abort_all_tasks(app).await;
+    }
+
     #[tokio::test]
     async fn a_static_backend_tls_listener_has_no_per_backend_client() {
         const CONFIG: &str = r#"
