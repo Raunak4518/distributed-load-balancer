@@ -128,10 +128,11 @@ pub async fn account_for(
         )
         .await?;
 
-    if let Some(parent) = credentials_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(credentials_path, serde_json::to_string(&credentials)?)?;
+    write_atomic(
+        credentials_path,
+        serde_json::to_string(&credentials)?.as_bytes(),
+        true,
+    )?;
 
     Ok(account)
 }
@@ -197,14 +198,48 @@ pub fn ensure_bootstrap_certificate(
     let cert = params
         .self_signed(&key_pair)
         .map_err(|e| AcmeError::Io(std::io::Error::other(e.to_string())))?;
-    if let Some(parent) = cert_file.parent() {
-        std::fs::create_dir_all(parent)?;
+    write_atomic(key_file, key_pair.serialize_pem().as_bytes(), true)?;
+    write_atomic(cert_file, cert.pem().as_bytes(), false)?;
+    Ok(())
+}
+
+pub(crate) fn write_atomic(path: &Path, contents: &[u8], private: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?
+        .to_string_lossy();
+    let temp = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if private { 0o600 } else { 0o644 });
     }
-    if let Some(parent) = key_file.parent() {
-        std::fs::create_dir_all(parent)?;
+    #[cfg(not(unix))]
+    let _ = private;
+    let result = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return result;
     }
-    std::fs::write(cert_file, cert.pem())?;
-    std::fs::write(key_file, key_pair.serialize_pem())?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -243,14 +278,8 @@ pub async fn renew_once(
     let (cert_chain_pem, private_key_pem) =
         obtain_certificate_http01(&account, domain, challenges).await?;
 
-    if let Some(parent) = cert_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if let Some(parent) = key_file.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(cert_file, cert_chain_pem)?;
-    std::fs::write(key_file, private_key_pem)?;
+    write_atomic(key_file, private_key_pem.as_bytes(), true)?;
+    write_atomic(cert_file, cert_chain_pem.as_bytes(), false)?;
 
     Ok(())
 }
@@ -377,6 +406,60 @@ pub fn spawn_acme_renewer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lb-acme-write-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn write_atomic_replaces_the_whole_file_and_leaves_no_temporary_behind() {
+        let dir = scratch_dir("replace");
+        let path = dir.join("nested").join("key.pem");
+        write_atomic(&path, b"first version, longer than the second", true).unwrap();
+        write_atomic(&path, b"second", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "key.pem")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_ignores_a_stale_temporary_from_a_crashed_write() {
+        let dir = scratch_dir("stale");
+        let path = dir.join("key.pem");
+        let stale = dir.join(format!(".key.pem.tmp-{}", std::process::id()));
+        std::fs::write(&stale, b"half-written garbage from before the crash").unwrap();
+        write_atomic(&path, b"fresh", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        assert!(!stale.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_bootstrap_private_key_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("mode");
+        let key = dir.join("key.pem");
+        let cert = dir.join("cert.pem");
+        ensure_bootstrap_certificate(&cert, &key, "example.test").unwrap();
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key mode was {mode:o}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn a_fresh_challenge_store_has_no_tokens() {
