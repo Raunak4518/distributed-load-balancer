@@ -23,7 +23,7 @@ While any confirmed backend in the same pool is eligible, awaiting backends rece
 
 ## Active health checks
 
-One task, spawned by [`spawn_active_checker`](../crates/lb-healthcheck/src/active.rs), runs per backend. It ticks on `health_check.interval_ms`, runs the configured probe, and writes the boolean result into the pool's `active_healthy` flag — nothing else about "healthy" lives in this loop; that decision belongs entirely to the probe.
+One task, spawned by [`spawn_active_checker`](../crates/lb-healthcheck/src/active.rs), runs per backend. It ticks on `health_check.interval_ms`, runs the configured probe, and counts consecutive results. A healthy backend is marked unhealthy after `unhealthy_threshold` consecutive failures (default 3), and an unhealthy one is restored after `healthy_threshold` consecutive successes (default 2), so a single slow or dropped probe does not flap a backend in and out of rotation. A backend [awaiting its first probe](#awaiting-the-first-probe) is the exception: that first result decides its state immediately, since it has never been confirmed either way. What counts as a passing probe belongs entirely to the probe itself.
 
 ### HTTP probe
 

@@ -124,13 +124,13 @@ The full metric catalog is in [metrics-reference.md](metrics-reference.md).
 
 ## 5. Stop a backend and watch health checking react
 
-Stop the `web2` process (`Ctrl+C` its terminal, or `kill` it). The active health checker probes each backend's `health_check.path` on `interval_ms` (2000ms here); a single failed probe (connection refused counts) immediately flips that backend's health flag — there's no threshold delay on the active check itself, unlike the passive circuit breaker's `failure_threshold`, which governs a different signal (forwarded-request outcomes, not probe results). Within a couple of seconds:
+Stop the `web2` process (`Ctrl+C` its terminal, or `kill` it). The active health checker probes each backend's `health_check.path` on `interval_ms` (2000ms here); after `unhealthy_threshold` consecutive failed probes (default 3; connection refused counts) the backend's health flag flips. This is separate from the passive circuit breaker's `failure_threshold`, which counts forwarded-request outcomes, not probe results. Within a few intervals:
 
 - The `lb_backend_healthy{listener="web",backend="web2"}` gauge in `/metrics` drops from `1` to `0`.
 - `GET /backends` shows `web2` with `"active_healthy": false` and `"eligible": false`.
 - Repeating the `curl` loop from step 3 now returns `web1` every time — `web2` is out of rotation without any config change.
 
-Restart the `web2` python process and both flip back within one health-check interval.
+Restart the `web2` python process and both flip back after `healthy_threshold` consecutive successful probes (default 2).
 
 ## 6. Edit the config and reload
 

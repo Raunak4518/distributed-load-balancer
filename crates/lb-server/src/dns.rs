@@ -88,6 +88,8 @@ fn spawn_checker_for(
     let config = ActiveCheckConfig {
         interval: Duration::from_millis(health_check.interval_ms),
         healthy_gauge: Some(metrics.backend(listener_name, &backend.id.0).healthy),
+        healthy_threshold: health_check.healthy_threshold,
+        unhealthy_threshold: health_check.unhealthy_threshold,
     };
     let timeout = Duration::from_millis(health_check.timeout_ms);
     let handle = match transport {
@@ -240,6 +242,8 @@ mod tests {
             unhealthy_request_count: None,
             outlier_detection: None,
             max_ejected_fraction: None,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
         }
     }
 
@@ -375,6 +379,8 @@ mod tests {
                 unhealthy_request_count: None,
                 outlier_detection: None,
                 max_ejected_fraction: None,
+                healthy_threshold: 1,
+                unhealthy_threshold: 1,
             }),
         );
 

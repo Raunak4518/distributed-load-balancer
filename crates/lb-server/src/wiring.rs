@@ -1399,6 +1399,8 @@ fn spawn_health_checkers(
         let config = ActiveCheckConfig {
             interval,
             healthy_gauge: Some(metrics.backend(listener_name, &b.id.0).healthy),
+            healthy_threshold: health_check.healthy_threshold,
+            unhealthy_threshold: health_check.unhealthy_threshold,
         };
         match transport {
             ProbeTransport::Http {

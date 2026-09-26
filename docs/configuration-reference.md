@@ -191,6 +191,8 @@ Also applies, with the identical shape, to `[listeners.routes.health_check]` and
 | `unhealthy_latency_ms` | integer | none | must be > 0 if set | Response time above which a successful request still counts as a passive circuit-breaker failure. |
 | `unhealthy_request_count` | integer | none | must be > 0 if set | In-flight request count above which the next completed request counts as a passive failure, regardless of its own latency/status. |
 | `outlier_detection` | table | none | see below | Enables rolling statistical comparison of backends within the pool. |
+| `healthy_threshold` | integer | `2` | must be > 0 | Consecutive successful active probes that return an unhealthy backend to rotation. |
+| `unhealthy_threshold` | integer | `3` | must be > 0 | Consecutive failed active probes that take a healthy backend out of rotation. |
 | `max_ejected_fraction` | float | none | must be within `[0.0, 1.0]` if set | Caps the fraction of a pool's backends that may be excluded at once by circuit trips and outlier ejections combined. |
 
 ### `[listeners.health_check.outlier_detection]`

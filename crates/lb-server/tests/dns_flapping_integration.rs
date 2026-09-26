@@ -204,6 +204,8 @@ fn health_check_config() -> HealthCheckConfig {
         unhealthy_request_count: None,
         outlier_detection: None,
         max_ejected_fraction: None,
+        healthy_threshold: 1,
+        unhealthy_threshold: 1,
     }
 }
 
@@ -259,6 +261,8 @@ async fn run_poller(
                     ActiveCheckConfig {
                         interval: Duration::from_millis(health_check.interval_ms),
                         healthy_gauge: None,
+                        healthy_threshold: health_check.healthy_threshold,
+                        unhealthy_threshold: health_check.unhealthy_threshold,
                     },
                     HttpProbe::new(
                         probe_client,

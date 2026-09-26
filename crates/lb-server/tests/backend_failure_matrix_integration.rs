@@ -121,6 +121,7 @@ forward_timeout_ms = 200
   interval_ms = 2000
   timeout_ms = 300
   failure_threshold = 1
+  unhealthy_threshold = 1
   cooldown_ms = 10000
 
   [listeners.rate_limit]

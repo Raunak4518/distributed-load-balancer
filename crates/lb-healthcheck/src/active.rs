@@ -9,6 +9,8 @@ pub struct ActiveCheckConfig {
     /// visible in metrics as well as in the pool. `None` in tests that don't
     /// care about metrics.
     pub healthy_gauge: Option<lb_metrics::IntGauge>,
+    pub healthy_threshold: u32,
+    pub unhealthy_threshold: u32,
 }
 
 /// Polls one backend on an interval and publishes the result into the pool's
@@ -26,9 +28,25 @@ where
     tokio::spawn(async move {
         let mut ticker = time::interval(config.interval);
         let mut previous: Option<bool> = None;
+        let mut consecutive_successes = 0u32;
+        let mut consecutive_failures = 0u32;
         loop {
             ticker.tick().await;
-            let healthy = probe.probe(&backend).await;
+            let passed = probe.probe(&backend).await;
+            if passed {
+                consecutive_successes = consecutive_successes.saturating_add(1);
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                consecutive_successes = 0;
+            }
+            let healthy = if pool.is_awaiting_first_probe(&backend.id) {
+                passed
+            } else if pool.is_active_healthy(&backend.id) {
+                consecutive_failures < config.unhealthy_threshold.max(1)
+            } else {
+                consecutive_successes >= config.healthy_threshold.max(1)
+            };
             if previous != Some(healthy) {
                 if healthy {
                     tracing::info!(backend = %backend.id, "backend health check recovered");
@@ -61,7 +79,71 @@ mod tests {
         ActiveCheckConfig {
             interval: Duration::from_millis(20),
             healthy_gauge: None,
+            healthy_threshold: 1,
+            unhealthy_threshold: 1,
         }
+    }
+
+    struct ScriptedProbe(std::sync::Mutex<std::collections::VecDeque<bool>>);
+
+    impl HealthProbe for ScriptedProbe {
+        async fn probe(&self, _backend: &Backend) -> bool {
+            self.0.lock().unwrap().pop_front().unwrap_or(true)
+        }
+    }
+
+    fn scripted(results: &[bool]) -> ScriptedProbe {
+        ScriptedProbe(std::sync::Mutex::new(results.iter().copied().collect()))
+    }
+
+    fn threshold_config() -> ActiveCheckConfig {
+        ActiveCheckConfig {
+            interval: Duration::from_millis(10),
+            healthy_gauge: None,
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_flips_only_after_consecutive_probe_results_reach_the_thresholds() {
+        let backend = Backend::new("b1", "127.0.0.1:9000".parse().unwrap(), 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let handle = spawn_active_checker(
+            backend.clone(),
+            pool.clone(),
+            threshold_config(),
+            scripted(&[false, false, true, false, false, false, true, true]),
+        );
+        let expected = [true, true, true, true, true, false, false, true];
+        time::sleep(Duration::from_millis(5)).await;
+        for (tick, healthy) in expected.iter().enumerate() {
+            assert_eq!(
+                pool.is_active_healthy(&backend.id),
+                *healthy,
+                "after probe {tick}"
+            );
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_awaiting_its_first_probe_is_judged_by_that_probe_alone() {
+        let backend = Backend::new("new", "127.0.0.1:9000".parse().unwrap(), 1, None);
+        let pool = Arc::new(BackendPool::new(Vec::new()));
+        pool.apply_resolved(vec![backend.clone()]);
+        assert!(pool.is_awaiting_first_probe(&backend.id));
+        let handle = spawn_active_checker(
+            backend.clone(),
+            pool.clone(),
+            threshold_config(),
+            scripted(&[false]),
+        );
+        time::sleep(Duration::from_millis(5)).await;
+        assert!(!pool.is_awaiting_first_probe(&backend.id));
+        assert!(!pool.is_active_healthy(&backend.id));
+        handle.abort();
     }
 
     #[tokio::test]

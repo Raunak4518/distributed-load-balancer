@@ -804,6 +804,10 @@ pub struct HealthCheckConfig {
     pub outlier_detection: Option<OutlierDetectionConfig>,
     #[serde(default)]
     pub max_ejected_fraction: Option<f64>,
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -837,6 +841,14 @@ fn default_outlier_stddev_factor() -> f64 {
 
 fn default_half_open_successes_required() -> u32 {
     1
+}
+
+fn default_healthy_threshold() -> u32 {
+    2
+}
+
+fn default_unhealthy_threshold() -> u32 {
+    3
 }
 
 fn default_flap_backoff_multiplier() -> f64 {
@@ -1127,6 +1139,11 @@ impl ListenerConfig {
                 return Err(invalid("retry_budget.burst must be positive".into()));
             }
         }
+        if self.health_check.healthy_threshold == 0 || self.health_check.unhealthy_threshold == 0 {
+            return Err(invalid(
+                "health_check.healthy_threshold and unhealthy_threshold must be positive".into(),
+            ));
+        }
         if self.health_check.flap_backoff_multiplier < 1.0 {
             return Err(invalid(
                 "health_check.flap_backoff_multiplier must be >= 1.0".into(),
@@ -1203,6 +1220,13 @@ impl ListenerConfig {
                             "each [[listeners.routes]] needs health_check.path, same as the listener itself".into(),
                         ));
                     }
+                    if route.health_check.healthy_threshold == 0
+                        || route.health_check.unhealthy_threshold == 0
+                    {
+                        return Err(invalid(
+                            "each [[listeners.routes]] health_check.healthy_threshold and unhealthy_threshold must be positive".into(),
+                        ));
+                    }
                     if route.health_check.flap_backoff_multiplier < 1.0 {
                         return Err(invalid(
                             "each [[listeners.routes]] health_check.flap_backoff_multiplier must be >= 1.0".into(),
@@ -1240,6 +1264,13 @@ impl ListenerConfig {
                     if pool.health_check.path.is_none() {
                         return Err(invalid(
                             "each [[listeners.canary]] needs health_check.path, same as the listener itself".into(),
+                        ));
+                    }
+                    if pool.health_check.healthy_threshold == 0
+                        || pool.health_check.unhealthy_threshold == 0
+                    {
+                        return Err(invalid(
+                            "each [[listeners.canary]] health_check.healthy_threshold and unhealthy_threshold must be positive".into(),
                         ));
                     }
                     if pool.health_check.flap_backoff_multiplier < 1.0 {
@@ -1583,6 +1614,20 @@ mod tests {
           [listeners.load_balancing]
           strategy = "round_robin"
     "#;
+
+    #[test]
+    fn health_check_thresholds_default_and_validate() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert_eq!(cfg.listeners[0].health_check.healthy_threshold, 2);
+        assert_eq!(cfg.listeners[0].health_check.unhealthy_threshold, 3);
+        let zero = VALID.replacen(
+            "interval_ms = 2000",
+            "interval_ms = 2000\n          unhealthy_threshold = 0",
+            1,
+        );
+        let err = Config::parse(&zero).expect_err("a zero threshold must be rejected");
+        assert!(format!("{err}").contains("unhealthy_threshold"), "{err}");
+    }
 
     #[test]
     fn a_misspelled_key_anywhere_is_rejected_and_named() {
