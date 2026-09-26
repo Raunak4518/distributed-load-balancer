@@ -1,6 +1,4 @@
 use lb_core::{BackendId, BackendPool, LoadBalancer};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 /// Virtual nodes per unit of `weight` (so a weight-3 backend claims 3x the
@@ -85,9 +83,17 @@ impl ConsistentHash {
 }
 
 fn hash_str(s: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    hasher.finish()
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in s.as_bytes() {
+        h ^= u64::from(*byte);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    h
 }
 
 impl LoadBalancer for ConsistentHash {
@@ -180,6 +186,34 @@ mod tests {
             "removing one of four backends remapped {remapped}/{} keys -- too close to a full remap",
             keys.len()
         );
+    }
+
+    #[test]
+    fn the_hash_is_a_fixed_function_of_the_key_bytes() {
+        assert_eq!(hash_str("client-42"), 0xc456_11be_9bd9_112b);
+        assert_eq!(hash_str(""), 0xefd0_1f60_ba99_2926);
+        assert_eq!(hash_str("b1\u{0}0"), 0x7209_9ae0_6373_bc8a);
+    }
+
+    #[test]
+    fn equal_weight_backends_share_keys_roughly_evenly() {
+        let pool = pool_of(&["b1", "b2", "b3", "b4"]);
+        let ch = ConsistentHash::new();
+        let mut counts = std::collections::HashMap::new();
+        for i in 0..10_000 {
+            *counts
+                .entry(
+                    ch.pick(&pool, &format!("10.0.{}.{}", i / 256, i % 256))
+                        .unwrap(),
+                )
+                .or_insert(0usize) += 1;
+        }
+        for (id, n) in counts {
+            assert!(
+                (1_000..=4_000).contains(&n),
+                "{id:?} got {n} of 10000 keys -- the ring is badly skewed"
+            );
+        }
     }
 
     #[test]
