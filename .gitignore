@@ -11,3 +11,6 @@ graphify-out/
 
 # lb-bench-e2e persisted benchmark results
 /results/
+
+# Local agent worktrees
+/.claude/worktrees/
