@@ -27,6 +27,7 @@ pub struct CounterStore {
 pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
 
 const MAX_SNAPSHOT_BUCKET_ENTRIES: usize = 5_000;
+const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
 const FUTURE_SKEW_TOLERANCE_SECS: u64 = 5;
 
@@ -223,7 +224,12 @@ impl CounterStore {
     /// Our own in-window cells, for pushing to peers. A node is only
     /// authoritative for its own counts and never relays anyone else's.
     pub fn snapshot_own(&self, node_id: &str, now_secs: u64) -> Vec<(String, Vec<(u64, u64)>)> {
-        self.snapshot_own_capped(node_id, now_secs, MAX_SNAPSHOT_BUCKET_ENTRIES)
+        self.snapshot_own_capped(
+            node_id,
+            now_secs,
+            MAX_SNAPSHOT_BUCKET_ENTRIES,
+            MAX_SNAPSHOT_BYTES,
+        )
     }
 
     fn snapshot_own_capped(
@@ -231,6 +237,7 @@ impl CounterStore {
         node_id: &str,
         now_secs: u64,
         max_entries: usize,
+        max_bytes: usize,
     ) -> Vec<(String, Vec<(u64, u64)>)> {
         let cutoff = now_secs.saturating_sub(self.window_secs.saturating_sub(1));
         let mut keys: Vec<String> = self
@@ -247,6 +254,7 @@ impl CounterStore {
         let mut idx = self.snapshot_cursor.load(Ordering::Relaxed) % len;
         let mut out = Vec::new();
         let mut total_entries = 0usize;
+        let mut total_bytes = 0usize;
         for _ in 0..len {
             if let Some(item) = self.keys.get(&keys[idx]) {
                 if let Some(buckets) = item.per_node.get(node_id) {
@@ -256,10 +264,15 @@ impl CounterStore {
                         .map(|(epoch, count)| (*epoch, *count))
                         .collect();
                     if !in_window.is_empty() {
-                        if total_entries > 0 && total_entries + in_window.len() > max_entries {
+                        let bytes = estimated_snapshot_bytes(&keys[idx], in_window.len());
+                        if total_entries > 0
+                            && (total_entries + in_window.len() > max_entries
+                                || total_bytes + bytes > max_bytes)
+                        {
                             break;
                         }
                         total_entries += in_window.len();
+                        total_bytes += bytes;
                         out.push((keys[idx].clone(), in_window));
                     }
                 }
@@ -311,6 +324,10 @@ pub(crate) type CrdtState = std::collections::BTreeMap<
     String,
     std::collections::BTreeMap<String, std::collections::BTreeMap<u64, u64>>,
 >;
+
+fn estimated_snapshot_bytes(key: &str, entries: usize) -> usize {
+    key.len() * 6 + 16 + entries * 48
+}
 
 #[cfg(test)]
 mod tests {
@@ -430,12 +447,49 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_of_long_keys_fits_in_one_gossip_message() {
+        let store = CounterStore::new(10);
+        let keys: Vec<String> = (0..1_000)
+            .map(|i| format!("{i:05}{}", "x".repeat(5_000)))
+            .collect();
+        for key in &keys {
+            store.merge(key, "me", &[(NOW, 1)], NOW);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..40 {
+            let snap = store.snapshot_own("me", NOW);
+            assert!(!snap.is_empty());
+            let encoded = serde_json::to_vec(&snap).unwrap();
+            assert!(
+                encoded.len() <= MAX_SNAPSHOT_BYTES,
+                "{} bytes",
+                encoded.len()
+            );
+            assert!(encoded.len() < crate::protocol::MAX_MESSAGE_BYTES);
+            seen.extend(snap.into_iter().map(|(key, _)| key));
+        }
+        assert_eq!(
+            seen.len(),
+            keys.len(),
+            "every key must still be gossiped eventually"
+        );
+    }
+
+    #[test]
+    fn a_byte_capped_snapshot_always_includes_at_least_one_key() {
+        let store = CounterStore::new(10);
+        store.merge(&"y".repeat(10_000), "me", &[(NOW, 1)], NOW);
+        let snap = store.snapshot_own_capped("me", NOW, usize::MAX, 10);
+        assert_eq!(snap.len(), 1);
+    }
+
+    #[test]
     fn a_capped_snapshot_stops_at_the_entry_limit() {
         let store = CounterStore::new(10);
         for i in 0..10 {
             store.merge(&format!("k{i}"), "me", &[(NOW, 1)], NOW);
         }
-        let snap = store.snapshot_own_capped("me", NOW, 4);
+        let snap = store.snapshot_own_capped("me", NOW, 4, usize::MAX);
         assert_eq!(snap.len(), 4);
     }
 
@@ -443,7 +497,7 @@ mod tests {
     fn a_capped_snapshot_always_includes_at_least_one_key() {
         let store = CounterStore::new(10);
         store.merge("big", "me", &[(NOW, 1), (NOW - 1, 1), (NOW - 2, 1)], NOW);
-        let snap = store.snapshot_own_capped("me", NOW, 1);
+        let snap = store.snapshot_own_capped("me", NOW, 1, usize::MAX);
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].0, "big");
     }
@@ -454,8 +508,8 @@ mod tests {
         for i in 0..6 {
             store.merge(&format!("k{i}"), "me", &[(NOW, 1)], NOW);
         }
-        let first = store.snapshot_own_capped("me", NOW, 3);
-        let second = store.snapshot_own_capped("me", NOW, 3);
+        let first = store.snapshot_own_capped("me", NOW, 3, usize::MAX);
+        let second = store.snapshot_own_capped("me", NOW, 3, usize::MAX);
         assert_eq!(first.len(), 3);
         assert_eq!(second.len(), 3);
         let mut seen: Vec<String> = first.into_iter().chain(second).map(|(k, _)| k).collect();
