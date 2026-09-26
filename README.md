@@ -22,7 +22,7 @@
 
 `lb-server` terminates TLS, serves HTTP/1.1 and HTTP/2, proxies raw TCP, and spreads traffic across backends using one of five selection strategies — including a latency-aware Peak-EWMA power-of-two-choices balancer. It health-checks backends actively and passively, ejects failing ones through a circuit breaker and statistical outlier detection, and rate-limits clients with GCRA. When several instances run side by side, they share rate-limit state through an HMAC-authenticated G-Counter CRDT, so a client's budget holds across the whole fleet.
 
-It is built to be operated: memory that clients can influence is bounded (the response cache's byte budget is a hard limit; per-key tracking caps can be exceeded only by requests racing each other, by one small entry each), rejections and backend failures are exported as Prometheus metrics, configuration reloads on `SIGHUP` without dropping connections, and shutdown drains in-flight requests.
+It is built to be operated: memory that clients can influence is bounded (the response cache's byte budget is a hard limit; rate-limit keys are fixed-size, and their count caps can be exceeded only by requests racing each other, by one small entry each), rejections and backend failures are exported as Prometheus metrics, configuration reloads on `SIGHUP` without dropping connections, and shutdown drains in-flight requests.
 
 ## Table of contents
 

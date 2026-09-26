@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wherever they appear, across every `Cache-Control` line.
 - Requests carrying `Authorization` now bypass the cache entirely, and
   responses carrying `Set-Cookie` are never stored.
+- **Header-based rate-limit keys are now stored as a fixed-size hash.** The
+  raw header value was stored and gossiped, so a client could grow memory
+  with long values (up to ~400 KB each over HTTP/1.1) and API keys used as
+  rate-limit keys crossed the cluster channel in plaintext. Keys are now
+  `h:` plus 128 bits of SHA-256. On the first deploy, `consistent_hash`
+  listeners keyed by a header remap each client once.
+- **A node's gossip could be rejected wholesale.** A snapshot was capped at
+  5,000 entries but not in bytes, so long keys could push every message
+  past the 4 MiB receive limit, silently removing that node from cluster
+  rate limiting. Snapshots now also stop at about 1 MiB.
 
 ### Added
 

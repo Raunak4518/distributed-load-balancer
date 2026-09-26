@@ -27,7 +27,7 @@ Each gossip round opens a fresh TCP connection to each peer, writes one framed m
 
 A node's own snapshot is capped so no single push message is unbounded:
 
-- At most 5,000 `(epoch, count)` bucket entries per message (`MAX_SNAPSHOT_BUCKET_ENTRIES`), spread across as many keys as fit — at least one key is always included even if its own buckets alone exceed the cap.
+- At most 5,000 `(epoch, count)` bucket entries (`MAX_SNAPSHOT_BUCKET_ENTRIES`) and at most an estimated 1 MiB of encoded payload (`MAX_SNAPSHOT_BYTES`, a quarter of the 4 MiB receive limit) per message, spread across as many keys as fit — at least one key is always included even if its own buckets alone exceed the cap.
 - If a node tracks more in-window keys than fit in one message, successive pushes round-robin through the full key set via an internal cursor, so every key is eventually gossiped even under a snapshot that never covers everything at once.
 
 ## Message format and authentication
@@ -63,7 +63,7 @@ The peer label on the skew-rejection metric is itself bounded: at most 64 distin
 ## Bounds
 
 - **`MAX_TRACKED_KEYS` (100,000).** A brand-new key is not admitted into the store once this many distinct keys are already tracked — mirroring the local GCRA's own `max_tracked_keys` cap, for the same reason: an attacker's key set must not be free to grow a node's memory without bound. Existing keys keep updating normally; only new ones are refused. Keys are reclaimed automatically as their cells age out of the window and `prune()` removes them.
-- **Snapshot caps.** Covered above under gossip frequency: 5,000 bucket entries per outgoing message, round-robined across keys when the full set does not fit.
+- **Snapshot caps.** Covered above under gossip frequency: 5,000 bucket entries and about 1 MiB per outgoing message, round-robined across keys when the full set does not fit. The byte budget guarantees a message never exceeds the 4 MiB limit peers enforce on receipt; without it, enough long keys would make every message from a node oversized, and peers would reject all of its gossip.
 - **Peer connections.** Each listener caps concurrent inbound connections from a single peer address (4 at a time) and closes a connection that has not completed one full authenticated frame within 30 seconds — a slow or hostile peer can occupy at most a small, fixed slice of the listener's resources.
 
 ## Peer channel mutual TLS
@@ -90,7 +90,7 @@ Once connectivity is restored, ordinary gossip resumes and every node's local vi
 
 For a given request, the local GCRA and the cluster coordinator are checked in a fixed order (see [`request-lifecycle.md`](request-lifecycle.md)):
 
-1. The local, node-only [GCRA limiter](rate-limiting.md) runs first, using the listener's configured rate-limit key (source IP or a header value). If it denies, the request never reaches the cluster check at all — cluster coordination is deliberately skipped so a request that would be rejected anyway never consumes shared cluster state.
+1. The local, node-only [GCRA limiter](rate-limiting.md) runs first, using the listener's configured rate-limit key (source IP, or a fixed-size hash of a header value — see [rate-limiting.md](rate-limiting.md#configuration)). If it denies, the request never reaches the cluster check at all — cluster coordination is deliberately skipped so a request that would be rejected anyway never consumes shared cluster state.
 2. If the local check allows, and the listener has a cluster coordinator configured, `ListenerCoordinator::try_admit` is called with the *same* key. It namespaces the key by listener name (prefixed internally with a separator byte that cannot appear in an IP literal or header value), so two listeners rate-limiting the same client IP have independent cluster budgets, and delegates to the shared `CounterStore`'s windowed sum-and-increment described above.
 
 The cluster-wide limit for a listener is derived, not separately configured: it is `ceil(rate_per_sec * window_secs)` — the listener's local per-node rate sustained over the whole cluster window. The local GCRA continues to shape bursts inside that sustained-rate ceiling; the cluster check only bounds the sustained total across every node.

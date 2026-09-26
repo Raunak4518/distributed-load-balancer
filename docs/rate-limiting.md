@@ -51,7 +51,7 @@ max_tracked_keys = 100000  # optional, defaults to 100000
 `key` selects what identifies a caller:
 
 - `source_ip` — the connection's real peer address. This is always the raw peer IP, never a client-supplied header such as `X-Forwarded-For`; trusting a client-controlled header here would let any caller mint itself a fresh bucket just by changing it. See [`edge-hardening.md`](edge-hardening.md) for the separate, trusted-proxy-only path (`proxy_protocol`) that can change what "peer address" means.
-- `header:<name>` — the named request header's value, or the literal string `unknown` if the header is absent. HTTP listeners only; a TCP listener has no headers, and its config is rejected at startup if `key` names one.
+- `header:<name>` — the named request header's value, stored as a fixed-size hash (`h:` followed by the first 128 bits of its SHA-256, in hex) rather than the value itself, or the literal string `unknown` if the header is absent. Hashing makes every tracked key the same small size however long a client makes the header, keeps raw values such as API keys out of the limiter's memory and off the cluster gossip channel, and at 128 bits makes two distinct values sharing a bucket practically impossible. HTTP listeners only; a TCP listener has no headers, and its config is rejected at startup if `key` names one.
 
 `rate_per_sec` and `burst` must both be positive; `max_tracked_keys` must be positive if set. See [`configuration-reference.md`](configuration-reference.md) for the full listener schema.
 
@@ -59,7 +59,7 @@ max_tracked_keys = 100000  # optional, defaults to 100000
 
 The limiter's state is a concurrent map from key to TAT. Nothing evicts a key on its own between sweeps (see below), so without a cap an attacker who sprays unique source IPs or header values could grow that map without bound.
 
-`max_tracked_keys` caps distinct keys. Once the map is at capacity, every key that has not already been seen is redirected to one shared overflow bucket, keyed by the sentinel string `"\u{0}overflow"` — the NUL prefix cannot appear in an IP literal or an HTTP header value, so a client cannot forge a collision with it. Established keys keep their own individual budget; only newcomers share the overflow bucket once the map is full.
+`max_tracked_keys` caps distinct keys, and since every key is either an IP address or a 34-byte hash, the limiter's memory is bounded by a fixed amount per listener regardless of what clients send. Once the map is at capacity, every key that has not already been seen is redirected to one shared overflow bucket, keyed by the sentinel string `"\u{0}overflow"` — the NUL prefix cannot appear in an IP literal or an HTTP header value, so a client cannot forge a collision with it. Established keys keep their own individual budget; only newcomers share the overflow bucket once the map is full.
 
 This is a deliberate three-way tradeoff:
 
