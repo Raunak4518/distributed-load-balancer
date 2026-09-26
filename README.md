@@ -22,7 +22,7 @@
 
 `lb-server` terminates TLS, serves HTTP/1.1 and HTTP/2, proxies raw TCP, and spreads traffic across backends using one of five selection strategies — including a latency-aware Peak-EWMA power-of-two-choices balancer. It health-checks backends actively and passively, ejects failing ones through a circuit breaker and statistical outlier detection, and rate-limits clients with GCRA. When several instances run side by side, they share rate-limit state through an HMAC-authenticated G-Counter CRDT, so a client's budget holds across the whole fleet.
 
-It is built to be operated: memory that clients can influence is bounded, rejections and backend failures are exported as Prometheus metrics, configuration reloads on `SIGHUP` without dropping connections, and shutdown drains in-flight requests.
+It is built to be operated: memory that clients can influence is bounded (the response cache's byte budget is a hard limit; per-key tracking caps can be exceeded only by requests racing each other, by one small entry each), rejections and backend failures are exported as Prometheus metrics, configuration reloads on `SIGHUP` without dropping connections, and shutdown drains in-flight requests.
 
 ## Table of contents
 
@@ -277,7 +277,7 @@ The current release is **0.3**. The project follows [Semantic Versioning](https:
 Known limitations, each documented on the linked page:
 
 - The proxy does not add `X-Forwarded-For` / `Forwarded` headers; backends see the load balancer's address ([HTTP features](docs/http-features.md#x-forwarded-for--forwarded)).
-- The response cache does not honor `Vary` and does not special-case `Authorization`, `Cookie` or backend `Set-Cookie` ([HTTP features](docs/http-features.md#limitations-set-cookie-authorizationcookie-and-vary)).
+- The response cache does not revalidate (`ETag`, conditional requests) and relies on the backend's `Cache-Control`/`Vary` to mark cookie-personalized responses ([HTTP features](docs/http-features.md#personalized-content-and-limitations)).
 - Unknown configuration keys are ignored rather than rejected ([configuration reference](docs/configuration-reference.md#top-level-structure)).
 - `SIGHUP` reload is Unix-only, and the admin listener has no TLS of its own ([operations](docs/operations.md)).
 - ACME issues single-domain certificates over HTTP-01 only ([TLS](docs/tls.md#acme-automatic-certificates)).

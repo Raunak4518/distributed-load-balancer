@@ -87,24 +87,27 @@ An in-memory, listener-scoped cache that answers a repeated request straight fro
 
 An entry is only stored, and only served, under all of the following:
 
-- **Method**: only `GET`. Every other method bypasses the cache in both directions (never looked up, never stored).
+- **Request**: only a `GET` with no `Authorization` header that is not a WebSocket/`Upgrade` handshake. Any other request bypasses the cache in both directions: it is never answered from the cache and its response is never stored. Skipping authenticated requests follows RFC 9111 §3.5 for shared caches; skipping upgrade handshakes guarantees a stored plain `GET` can never prevent an upgrade on the same URL.
 - **Status**: only `200 OK`. Any other status is never cached.
 - **Content-Length**: the response must declare an explicit `Content-Length`, and it must be within the cache's `max_entry_bytes`. A chunked or unknown-length response is never cached — its length can't be checked before the body is fully read, and buffering an unbounded body to find out would defeat the size cap it's trying to enforce.
-- **`Cache-Control`** directives are read, case-insensitively, comma-split: `no-store`, `private`, and `no-cache` all suppress caching outright; `max-age=N` sets the entry's TTL (and `max-age=0`, or an unparseable value, also suppresses caching). Any other `Cache-Control` directive (`s-maxage`, `must-revalidate`, `stale-while-revalidate`, `no-transform`, ...) is not recognized and has no effect. A response with no `Cache-Control` header at all falls back to the cache's configured `default_ttl_secs`.
+- **`Set-Cookie`**: a response that sets a cookie is never stored, so one client's cookie is never replayed to another.
+- **`Vary`**: a response may carry `Vary: Accept-Encoding` (the key already separates encodings, see below). A `Vary` on any other request header, or `Vary: *`, means the response is never stored.
+- **`Cache-Control`** directives are read case-insensitively, across every `Cache-Control` header line and in any order: `no-store`, `private` (including the field-list form `private="..."`), or `no-cache` anywhere in the response suppresses caching outright. `s-maxage=N` takes precedence over `max-age=N`, since this is a shared cache; either one set to `0` or to an unparseable value suppresses caching. Other directives (`must-revalidate`, `stale-while-revalidate`, `no-transform`, ...) have no effect. A response with no TTL directive falls back to the cache's configured `default_ttl_secs`.
 
 ### Key composition
 
-The cache key is `"{method}|{host}|{path_and_query}"`, where `host` is the request's `Host` header if present, else the request URI's authority (the fallback that keys an HTTP/2 request correctly when the client sent `:authority` rather than a `Host` header). This means:
+The cache key is `"{method}|{host}|{path_and_query}|{accept_encoding}"`, where `host` is the request's `Host` header if present, else the request URI's authority (the fallback that keys an HTTP/2 request correctly when the client sent `:authority` rather than a `Host` header), and `accept_encoding` is the request's `Accept-Encoding` normalized to lowercase, whitespace-free, sorted, de-duplicated codings. This means:
 
 - Two virtual hosts sharing the same path (matched via a `[[listeners.routes]]` `host` rule) never collide.
 - Different query strings (`?page=2` vs `?page=3`) are distinct entries; header order elsewhere in the request has no effect on the key.
+- A backend that compresses its own responses and sends `Vary: Accept-Encoding` is cached safely: a client that cannot decode gzip is never served another client's gzip body. `Accept-Encoding: gzip, br` and `Accept-Encoding: BR,gzip` share an entry.
 - A listener with routing rules still uses one cache, correctly partitioned by the key alone — there is no separate cache per route.
 
 ### TTL rules
 
-- `Cache-Control: max-age=N` (N > 0) sets the TTL to N seconds.
-- No `Cache-Control` header at all: the TTL is the cache's configured `default_ttl_secs`.
-- `no-store`, `private`, `no-cache`, or `max-age=0`: not cached.
+- `Cache-Control: s-maxage=N` (N > 0) sets the TTL to N seconds; otherwise `max-age=N` (N > 0) does.
+- Neither present: the TTL is the cache's configured `default_ttl_secs`.
+- `no-store`, `private`, or `no-cache` anywhere, or the effective `s-maxage`/`max-age` equal to `0`: not cached.
 - Expiry is checked lazily on every `get` (an expired entry is removed on the read that finds it, so a request landing between sweeps still sees a correct miss) and reclaimed proactively by a periodic sweep (see below).
 
 ### Memory accounting and caps
@@ -113,7 +116,7 @@ Two independent size limits apply:
 
 - `max_entry_bytes`: caps one entry's body size. A response whose declared `Content-Length` exceeds this is never cached.
 - `max_total_bytes`: caps the cache's aggregate accounted size across all entries. Accounted size per entry is `320 bytes` fixed overhead + key length + body length +, per response header, `128 bytes` overhead plus that header's name and value lengths. This means headers are not free — a response with many or large headers (e.g. several `Set-Cookie` values) counts meaningfully toward the budget even with a tiny body, and a zero-length body still consumes its full header/key/overhead accounting.
-- The total-bytes check is a **soft cap**: a brief overshoot under concurrent inserts racing the check is accepted rather than serialized against.
+- `max_total_bytes` is a **hard cap**: an entry's bytes are reserved with an atomic compare-and-swap before it is inserted, so concurrent inserts can never push the accounted total past the configured budget. A replacement for an existing key reserves its full size before the old entry's bytes are released, so a replacement that does not fit alongside the current entry is not admitted.
 
 ### No eviction policy
 
@@ -123,15 +126,12 @@ There is no LRU, LFU, or any other eviction algorithm. Once `max_total_bytes` is
 
 A background task runs `sweep_expired()` on a fixed interval for the life of the listener, scanning every entry and removing any past its `expires_at`, reclaiming its share of `max_total_bytes`. This exists because lazy removal on `get` only reclaims space for keys someone still asks for — a cache full of short-TTL entries that traffic has moved on from would otherwise stay full (and keep rejecting new entries) indefinitely.
 
-### Limitations: Set-Cookie, Authorization/Cookie, and Vary
+### Personalized content and limitations
 
-State these plainly, since they differ from what many caches do by default:
-
-- **A backend's own `Set-Cookie` header is cached and replayed verbatim** to every future client served from that entry, if the response is otherwise cacheable. The cache has no special-case exclusion for `Set-Cookie`. The one thing that is *not* cached is a load-balancer-injected sticky-session cookie — the cache-eligibility decision is made, and the response body buffered, before the sticky `Set-Cookie` is added to the outgoing response, specifically so a stored entry never carries one client's sticky pin.
-- **`Authorization` and `Cookie` request headers are not treated specially.** There is no logic that skips caching a response to an authenticated or cookie-bearing request. If a backend returns `200` with a `Content-Length` and no `Cache-Control` ruling it out, its response is cached and can be served to a different client's request that hits the same key, regardless of what credentials either request carried.
-- **`Vary` is not honored.** The cache key is method/host/path/query only; a response's `Vary` header (e.g. `Vary: Accept-Encoding`, `Vary: Cookie`) has no effect on key composition or on cache admission.
-
-Operators enabling this cache on a route that serves personalized or authenticated content should rely on the backend sending `Cache-Control: private`/`no-store` for such responses — the load balancer will not detect that case on its own.
+- **Cookies on requests are not part of the key.** A backend that personalizes a response by cookie must say so with `Cache-Control: private` or `no-store`, or `Vary: Cookie`; any of these keeps it out of the cache. A cookie-personalized response with none of them is shared. This matches nginx's default; bypassing every cookie-bearing request would make the cache useless for browser traffic.
+- **The load balancer's own sticky cookie is never stored.** The cache decision and body buffering happen before the sticky `Set-Cookie` is added to the outgoing response.
+- **No revalidation.** `ETag`, `Last-Modified` and conditional requests are not supported: a conditional request that hits the cache receives the full stored `200` rather than a `304`, and an expired entry is refetched rather than revalidated.
+- **No eviction.** See above; a full cache admits nothing new until entries expire.
 
 ### Configuration
 
@@ -178,7 +178,7 @@ A request is treated as a protocol-upgrade request when its `Connection` header 
 
 This check runs after rate limiting, the WAF, the response-cache lookup, and route resolution, and before the body read, the sticky pin, and the retry loop — none of which apply to a connection that is about to stop being ordinary HTTP.
 
-> **Known limitation:** because the cache lookup precedes this check and keys only on method, host and path, a WebSocket handshake (a `GET`) on a listener with `[listeners.cache]` configured is answered from the cache if a plain `GET` response for the same URL is stored, and the upgrade never happens. Do not enable caching on a listener whose WebSocket endpoints also serve cacheable plain `GET` responses at the same path.
+The response cache never answers an upgrade handshake, even for a URL whose plain `GET` response is cached; see [response caching](#what-is-cacheable).
 
 ### Dedicated, non-pooled backend connection
 

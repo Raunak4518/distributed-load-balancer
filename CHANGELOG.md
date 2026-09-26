@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The response cache could share private responses.** `Cache-Control`
+  directives were read left to right and the first `max-age` ended the scan,
+  so `max-age=600, private` or `max-age=600, no-store` was cached and served
+  to every client. `no-store`, `private` and `no-cache` now forbid caching
+  wherever they appear, across every `Cache-Control` line.
+- Requests carrying `Authorization` now bypass the cache entirely, and
+  responses carrying `Set-Cookie` are never stored.
+
 ### Added
 
 - **Awaiting-first-probe state for new backends.** A backend that joins a
@@ -20,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The response cache honors `s-maxage` (it takes precedence over `max-age`)
+  and `Vary`: the key now includes the normalized `Accept-Encoding`, so
+  `Vary: Accept-Encoding` responses are cached per encoding, and any other
+  `Vary` prevents caching. Previously a gzip body could be served to a
+  client that had not asked for it.
+- A WebSocket handshake could be answered from the cache when a plain `GET`
+  for the same URL was stored, so the upgrade never happened. Upgrade
+  handshakes now bypass the cache.
+- `[listeners.cache] max_total_bytes` is now a hard limit. Concurrent inserts
+  could previously overshoot it by up to one entry each.
 - **DNS-discovered backends had no circuit breaker, passive health checks,
   outlier detection or per-backend metrics.** These were built once from the
   static backend list, which is empty on a `dns_discovery` listener, so a
