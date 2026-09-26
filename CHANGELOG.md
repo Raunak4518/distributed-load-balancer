@@ -48,6 +48,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The HTTP/2 slowloris deadline was disarmed by a single byte.** A client
+  could send one byte of the connection preface and then hold the connection
+  indefinitely. The deadline now stays armed until the full preface and the
+  client's first SETTINGS frame have arrived.
+- **A DNS refresh could permanently inflate a backend's in-flight count.**
+  Refreshing the pool gave persisting backends new state objects with the
+  count copied in, so requests that started before the refresh decremented
+  the old object and the live count never came back down; health and drain
+  writes racing a refresh could likewise be lost. Persisting backends now
+  keep their state object across refreshes.
+- **WebSocket connections were invisible to load accounting.** An upgraded
+  connection now counts as in-flight against its backend for its whole life,
+  so `least_connections`, `peak_ewma_p2c` and `active_conns` see it.
+- **Gossip could delay a hot key by many rounds.** Snapshots now send keys
+  whose counts changed since they were last gossiped before resuming the
+  rotation, so the documented convergence bound holds while the keys changed
+  per interval fit in one message.
 - **Finished connection tasks were kept until shutdown.** Each listener's
   connection set was only drained at shutdown, so its bookkeeping grew with
   every connection ever accepted. Finished tasks are now released as new

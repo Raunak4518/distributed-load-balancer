@@ -35,18 +35,17 @@ Three independent timeouts bound how long a client may take to *send* data, at t
 | Defense | Config field / default | Applies to | Response |
 |---|---|---|---|
 | Header read timeout | `header_read_timeout_ms` / `5000` | HTTP/1.1 request head | Connection dropped (hyper's `http1::Builder::header_read_timeout`) |
-| First-byte deadline | (reuses `header_read_timeout_ms`) | HTTP/2, before the client preface/SETTINGS arrive | Connection dropped |
+| HTTP/2 preface deadline | (reuses `header_read_timeout_ms`) | HTTP/2, until the client's preface and first SETTINGS frame have arrived | Connection dropped |
 | Body read timeout | `body_read_timeout_ms` / `10000` | Request body, either protocol | `408 Request Timeout` |
 
 ### Header read timeout (HTTP/1.1)
 
 A classic slowloris attack sends request headers one byte at a time to hold a connection slot open indefinitely. `header_read_timeout_ms` bounds the time hyper's HTTP/1.1 server is willing to wait for a complete request head; see the `.header_read_timeout(...)` call in [`lib.rs`](../crates/lb-server/src/lib.rs). There is deliberately no equivalent hyper setting for an *established* HTTP/2 connection — an idle h2 connection is normal, and the PING keepalive below (not a header-read timeout) is what distinguishes idle from dead.
 
-### First-byte deadline (HTTP/2)
+### Preface deadline (HTTP/2)
 
-hyper's own HTTP/2 PING keepalive only arms once the client's preface and initial `SETTINGS` frame have already arrived. A client that completes a TLS handshake, negotiates `h2` over ALPN, and then sends nothing is never timed out by hyper on its own — it holds its connection permit and per-IP slot forever. [`first_byte.rs`](../crates/lb-server/src/first_byte.rs) closes this gap: `FirstByteDeadline` wraps the stream in a deadline armed at construction (using `header_read_timeout_ms`, the same knob HTTP/1.1 uses) and disarmed the moment any byte is actually read — an `Ok` read that fills zero bytes (EOF from a half-close) does not count as a byte and leaves the deadline armed.
+hyper's own HTTP/2 PING keepalive only arms once the client's preface and initial `SETTINGS` frame have already arrived. A client that completes a TLS handshake, negotiates `h2` over ALPN, and then sends nothing — or only part of the preface — is never timed out by hyper on its own, and would hold its connection permit and per-IP slot forever. [`first_byte.rs`](../crates/lb-server/src/first_byte.rs) closes this gap: `FirstByteDeadline` wraps the stream in a deadline armed at construction (using `header_read_timeout_ms`, the same knob HTTP/1.1 uses) that is disarmed only once the client's full 24-byte connection preface and its complete first frame — the SETTINGS frame RFC 9113 requires next, header and payload — have been read. Sending one byte, or dribbling the preface, does not disarm it; the whole handshake must arrive within the deadline. From then on hyper's PING keepalive governs the established connection.
 
-This is a known, documented partial mitigation, not a complete one: the deadline is disarmed by "a byte arrived," not by "the preface completed." A client that sends one byte and then stalls mid-preface still disarms it, and from that point on it is bounded only by the per-IP connection cap, not by anything HTTP/2-specific. Tightening the disarm condition to the full 24-byte preface would only move the attacker's cost from one byte to 24 bytes, not close the gap structurally — and a deadline on full handshake completion is not something hyper exposes to the caller. This limitation is recorded in the module's own documentation.
 
 ### Body read timeout
 
@@ -185,6 +184,5 @@ Every structure that is keyed, directly or indirectly, by attacker-controlled in
 
 These are limitations the code itself documents, not a general security disclaimer:
 
-- **HTTP/2 first-byte deadline disarms on one byte, not a completed preface.** A client that sends a single byte and then stalls mid-preface still disarms `FirstByteDeadline` and is, from that point, bounded only by the per-IP connection cap rather than anything HTTP/2-specific. The code's own reasoning for leaving this alone: tightening the disarm condition to the full 24-byte preface only moves the attacker's cost from one byte to 24 and does not close the gap structurally, and a deadline on full handshake completion is not something hyper exposes to a caller. See [`first_byte.rs`](../crates/lb-server/src/first_byte.rs).
 - **The WAF is not a rule engine.** No percent-decoding or canonicalization is applied before matching, so an encoded or otherwise obfuscated payload can evade the fixed token lists. The rule set, and the header allowlist under `inspect_headers`, are compiled in and cannot be extended per deployment. See [`waf.rs`](../crates/lb-proxy/src/waf.rs).
 - **`max_concurrent_streams` does not, by itself, restore an HTTP/1.1-equivalent per-IP memory bound under HTTP/2.** The actual per-IP concurrency ceiling under HTTP/2 comes from `[listeners.rate_limit]`'s `burst` (with `key = "source_ip"`), not from the HTTP/2 stream limit — see "Per-IP concurrency under HTTP/2" above.

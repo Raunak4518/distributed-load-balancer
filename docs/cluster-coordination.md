@@ -28,7 +28,7 @@ Each gossip round opens a fresh TCP connection to each peer, writes one framed m
 A node's own snapshot is capped so no single push message is unbounded:
 
 - At most 5,000 `(epoch, count)` bucket entries (`MAX_SNAPSHOT_BUCKET_ENTRIES`) and at most an estimated 1 MiB of encoded payload (`MAX_SNAPSHOT_BYTES`, a quarter of the 4 MiB receive limit) per message, spread across as many keys as fit — at least one key is always included even if its own buckets alone exceed the cap.
-- If a node tracks more in-window keys than fit in one message, successive pushes round-robin through the full key set via an internal cursor, so every key is eventually gossiped even under a snapshot that never covers everything at once.
+- Keys whose counts this node changed since they were last gossiped are sent first, so a key that is actively being admitted reaches peers on the next round rather than waiting for its turn in a rotation. Any remaining space is filled by rotating through the rest of the node's keys with an internal cursor, so every key is eventually re-sent even when the full set never fits in one message.
 
 ## Message format and authentication
 
@@ -131,6 +131,8 @@ bound          = ceil(per_node_burst * peer_count)
 ```
 
 Each of the other `peer_count` nodes can independently admit up to `rate_per_sec * sync_interval` requests against a shared key before this node's next gossip round would observe them; the bound sums that worst case across every peer. `lb-server` exposes this per-listener as the `lb_ratelimit_cluster_convergence_bound` gauge (see [`metrics-reference.md`](metrics-reference.md)) so operators can see the theoretical slack for their own `rate_per_sec`/`sync_interval_ms`/peer-count combination.
+
+The bound assumes every key that changed during a sync interval is gossiped at the end of it. That holds while the keys a node changes per interval fit in one message (5,000 counter entries, about 1 MiB). Beyond that — tens of thousands of distinct keys admitted every interval, as in a key spray — changed keys queue across successive rounds, each additional round of queueing adds one `sync_interval_ms` of delay, and the effective over-admission for those keys grows proportionally beyond the published gauge.
 
 This bound is tested empirically, not just asserted, by `lb-bench`'s cluster harness ([`cluster_main.rs`](../crates/lb-bench/src/cluster_main.rs)): real `ClusterNode`s gossip over real `tokio::net::TcpListener` sockets across a matrix of cluster sizes (3, 5, 10 nodes) and gossip intervals (100ms–5s), each running a synchronized paced burst against one shared key, and the harness compares the true converged total against `configured_limit + convergence_over_admission_bound(...)` for that combination. The bound is a model of steady-state gossip, not a hard guarantee: the reported results, including one combination that exceeded it marginally, are in [`benchmarks.md`](benchmarks.md).
 

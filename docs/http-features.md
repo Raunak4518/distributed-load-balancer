@@ -182,6 +182,8 @@ The response cache never answers an upgrade handshake, even for a URL whose plai
 
 ### Dedicated, non-pooled backend connection
 
+A WebSocket or other upgraded connection counts as one in-flight connection against its backend for its whole life, the same accounting an ordinary request gets for its duration, so `least_connections`, `peak_ewma_p2c`'s pending-load signal, the passive `unhealthy_request_count` threshold and `GET /backends`' `active_conns` all see long-lived WebSocket sessions.
+
 The upgrade path dials its own one-off HTTP/1.1 connection to the backend directly (`hyper::client::conn::http1::handshake`), bypassing the shared pooled client entirely. The pooled client has no special handling for a `101` response before deciding whether to return a connection to its idle pool, so reusing it here would risk a genuinely dangerous bug: a socket mid-WebSocket-stream being handed to an unrelated pooled request. On a TLS backend, this dedicated connection also pins its own ALPN offer to `http/1.1` only, since the plain `hyper::client::conn::http1` handshake cannot parse an h2 byte stream and a pooled connection's usual `[h2, http/1.1]` ALPN list would risk exactly that mismatch.
 
 Request headers (`Connection`, `Upgrade`, `Sec-WebSocket-*`, etc.) are forwarded to the backend **verbatim** — `strip_hop_by_hop` is deliberately not applied on this path, since those are exactly the headers the backend needs intact to answer the handshake.
