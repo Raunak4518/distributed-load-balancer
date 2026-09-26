@@ -1111,6 +1111,7 @@ dependencies = [
  "lb-tcp",
  "lb-tls",
  "rustls",
+ "sha2",
  "socket2",
  "tokio",
  "tokio-rustls",

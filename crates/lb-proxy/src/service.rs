@@ -338,13 +338,23 @@ fn extract_key(req: &Request<Incoming>, source: &RateLimitKeySource, peer_ip: Ip
         // Trusting X-Forwarded-For here would let any client mint itself a
         // fresh rate-limit bucket just by changing the header.
         RateLimitKeySource::SourceIp => peer_ip.to_string(),
-        RateLimitKeySource::Header(name) => req
-            .headers()
-            .get(name.as_str())
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string(),
+        RateLimitKeySource::Header(name) => match req.headers().get(name.as_str()) {
+            Some(value) => hashed_header_key(value.as_bytes()),
+            None => "unknown".to_string(),
+        },
     }
+}
+
+fn hashed_header_key(value: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let digest = Sha256::digest(value);
+    let mut key = String::with_capacity(34);
+    key.push_str("h:");
+    for byte in &digest[..16] {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
 async fn read_bounded(body: Incoming, max_bytes: usize) -> Result<Bytes, ()> {
@@ -3860,7 +3870,102 @@ mod tests {
         );
     }
 
-    struct PanicOnHeader(&'static str);
+    struct RecordingLimiter(std::sync::Mutex<Vec<String>>);
+    impl RateLimiter for RecordingLimiter {
+        fn check(&self, key: &str) -> Decision {
+            self.0.lock().unwrap().push(key.to_string());
+            Decision::Allow
+        }
+    }
+
+    #[test]
+    fn a_header_key_is_a_fixed_size_hash_of_the_value() {
+        let huge = vec![b'a'; 100_000];
+        let key = hashed_header_key(&huge);
+        assert_eq!(key.len(), 34);
+        assert!(key.starts_with("h:"));
+        assert_eq!(
+            hashed_header_key(b"tenant-1"),
+            hashed_header_key(b"tenant-1")
+        );
+        assert_ne!(
+            hashed_header_key(b"tenant-1"),
+            hashed_header_key(b"tenant-2")
+        );
+        assert_ne!(hashed_header_key(b"unknown"), "unknown");
+    }
+
+    #[tokio::test]
+    async fn the_rate_limiter_never_sees_a_raw_header_value() {
+        let backend_addr = spawn_fixed_response_backend(StatusCode::OK, "ok").await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let limiter = Arc::new(RecordingLimiter(std::sync::Mutex::new(Vec::new())));
+        let ctx = Arc::new(ProxyContext {
+            rate_limiter: Arc::clone(&limiter),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool: Arc::new(BackendPool::new(vec![backend.clone()])),
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            retry_budget: None,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::Header("X-Api-Key".to_string()),
+            forward_timeout: Duration::from_secs(1),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        });
+        let addr = spawn_proxy_listener(ctx).await;
+        let big_value = "k".repeat(64 * 1024);
+
+        async fn send(addr: SocketAddr, api_key: Option<&str>) {
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            let header = api_key
+                .map(|v| format!("X-Api-Key: {v}\r\n"))
+                .unwrap_or_default();
+            stream
+                .write_all(
+                    format!("GET / HTTP/1.1\r\nHost: x\r\n{header}Connection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf).await;
+        }
+
+        send(addr, Some(&big_value)).await;
+        send(addr, Some("secret-api-key")).await;
+        send(addr, Some("secret-api-key")).await;
+        send(addr, None).await;
+
+        let keys = limiter.0.lock().unwrap().clone();
+        assert_eq!(keys.len(), 4);
+        assert_eq!(keys[0], hashed_header_key(big_value.as_bytes()));
+        assert_eq!(keys[0].len(), 34);
+        assert_eq!(keys[1], keys[2]);
+        assert_ne!(keys[0], keys[1]);
+        assert!(!keys.iter().any(|k| k.contains("secret-api-key")));
+        assert_eq!(keys[3], "unknown");
+    }
+
+    struct PanicOnHeader(String);
     impl LoadBalancer for PanicOnHeader {
         fn pick(&self, pool: &BackendPool, key: &str) -> Option<BackendId> {
             if key == self.0 {
@@ -3893,7 +3998,7 @@ mod tests {
 
         let ctx = Arc::new(ProxyContext {
             rate_limiter: Arc::new(AlwaysAllow),
-            balancer: Arc::new(PanicOnHeader("panic")),
+            balancer: Arc::new(PanicOnHeader(hashed_header_key(b"panic"))),
             pool,
             routes: Vec::new(),
             canary: Vec::new(),
