@@ -25,6 +25,7 @@ struct BackendState {
     /// through `ActiveConnGuard`, never directly, so a count can't leak on
     /// an early return from the caller.
     active_conns: AtomicUsize,
+    awaiting_first_probe: AtomicBool,
 }
 
 struct PoolState {
@@ -47,6 +48,7 @@ impl PoolState {
                 manually_drained: AtomicBool::new(false),
                 outlier_ejected: AtomicBool::new(false),
                 active_conns: AtomicUsize::new(0),
+                awaiting_first_probe: AtomicBool::new(false),
             });
             order.push(id.clone());
             ordered.push(Arc::clone(&state));
@@ -93,7 +95,22 @@ impl BackendPool {
     pub fn set_active_healthy(&self, id: &BackendId, healthy: bool) {
         if let Some(s) = self.inner.load().states.get(id) {
             s.active_healthy.store(healthy, Ordering::SeqCst);
+            s.awaiting_first_probe.store(false, Ordering::SeqCst);
         }
+    }
+
+    pub fn mark_awaiting_first_probe(&self, id: &BackendId) {
+        if let Some(s) = self.inner.load().states.get(id) {
+            s.awaiting_first_probe.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub fn is_awaiting_first_probe(&self, id: &BackendId) -> bool {
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .is_some_and(|s| s.awaiting_first_probe.load(Ordering::SeqCst))
     }
 
     pub fn set_circuit_open(&self, id: &BackendId, open: bool) {
@@ -200,30 +217,41 @@ impl BackendPool {
     }
 
     pub fn is_eligible(&self, id: &BackendId) -> bool {
-        self.inner
-            .load()
-            .states
-            .get(id)
-            .is_some_and(|s| state_is_eligible(s))
+        let snapshot = self.inner.load();
+        let Some(s) = snapshot.states.get(id) else {
+            return false;
+        };
+        if !passes_flags(s) {
+            return false;
+        }
+        !s.awaiting_first_probe.load(Ordering::SeqCst)
+            || !snapshot.ordered.iter().any(|other| is_confirmed(other))
     }
 
     pub fn eligible_backends(&self) -> Vec<BackendId> {
-        self.inner
-            .load()
-            .ordered
-            .iter()
-            .filter(|s| state_is_eligible(s))
-            .map(|s| s.backend.id.clone())
-            .collect()
+        self.eligible_map(|s| s.backend.id.clone())
     }
 
     pub fn eligible_with_weights(&self) -> Vec<(BackendId, u32)> {
-        self.inner
-            .load()
+        self.eligible_map(|s| (s.backend.id.clone(), s.backend.weight))
+    }
+
+    fn eligible_map<R>(&self, f: impl Fn(&BackendState) -> R) -> Vec<R> {
+        let snapshot = self.inner.load();
+        let confirmed: Vec<R> = snapshot
             .ordered
             .iter()
-            .filter(|s| state_is_eligible(s))
-            .map(|s| (s.backend.id.clone(), s.backend.weight))
+            .filter(|s| is_confirmed(s))
+            .map(|s| f(s))
+            .collect();
+        if !confirmed.is_empty() {
+            return confirmed;
+        }
+        snapshot
+            .ordered
+            .iter()
+            .filter(|s| passes_flags(s))
+            .map(|s| f(s))
             .collect()
     }
 
@@ -280,6 +308,9 @@ impl BackendPool {
                     // A persisting backend's in-flight work didn't go
                     // anywhere just because the pool was refreshed.
                     active_conns: AtomicUsize::new(existing.active_conns.load(Ordering::SeqCst)),
+                    awaiting_first_probe: AtomicBool::new(
+                        existing.awaiting_first_probe.load(Ordering::SeqCst),
+                    ),
                 }),
                 None => Arc::new(BackendState {
                     backend: b,
@@ -288,6 +319,7 @@ impl BackendPool {
                     manually_drained: AtomicBool::new(false),
                     outlier_ejected: AtomicBool::new(false),
                     active_conns: AtomicUsize::new(0),
+                    awaiting_first_probe: AtomicBool::new(true),
                 }),
             };
             ordered.push(Arc::clone(&state));
@@ -302,11 +334,15 @@ impl BackendPool {
     }
 }
 
-fn state_is_eligible(s: &BackendState) -> bool {
+fn passes_flags(s: &BackendState) -> bool {
     s.active_healthy.load(Ordering::SeqCst)
         && !s.circuit_open.load(Ordering::SeqCst)
         && !s.manually_drained.load(Ordering::SeqCst)
         && !s.outlier_ejected.load(Ordering::SeqCst)
+}
+
+fn is_confirmed(s: &BackendState) -> bool {
+    passes_flags(s) && !s.awaiting_first_probe.load(Ordering::SeqCst)
 }
 
 fn resolved_set_unchanged(previous: &PoolState, backends: &[Backend]) -> bool {
@@ -741,5 +777,89 @@ mod tests {
         assert_eq!(pool.active_count(&BackendId::new("ghost")), 0);
         // Must not panic, matching every other per-backend accessor here.
         let _guard = pool.track_active(&BackendId::new("ghost"));
+    }
+
+    fn backend(id: &str) -> Backend {
+        Backend::new(id, "127.0.0.1:9000".parse().unwrap(), 1, None)
+    }
+
+    #[test]
+    fn a_resolved_backend_waits_for_its_first_probe_while_a_confirmed_backend_exists() {
+        let pool = pool_of(&["a"]);
+        let b = BackendId::new("b");
+        pool.apply_resolved(vec![backend("a"), backend("b")]);
+
+        assert!(pool.is_awaiting_first_probe(&b));
+        assert!(!pool.is_eligible(&b));
+        assert_eq!(pool.eligible_backends(), vec![BackendId::new("a")]);
+        assert_eq!(pool.eligible_with_weights(), vec![(BackendId::new("a"), 1)]);
+
+        pool.set_active_healthy(&b, true);
+        assert!(!pool.is_awaiting_first_probe(&b));
+        assert!(pool.is_eligible(&b));
+        assert_eq!(
+            pool.eligible_backends(),
+            vec![BackendId::new("a"), BackendId::new("b")]
+        );
+    }
+
+    #[test]
+    fn a_failed_first_probe_keeps_a_resolved_backend_out_of_rotation() {
+        let pool = pool_of(&["a"]);
+        let b = BackendId::new("b");
+        pool.apply_resolved(vec![backend("a"), backend("b")]);
+        pool.set_active_healthy(&b, false);
+        assert!(!pool.is_awaiting_first_probe(&b));
+        assert!(!pool.is_eligible(&b));
+        assert_eq!(pool.eligible_backends(), vec![BackendId::new("a")]);
+    }
+
+    #[test]
+    fn awaiting_backends_serve_when_no_confirmed_backend_exists() {
+        let pool = BackendPool::new(Vec::new());
+        pool.apply_resolved(vec![backend("a"), backend("b")]);
+        assert!(pool.is_awaiting_first_probe(&BackendId::new("a")));
+        assert!(pool.is_eligible(&BackendId::new("a")));
+        assert_eq!(
+            pool.eligible_backends(),
+            vec![BackendId::new("a"), BackendId::new("b")]
+        );
+    }
+
+    #[test]
+    fn awaiting_backends_take_over_when_the_last_confirmed_backend_fails() {
+        let pool = pool_of(&["a"]);
+        pool.apply_resolved(vec![backend("a"), backend("b")]);
+        pool.set_active_healthy(&BackendId::new("a"), false);
+        assert_eq!(pool.eligible_backends(), vec![BackendId::new("b")]);
+        assert!(pool.is_eligible(&BackendId::new("b")));
+    }
+
+    #[test]
+    fn an_awaiting_backend_that_is_otherwise_excluded_is_never_a_fallback() {
+        let pool = BackendPool::new(Vec::new());
+        pool.apply_resolved(vec![backend("a")]);
+        pool.set_manually_drained(&BackendId::new("a"), true);
+        assert!(pool.eligible_backends().is_empty());
+        assert!(!pool.is_eligible(&BackendId::new("a")));
+    }
+
+    #[test]
+    fn the_awaiting_state_survives_a_later_resolution_until_probed() {
+        let pool = pool_of(&["a"]);
+        pool.apply_resolved(vec![backend("a"), backend("b")]);
+        pool.apply_resolved(vec![backend("a"), backend("b"), backend("c")]);
+        assert!(pool.is_awaiting_first_probe(&BackendId::new("b")));
+        assert!(pool.is_awaiting_first_probe(&BackendId::new("c")));
+        assert!(!pool.is_awaiting_first_probe(&BackendId::new("a")));
+    }
+
+    #[test]
+    fn constructed_backends_start_confirmed_and_can_be_marked_awaiting() {
+        let pool = pool_of(&["a", "b"]);
+        assert!(!pool.is_awaiting_first_probe(&BackendId::new("a")));
+        pool.mark_awaiting_first_probe(&BackendId::new("b"));
+        assert!(pool.is_awaiting_first_probe(&BackendId::new("b")));
+        assert_eq!(pool.eligible_backends(), vec![BackendId::new("a")]);
     }
 }

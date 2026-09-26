@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod backend_map;
 pub mod balancer;
 pub mod clock;
 pub mod cluster;
@@ -13,6 +14,7 @@ pub mod resolve;
 pub mod transport;
 
 pub use backend::{Backend, BackendId};
+pub use backend_map::BackendMap;
 pub use balancer::LoadBalancer;
 #[cfg(feature = "test-util")]
 pub use clock::test_util;
