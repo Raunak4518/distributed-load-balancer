@@ -28,7 +28,7 @@ opentelemetry-http = "0.30"
 # to need no ambient Tokio runtime, unlike an async client (see its doc
 # comment for why that matters: the batch span processor drives its exporter
 # from its own dedicated OS thread, not a Tokio task).
-opentelemetry-otlp = { version = "0.30", default-features = false, features = [
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "http-proto",
 ] }
 async-trait = "0.1"
