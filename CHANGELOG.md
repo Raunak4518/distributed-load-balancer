@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Updated rustls to 0.23.45** for RUSTSEC-2026-0285, in which TLS 1.3
+  handshake messages were accepted across encryption-level boundaries. The
+  edge TLS termination path was affected.
+- **`max_request_body_bytes` did not bound memory.** The whole request body
+  was buffered before its size was checked, so a client could make the proxy
+  allocate far more than the limit. A declared `Content-Length` over the
+  limit is now refused before reading, and other bodies are read through a
+  counting limiter that stops as soon as the limit is passed.
 - **The response cache could share private responses.** `Cache-Control`
   directives were read left to right and the first `max-age` ended the scan,
   so `max-age=600, private` or `max-age=600, no-store` was cached and served
@@ -40,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Finished connection tasks were kept until shutdown.** Each listener's
+  connection set was only drained at shutdown, so its bookkeeping grew with
+  every connection ever accepted. Finished tasks are now released as new
+  connections arrive.
+- **A backend could stall a response body indefinitely.**
+  `forward_timeout_ms` only covered the wait for response headers. The new
+  `response_body_idle_timeout_ms` (default 60s) bounds every gap in a
+  streamed response body; a stalled response is aborted rather than
+  presented as complete, and counted under
+  `lb_request_timeouts_total{phase="upstream_body"}`.
 - **Five metrics were registered but never updated**, and two more stayed
   flat for HTTP listeners. `lb_cluster_auth_failures_total`,
   `lb_cluster_peer_sync_total`, `lb_cluster_tracked_keys`,

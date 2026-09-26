@@ -65,7 +65,7 @@ write_timeout_ms = 30000
 
 ## Request body size limit
 
-`max_request_body_bytes` (default `1048576`, i.e. 1 MiB) bounds how much of a request body the proxy will buffer. A body exceeding this limit gets `413 Payload Too Large` ([`service.rs`](../crates/lb-proxy/src/service.rs)), and the request is never forwarded. This is enforced independently of the body read timeout above — a body can be rejected for being too large well before it would have timed out.
+`max_request_body_bytes` (default `1048576`, i.e. 1 MiB) bounds how much of a request body the proxy will buffer, and the bound holds while reading: a request declaring a larger `Content-Length` is refused with `413 Payload Too Large` before any of its body is read, and a body without a declared length is read through a counting limiter that stops as soon as the limit is passed, so memory per request never exceeds the limit plus one frame. The request is never forwarded. This is enforced independently of the body read timeout below — a body can be rejected for being too large well before it would have timed out.
 
 ```toml
 [[listeners]]

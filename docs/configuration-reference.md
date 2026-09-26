@@ -56,6 +56,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `max_request_body_bytes` | integer | `1048576` (1 MiB) | HTTP-only | Request body size cap. |
 | `write_timeout_ms` | integer | `30000` | must be > 0; HTTP-only (must be unset on TCP) | Max time a client may take to read the response before the connection is dropped. |
 | `websocket_idle_timeout_ms` | integer | `300000` (300s) | HTTP-only | Idle timeout applied to a connection after it upgrades (e.g. WebSocket); request-shaped timeouts stop applying once the upgrade completes. |
+| `response_body_idle_timeout_ms` | integer | `60000` (60s) | must be > 0; HTTP-only | Longest gap allowed between chunks of a streamed backend response body. `forward_timeout_ms` bounds the wait for response headers only; this bounds a backend that sends headers and then stalls or trickles the body. When it fires, the client's response is aborted (never presented as complete) and `lb_request_timeouts_total{phase="upstream_body"}` increments. |
 | `compression` | boolean | `false` | HTTP-only (must be `false`/unset on TCP) | Enables negotiated gzip/brotli/deflate/zstd response compression. |
 | `connect_timeout_ms` | integer | `2000` | TCP-only (must be unset on HTTP) | Max time to establish the backend TCP connection. |
 | `idle_timeout_ms` | integer | `300000` (300s) | TCP-only (must be unset on HTTP) | Max time a TCP session may sit idle before being closed. |
@@ -379,7 +380,7 @@ Absent by default: spans are still created internally but nothing exports them.
 - `retry_budget.rate_per_sec`/`.burst` (if set) must be positive.
 - `health_check.flap_backoff_multiplier` must be ≥ 1.0; `unhealthy_latency_ms`/`unhealthy_request_count` must be positive if set; `outlier_detection` (if set) requires `min_volume > 0`, `min_hosts >= 2`, `stddev_factor > 0.0`; `max_ejected_fraction` (if set) must be within `[0.0, 1.0]`.
 - `max_connections`/`max_connections_per_ip` must both be positive, and the per-IP cap must not exceed the global cap.
-- `header_read_timeout_ms`, `body_read_timeout_ms`, `write_timeout_ms`, and `proxy_protocol_timeout_ms` must all be positive.
+- `header_read_timeout_ms`, `body_read_timeout_ms`, `write_timeout_ms`, `response_body_idle_timeout_ms`, and `proxy_protocol_timeout_ms` must all be positive.
 
 **HTTP listeners only**
 - `health_check.path` is required.
@@ -389,7 +390,7 @@ Absent by default: spans are still created internally but nothing exports them.
 
 **TCP listeners only**
 - `health_check.path` must be unset (nothing to probe with a path).
-- `forward_timeout_ms`, `max_request_body_bytes`, `write_timeout_ms`, `websocket_idle_timeout_ms`, `compression`, `routes`, `canary`, `sticky`, `cache`, `waf`, and `retry_budget` must all be unset/empty/false — each is HTTP-only.
+- `forward_timeout_ms`, `max_request_body_bytes`, `write_timeout_ms`, `websocket_idle_timeout_ms`, `response_body_idle_timeout_ms`, `compression`, `routes`, `canary`, `sticky`, `cache`, `waf`, and `retry_budget` must all be unset/empty/false — each is HTTP-only.
 - `rate_limit.key` must not be `"header:..."` — a TCP listener has no headers to read.
 
 **`backend_tls` (either protocol, when set)**
@@ -416,7 +417,7 @@ Sending `SIGHUP` (Unix only — there is no equivalent signal path on Windows) r
 - Adding or removing a listener, or changing a listener's `protocol` or `listen` address — new bind/unbind lifecycle is not supported live.
 - On any listener whose identity is unchanged, a change to: `tls`, `backend_tls`, `http2`, `max_connections`, `max_connections_per_ip`, `header_read_timeout_ms`, `write_timeout_ms`, `compression`, `proxy_protocol`, `proxy_protocol_timeout_ms`, or `client_tcp_keepalive`. These live on the listener's accept-loop runtime, not the swappable per-request context, so changing any of them refuses the entire reload with a message naming the listener.
 
-**Applies live (no restart) once the fields above are unchanged:** everything else on a listener — `backends`, `dns_discovery`, `health_check` (including `outlier_detection`), `rate_limit`, `load_balancing`, `routes`, `canary`, `sticky`, `cache`, `waf`, `retry_budget`, `forward_timeout_ms`, `max_request_body_bytes`, `body_read_timeout_ms`, `websocket_idle_timeout_ms`, `connect_timeout_ms`, `idle_timeout_ms`, and `backend_tcp_keepalive`. A changed listener is rebuilt (new backend pool, new circuit breakers only for genuinely new backends, new compiled routes/canary pools) and atomically swapped in; live state that survives an unrelated field's reload includes manually-drained backends and open circuit breakers — only listeners whose config actually differs are rebuilt at all. TLS certificate *content* (the files on disk) reloads independently on its own periodic schedule (`reload_interval_secs`), unrelated to SIGHUP.
+**Applies live (no restart) once the fields above are unchanged:** everything else on a listener — `backends`, `dns_discovery`, `health_check` (including `outlier_detection`), `rate_limit`, `load_balancing`, `routes`, `canary`, `sticky`, `cache`, `waf`, `retry_budget`, `forward_timeout_ms`, `max_request_body_bytes`, `body_read_timeout_ms`, `websocket_idle_timeout_ms`, `response_body_idle_timeout_ms`, `connect_timeout_ms`, `idle_timeout_ms`, and `backend_tcp_keepalive`. A changed listener is rebuilt (new backend pool, new circuit breakers only for genuinely new backends, new compiled routes/canary pools) and atomically swapped in; live state that survives an unrelated field's reload includes manually-drained backends and open circuit breakers — only listeners whose config actually differs are rebuilt at all. TLS certificate *content* (the files on disk) reloads independently on its own periodic schedule (`reload_interval_secs`), unrelated to SIGHUP.
 
 A reload that fails to parse, fails validation, or touches a restart-only field changes nothing and logs the reason; the process keeps serving the previous config.
 

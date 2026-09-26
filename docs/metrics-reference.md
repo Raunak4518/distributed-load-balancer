@@ -61,9 +61,9 @@ Incremented in `serve_listener` in [`lib.rs`](../crates/lb-server/src/lib.rs): `
 
 ### `lb_request_timeouts_total` — counter
 
-Labels: `listener`, `phase` (`header` | `body`).
+Labels: `listener`, `phase` (`header` | `body` | `upstream_body`).
 
-`phase="body"` is incremented in `lb_proxy::service::handle_inner` when reading the request body exceeds `body_read_timeout` (the client receives `408 Request Timeout`). `phase="header"` is incremented when a connection is closed because the client did not send its request head in time: for HTTP/1.1 when hyper's `header_read_timeout` fires, and for HTTP/2 when `FirstByteDeadline` expires before the client's first byte. A write-side stall (`write_timeout_ms`) is not counted here.
+`phase="body"` is incremented in `lb_proxy::service::handle_inner` when reading the request body exceeds `body_read_timeout` (the client receives `408 Request Timeout`). `phase="header"` is incremented when a connection is closed because the client did not send its request head in time: for HTTP/1.1 when hyper's `header_read_timeout` fires, and for HTTP/2 when `FirstByteDeadline` expires before the client's first byte. A write-side stall (`write_timeout_ms`) is not counted here. `phase="upstream_body"` is incremented when a backend's streamed response body goes longer than `response_body_idle_timeout_ms` without sending anything, and the client's response is aborted.
 
 ## Backends, health, and circuit breaking
 
