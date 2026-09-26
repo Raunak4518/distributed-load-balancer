@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -28,6 +29,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Bind privately. This surface exposes internal topology (backend names,
     /// health, traffic volumes) and must never face the public internet.
@@ -79,6 +81,7 @@ impl AdminConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TracingConfig {
     /// Where spans are exported to, over OTLP/HTTP. A local collector
     /// (`http://localhost:4318`) is the common case; a plain `http://`
@@ -97,6 +100,7 @@ fn default_sample_ratio() -> f64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub format: LogFormat,
@@ -131,6 +135,7 @@ pub enum LogFormat {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     pub node_id: String,
     pub listen: SocketAddr,
@@ -165,6 +170,7 @@ pub struct ClusterConfig {
 /// Alternative Name, and every peer's `ca_file` must point at the same
 /// signing CA.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerTlsConfig {
     pub cert_file: PathBuf,
     pub key_file: PathBuf,
@@ -223,6 +229,7 @@ impl ClusterConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_drain_timeout_ms")]
     pub drain_timeout_ms: u64,
@@ -248,6 +255,7 @@ pub enum Protocol {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListenerConfig {
     pub name: String,
     pub protocol: Protocol,
@@ -396,6 +404,7 @@ pub struct ListenerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetryBudgetConfig {
     pub rate_per_sec: f64,
     pub burst: u32,
@@ -403,6 +412,7 @@ pub struct RetryBudgetConfig {
 
 /// See `ListenerConfig::waf`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WafConfig {
     /// `block` refuses the request outright (`403`); `log` records the
     /// match (metric + a warning log line) and forwards it exactly as if
@@ -426,6 +436,7 @@ pub enum WafMode {
 
 /// See `ListenerConfig::cache`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheConfig {
     /// A single response larger than this (by its `Content-Length`) is
     /// never cached -- the response is still served, just not stored.
@@ -457,6 +468,7 @@ fn default_cache_default_ttl_secs() -> u64 {
 
 /// See `ListenerConfig::client_tcp_keepalive`/`backend_tcp_keepalive`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpKeepaliveConfig {
     /// How long the connection may sit idle before the first probe
     /// (`TCP_KEEPIDLE`/`TCP_KEEPALIVE`).
@@ -485,6 +497,7 @@ fn default_tcp_keepalive_retries() -> u32 {
 
 /// See `ListenerConfig::sticky`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StickyConfig {
     /// The cookie's value is the raw backend id, unsigned: ids are
     /// operator-chosen, already exposed unauthenticated via the admin
@@ -511,6 +524,7 @@ fn default_sticky_cookie_name() -> String {
 /// backends and which load-balancing strategy/health-check apply. Widening
 /// that is possible later; it is not what was found missing.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// Matched as a path *segment* prefix, not a bare `starts_with`:
     /// `"/api"` matches `/api` and `/api/anything`, but not `/apiary` --
@@ -537,6 +551,7 @@ pub struct RouteConfig {
 /// *absolute* share of the listener's total request volume, orthogonal to
 /// whichever `load_balancing.strategy` a canary pool uses internally.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CanaryPoolConfig {
     pub percent: u8,
     #[serde(default)]
@@ -619,6 +634,7 @@ impl ListenerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub certificates: Vec<CertificateConfig>,
     pub handshake_timeout_ms: Option<u64>,
@@ -651,6 +667,7 @@ impl TlsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertificateConfig {
     /// Appears in metrics. Operator-chosen, never client-controlled.
     pub name: String,
@@ -663,6 +680,7 @@ pub struct CertificateConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AcmeCertConfig {
     pub directory_url: String,
     pub contact_email: String,
@@ -709,6 +727,7 @@ impl TryFrom<String> for TlsVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendTlsConfig {
     /// Omit for the system trust store. Internal PKI is the common case on
     /// this path, which is why the file form exists at all.
@@ -718,6 +737,7 @@ pub struct BackendTlsConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     pub id: String,
     pub address: SocketAddr,
@@ -735,6 +755,7 @@ fn default_weight() -> u32 {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheckConfig {
     /// Required for HTTP listeners, forbidden for TCP listeners (there is
     /// nothing to GET on a Postgres port).
@@ -786,6 +807,7 @@ pub struct HealthCheckConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutlierDetectionConfig {
     /// A backend needs at least this many recorded outcomes since the last
     /// evaluation round to be judged at all that round.
@@ -830,6 +852,7 @@ fn default_flap_streak_reset_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RateLimitConfig {
     pub key: RateLimitKeySource,
     pub rate_per_sec: f64,
@@ -869,6 +892,7 @@ impl TryFrom<String> for RateLimitKeySource {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoadBalancingConfig {
     pub strategy: LoadBalancingStrategy,
 }
@@ -1559,6 +1583,48 @@ mod tests {
           [listeners.load_balancing]
           strategy = "round_robin"
     "#;
+
+    #[test]
+    fn a_misspelled_key_anywhere_is_rejected_and_named() {
+        let cases = [
+            VALID.replacen(
+                "[[listeners]]",
+                "stray_top_level = 1
+        [[listeners]]",
+                1,
+            ),
+            VALID.replacen(
+                "listen = \"0.0.0.0:8080\"",
+                "listen = \"0.0.0.0:8080\"
+        max_conections = 5",
+                1,
+            ),
+            VALID.replacen(
+                "interval_ms = 2000",
+                "interval_ms = 2000
+          failure_treshold = 9",
+                1,
+            ),
+            VALID.replacen(
+                "strategy = \"round_robin\"",
+                "strategy = \"round_robin\"
+          stratgy = \"x\"",
+                1,
+            ),
+        ];
+        for (text, key) in cases.iter().zip([
+            "stray_top_level",
+            "max_conections",
+            "failure_treshold",
+            "stratgy",
+        ]) {
+            let err = Config::parse(text).expect_err("an unknown key must be rejected");
+            assert!(
+                format!("{err}").contains(key),
+                "error should name `{key}`, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn parses_mixed_protocol_config() {

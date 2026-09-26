@@ -278,7 +278,6 @@ Known limitations, each documented on the linked page:
 
 - The proxy does not add `X-Forwarded-For` / `Forwarded` headers; backends see the load balancer's address ([HTTP features](docs/http-features.md#x-forwarded-for--forwarded)).
 - The response cache does not revalidate (`ETag`, conditional requests) and relies on the backend's `Cache-Control`/`Vary` to mark cookie-personalized responses ([HTTP features](docs/http-features.md#personalized-content-and-limitations)).
-- Unknown configuration keys are ignored rather than rejected ([configuration reference](docs/configuration-reference.md#top-level-structure)).
 - `SIGHUP` reload is Unix-only, and the admin listener has no TLS of its own ([operations](docs/operations.md)).
 - ACME issues single-domain certificates over HTTP-01 only ([TLS](docs/tls.md#acme-automatic-certificates)).
 

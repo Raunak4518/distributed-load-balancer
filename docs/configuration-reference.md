@@ -35,7 +35,7 @@ Field names below are exact TOML keys, in the order their struct declares them. 
 [tracing]
 ```
 
-`listeners` is the only field with no default at the top level — at least one entry is required. `cluster`, `admin`, and `tracing` are entirely absent by default: no cluster coordination, no admin/metrics listener, no trace export. Unknown keys anywhere in the file are silently ignored (no section derives `deny_unknown_fields`), so a typo'd key does not fail startup — verify a new field took effect rather than trusting that it parsed.
+`listeners` is the only field with no default at the top level — at least one entry is required. `cluster`, `admin`, and `tracing` are entirely absent by default: no cluster coordination, no admin/metrics listener, no trace export. An unknown key anywhere in the file is a startup error that names the key, so a typo such as `max_conections` is caught by `lb-server --check-config` rather than silently falling back to the default.
 
 ## `[server]`
 

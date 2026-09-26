@@ -2,6 +2,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsDiscoveryConfig {
     pub name: String,
     pub port: u16,

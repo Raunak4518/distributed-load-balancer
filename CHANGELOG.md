@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Unknown configuration keys are now rejected.** A misspelled key such as
+  `max_conections` was silently ignored and its default applied; it is now a
+  startup error naming the key.
 - `health_check.max_ejected_fraction` could be exceeded under concurrency.
   Each ejection counted, decided and stored separately, so circuit trips on
   several request threads at once (the typical shape of a correlated
