@@ -268,10 +268,15 @@ async fn serve_listener(
         };
 
         // Must follow accept(): the peer address is unknowable before it.
-        let Some(ip_guard) = runtime.limits().per_ip.try_acquire(peer.ip()) else {
-            runtime.metrics().connections_rejected_per_ip.inc();
-            tracing::debug!(listener = %runtime.name(), peer = %peer, "per-IP connection cap reached");
-            continue; // `stream` drops here, closing it
+        let ip_guard = if runtime.proxy_protocol() {
+            None
+        } else {
+            let Some(ip_guard) = runtime.limits().per_ip.try_acquire(peer.ip()) else {
+                runtime.metrics().connections_rejected_per_ip.inc();
+                tracing::debug!(listener = %runtime.name(), peer = %peer, "per-IP connection cap reached");
+                continue; // `stream` drops here, closing it
+            };
+            Some(ip_guard)
         };
 
         spawn_connection(&runtime, &mut connections, stream, peer, permit, ip_guard);
@@ -306,13 +311,12 @@ fn spawn_connection(
     stream: TcpStream,
     peer: SocketAddr,
     permit: tokio::sync::OwnedSemaphorePermit,
-    ip_guard: crate::limits::IpGuard,
+    ip_guard: Option<crate::limits::IpGuard>,
 ) {
     let runtime = Arc::clone(runtime);
     connections.spawn(async move {
         // Held for the life of the connection, handshake included.
         let _permit = permit;
-        let _ip_guard = ip_guard;
 
         let mut stream = stream;
         let mut peer = peer;
@@ -348,6 +352,17 @@ fn spawn_connection(
                 }
             }
         }
+        let _ip_guard = match ip_guard {
+            Some(guard) => guard,
+            None => match runtime.limits().per_ip.try_acquire(peer.ip()) {
+                Some(guard) => guard,
+                None => {
+                    runtime.metrics().connections_rejected_per_ip.inc();
+                    tracing::debug!(listener = %runtime.name(), peer = %peer, "per-IP connection cap reached");
+                    return;
+                }
+            },
+        };
 
         let Some(acceptor) = runtime.tls() else {
             // No TLS means no ALPN, and this node is the edge: prior-knowledge

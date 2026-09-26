@@ -523,3 +523,87 @@ async fn valid_v2_header_followed_by_garbage_payload_does_not_hang() {
     let _response = send_then_close_and_read_response(listen, &payload).await;
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
+
+fn per_ip_cap_config(listen: SocketAddr, backend: SocketAddr) -> String {
+    format!(
+        r#"
+[[listeners]]
+name = "web"
+protocol = "http"
+listen = "{listen}"
+proxy_protocol = true
+proxy_protocol_timeout_ms = 200
+max_connections_per_ip = 1
+
+  [[listeners.backends]]
+  id = "b1"
+  address = "{backend}"
+
+  [listeners.health_check]
+  path = "/health"
+  interval_ms = 500
+  timeout_ms = 200
+  failure_threshold = 2
+  cooldown_ms = 300
+
+  [listeners.rate_limit]
+  key = "source_ip"
+  rate_per_sec = 1000
+  burst = 1000
+
+  [listeners.load_balancing]
+  strategy = "round_robin"
+"#
+    )
+}
+
+#[tokio::test]
+async fn the_per_ip_cap_counts_announced_clients_not_the_front_end() {
+    let (backend, _count) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let config = Config::parse(&per_ip_cap_config(listen, backend)).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut held = TcpStream::connect(listen).await.unwrap();
+    held.write_all(b"PROXY TCP4 10.1.1.1 10.0.0.99 51234 443\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut first = vec![0u8; 1024];
+    let n = tokio::time::timeout(Duration::from_secs(2), held.read(&mut first))
+        .await
+        .expect("the held connection must be served")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&first[..n]).starts_with("HTTP/1.1 200"),
+        "the held connection must be admitted and served before the cap is tested"
+    );
+
+    assert_eq!(
+        get_via_proxy_protocol(listen, "10.2.2.2").await,
+        StatusCode::OK,
+        "a different client behind the same front-end must get its own per-IP slot"
+    );
+    let mut refused = TcpStream::connect(listen).await.unwrap();
+    refused
+        .write_all(
+            b"PROXY TCP4 10.1.1.1 10.0.0.99 51235 443
+GET / HTTP/1.1
+Host: x
+Connection: close
+
+",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let read = refused.read_to_end(&mut response).await;
+    assert!(
+        read.is_err() || response.is_empty(),
+        "a second concurrent connection from the same announced client must be refused, got: {}",
+        String::from_utf8_lossy(&response)
+    );
+    drop(held);
+}

@@ -18,7 +18,7 @@ Because saturated connections are refused by the kernel rather than by this proc
 
 Rejections here increment `lb_connections_rejected_total{reason="max_per_ip"}`.
 
-> **Behind a proxy:** this check runs before any [PROXY protocol](#proxy-protocol) header is read, so on a listener with `proxy_protocol = true` it applies to the front-end's address, not the real client's. Every connection relayed by one ELB or CDN node counts against that node's single per-IP budget. Size `max_connections_per_ip` for the connection count of a front-end node on such listeners, and rely on `[listeners.rate_limit]` with `key = "source_ip"` — which does see the PROXY-protocol client address — for per-client limits.
+> **Behind a proxy:** on a listener with `proxy_protocol = true`, the per-IP slot is taken after the [PROXY protocol](#proxy-protocol) header is read, keyed on the real client address it announces, so every client behind one ELB or CDN node gets its own budget. Until the header arrives (at most `proxy_protocol_timeout_ms`), the connection is bounded by the global `max_connections` cap only.
 
 ```toml
 [[listeners]]

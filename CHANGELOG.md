@@ -40,6 +40,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A retry could go back to the backend that just failed.** The retry loop
+  re-ran the strategy with no exclusion, so under `consistent_hash` (and
+  often `least_connections`) it retried the same failing backend. Retries now
+  exclude it; each strategy picks among the remaining backends with its own
+  logic. A single-backend pool still retries.
+- **One failed health probe removed a backend.** Active checks now use
+  `health_check.unhealthy_threshold` (default 3) and `healthy_threshold`
+  (default 2), so one slow or dropped probe no longer flaps a backend. A
+  backend awaiting its first probe is still decided by that probe alone.
+- **Behind a PROXY-protocol front end, `max_connections_per_ip` capped the
+  front end rather than each client.** The per-IP slot was taken before the
+  PROXY header was read; it is now taken after, keyed on the announced
+  client address.
 - **Unknown configuration keys are now rejected.** A misspelled key such as
   `max_conections` was silently ignored and its default applied; it is now a
   startup error naming the key.
