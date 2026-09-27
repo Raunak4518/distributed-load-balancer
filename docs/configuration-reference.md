@@ -42,6 +42,18 @@ Field names below are exact TOML keys, in the order their struct declares them. 
 | Field | Type | Default | Validation | Meaning |
 |---|---|---|---|---|
 | `drain_timeout_ms` | integer | `10000` | none | Maximum time to wait for in-flight requests to finish during graceful shutdown before connections are forcefully aborted. |
+| `overload` | table | none | see below | Overload manager. Absent: no load shedding. |
+
+### `[server.overload]`
+
+Samples resource pressure every `check_interval_ms` and sheds load in two stages. Pressure is the highest of: each listener's connection-slot use (`max_connections`), resident memory against `max_memory_bytes` (Linux, only when set), and open file descriptors against the process limit (Linux). A level is entered as soon as pressure reaches its threshold and left only once pressure is 0.05 below it, so the level does not flap.
+
+| Field | Type | Default | Validation | Meaning |
+|---|---|---|---|---|
+| `shed_keepalive_at` | float | `0.8` | 0 < value < `reject_at` | Level 1: HTTP/1.1 responses carry `Connection: close`, so idle keep-alive connections are released. |
+| `reject_at` | float | `0.95` | value ≤ 1.0 | Level 2: new HTTP requests get `503` with `Retry-After: 1`, TCP listeners drop new connections, and `/ready` reports `503`. |
+| `max_memory_bytes` | integer | none | must be > 0 | Memory budget for the process; without it memory is not a pressure source. |
+| `check_interval_ms` | integer | `1000` | must be > 0 | Sampling interval. |
 
 ## `[[listeners]]`
 

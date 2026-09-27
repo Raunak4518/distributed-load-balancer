@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Overload manager: `[server.overload]`.** Samples connection-slot use,
+  memory and file descriptors, then sheds in two stages: `Connection: close`
+  on HTTP/1.1 responses, then `503` + `Retry-After` for new requests, dropped
+  TCP connections and a failing `/ready`. New metrics `lb_overload_level`,
+  `lb_overload_pressure_permille` and `lb_overload_rejected_total`.
 - **Per-backend in-flight limits: `[listeners.upstream_limits]`.** Caps
   concurrent requests per backend, with an optional bounded wait queue and
   queue timeout. A full backend hands the request to another one; slots are

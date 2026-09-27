@@ -53,6 +53,22 @@ Both are maintained for every listener. For an HTTP or HTTPS listener they are u
 
 ## Connections and timeouts (edge hardening)
 
+### `lb_overload_level` — gauge
+
+Current overload level from `[server.overload]`: `0` normal, `1` shedding keep-alive, `2` rejecting new work. Stays `0` when the overload manager is not configured.
+
+### `lb_overload_pressure_permille` — gauge
+
+Labels: `resource` (`connections` | `memory` | `file_descriptors`).
+
+Last sampled use of each resource as a fraction of its limit, in thousandths (`950` = 95%). `connections` is the busiest listener's share of its `max_connections`; `memory` appears only when `max_memory_bytes` is set, and `memory`/`file_descriptors` only on Linux.
+
+### `lb_overload_rejected_total` — counter
+
+Labels: `listener`.
+
+Requests answered `503` (HTTP) or connections dropped (TCP) because the overload level was `2`.
+
 ### `lb_connections_rejected_total` — counter
 
 Labels: `listener`, `reason` (`max_connections` | `max_per_ip` | `untrusted_proxy`).

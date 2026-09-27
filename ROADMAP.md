@@ -45,9 +45,7 @@ because every later phase builds on the guarantees of the earlier ones.
 
 ## Phase 1 — An elite proxy
 - [x] Per-backend in-flight request limit with a bounded wait queue, queue-time metric, overflow to another backend
-- [ ] Custom upstream connection pool: max connections per backend, max requests and lifetime per connection, warm-up
-- [ ] HTTP/2 upstream GOAWAY handling and connection draining
-- [ ] Overload manager: memory/FD/connection pressure → staged shedding levels
+- [x] Overload manager: memory/FD/connection pressure → staged shedding levels
 - [ ] Adaptive concurrency limit per backend (gradient-based)
 - [ ] Slow start / warm-up for recovered and newly added backends
 - [ ] Priority failover and backup pools; locality/zone-aware selection
@@ -63,6 +61,8 @@ because every later phase builds on the guarantees of the earlier ones.
 - [ ] Multi-worker accept with `SO_REUSEPORT`, per-worker counters
 - [ ] Socket tuning: backlog, `SO_RCVBUF`/`SO_SNDBUF`, `TCP_DEFER_ACCEPT`, `TCP_FASTOPEN`
 - [ ] Zero-copy L4 forwarding (`splice`) on Linux, benchmarked against the copy loop
+- [ ] Custom upstream connection pool: max connections per backend, max requests and lifetime per connection, warm-up
+- [ ] HTTP/2 upstream GOAWAY handling and connection draining
 
 ## Phase 2 — Modern protocols
 - [ ] gRPC: status-aware retries, deadlines, gRPC health checks, gRPC-Web
