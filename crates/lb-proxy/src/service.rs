@@ -538,6 +538,27 @@ fn build_outbound_request(
     )
 }
 
+fn normalize_host(req: &mut Request<Incoming>) -> Result<(), ()> {
+    let mut hosts = req.headers().get_all(header::HOST).iter();
+    let first = hosts.next();
+    if hosts.next().is_some() {
+        return Err(());
+    }
+    if let Some(value) = first {
+        let value = value.to_str().map_err(|_| ())?;
+        value.parse::<http::uri::Authority>().map_err(|_| ())?;
+    }
+    match req.uri().authority().cloned() {
+        Some(authority) => {
+            let value = HeaderValue::from_str(authority.as_str()).map_err(|_| ())?;
+            req.headers_mut().insert(header::HOST, value);
+        }
+        None if first.is_none() && req.version() == hyper::Version::HTTP_11 => return Err(()),
+        None => {}
+    }
+    Ok(())
+}
+
 fn deadline_exceeded(deadline: Option<tokio::time::Instant>) -> bool {
     deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
 }
@@ -714,6 +735,10 @@ where
     R: RateLimiter,
     C: Clock,
 {
+    let mut req = req;
+    if normalize_host(&mut req).is_err() {
+        return Ok(simple_response(StatusCode::BAD_REQUEST, "invalid host"));
+    }
     if ctx.overload.rejects_new_work() {
         ctx.metrics.overload_rejected.inc();
         let mut resp = simple_response(StatusCode::SERVICE_UNAVAILABLE, "overloaded");
@@ -887,7 +912,6 @@ where
         }
     }
 
-    let mut req = req;
     if let Some(forwarded) = &ctx.forwarded {
         let host = req
             .headers()
