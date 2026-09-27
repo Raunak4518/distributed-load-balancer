@@ -10,11 +10,14 @@ const NO_SAMPLE: u64 = u64::MAX;
 const ERROR_SMOOTHING: f64 = 0.1;
 const ERROR_PENALTY: f64 = 10.0;
 const DAMPING: f64 = 0.1;
+const ERROR_DECAY: Duration = Duration::from_secs(10);
 
 struct EwmaEntry {
     estimate_nanos: AtomicU64,
     last_update_nanos: AtomicU64,
     error_rate_bits: AtomicU64,
+    last_outcome_nanos: AtomicU64,
+    generation: AtomicU64,
     update_lock: Mutex<()>,
 }
 
@@ -24,12 +27,16 @@ impl EwmaEntry {
             estimate_nanos: AtomicU64::new(NO_SAMPLE),
             last_update_nanos: AtomicU64::new(0),
             error_rate_bits: AtomicU64::new(0f64.to_bits()),
+            last_outcome_nanos: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
             update_lock: Mutex::new(()),
         }
     }
 
-    fn error_rate(&self) -> f64 {
-        f64::from_bits(self.error_rate_bits.load(Ordering::Relaxed))
+    fn error_rate_at(&self, now_nanos: u64) -> f64 {
+        let stored = f64::from_bits(self.error_rate_bits.load(Ordering::Relaxed));
+        let elapsed = now_nanos.saturating_sub(self.last_outcome_nanos.load(Ordering::Relaxed));
+        stored * (-(elapsed as f64) / ERROR_DECAY.as_nanos() as f64).exp()
     }
 }
 
@@ -115,12 +122,33 @@ impl<C: Clock> PeakEwmaP2c<C> {
             .retain(|id, _| live.contains(id));
     }
 
+    fn now_nanos(&self) -> u64 {
+        self.clock
+            .now()
+            .saturating_duration_since(self.creation)
+            .as_nanos() as u64
+    }
+
     fn error_rate(&self, id: &BackendId) -> f64 {
+        let now = self.now_nanos();
         self.entries
             .read()
             .unwrap()
             .get(id)
-            .map_or(0.0, EwmaEntry::error_rate)
+            .map_or(0.0, |entry| entry.error_rate_at(now))
+    }
+
+    fn forget_history_if_it_became_eligible_again(&self, pool: &BackendPool, id: &BackendId) {
+        let generation = pool.eligibility_generation(id);
+        if let Some(entry) = self.entries.read().unwrap().get(id) {
+            if entry.generation.swap(generation, Ordering::Relaxed) != generation {
+                let _guard = entry.update_lock.lock().unwrap();
+                entry.estimate_nanos.store(NO_SAMPLE, Ordering::Relaxed);
+                entry
+                    .error_rate_bits
+                    .store(0f64.to_bits(), Ordering::Relaxed);
+            }
+        }
     }
 
     fn cost(&self, pool: &BackendPool, id: &BackendId) -> f64 {
@@ -180,6 +208,8 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
                 }
                 let a = &eligible[i];
                 let b = &eligible[j];
+                self.forget_history_if_it_became_eligible_again(pool, a);
+                self.forget_history_if_it_became_eligible_again(pool, b);
                 let winner = match (self.has_sample(a), self.has_sample(b)) {
                     (false, true) => a,
                     (true, false) => b,
@@ -211,13 +241,16 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
     }
 
     fn record_outcome(&self, id: &BackendId, success: bool) {
+        let now = self.now_nanos();
         self.with_entry(id, |entry| {
             let _guard = entry.update_lock.lock().unwrap();
             let failure = if success { 0.0 } else { 1.0 };
-            let rate = entry.error_rate() * (1.0 - ERROR_SMOOTHING) + failure * ERROR_SMOOTHING;
+            let rate =
+                entry.error_rate_at(now) * (1.0 - ERROR_SMOOTHING) + failure * ERROR_SMOOTHING;
             entry
                 .error_rate_bits
                 .store(rate.to_bits(), Ordering::Relaxed);
+            entry.last_outcome_nanos.store(now, Ordering::Relaxed);
         });
     }
 }
@@ -368,6 +401,48 @@ mod tests {
         assert!(
             flaky < 60,
             "a backend failing half its requests got {flaky}/400"
+        );
+    }
+
+    #[test]
+    fn a_backend_that_recovers_is_tried_again_despite_its_bad_history() {
+        let pool = pool_of(&["good", "recovered"]);
+        let lb = PeakEwmaP2c::new(FakeClock::new());
+        let recovered = BackendId::new("recovered");
+        lb.record_latency(&BackendId::new("good"), Duration::from_millis(1));
+        lb.record_latency(&recovered, Duration::from_secs(2));
+        for _ in 0..20 {
+            lb.record_outcome(&recovered, false);
+        }
+        assert_ne!(lb.pick(&pool, ""), Some(recovered.clone()));
+
+        pool.set_active_healthy(&recovered, false);
+        pool.set_active_healthy(&recovered, true);
+        assert_eq!(
+            lb.pick(&pool, ""),
+            Some(recovered),
+            "a backend that just became eligible again must be sampled afresh"
+        );
+    }
+
+    #[test]
+    fn an_error_penalty_fades_once_failures_stop() {
+        let pool = pool_of(&["flaky", "steady"]);
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::new(clock.clone());
+        for id in ["flaky", "steady"] {
+            lb.record_latency(&BackendId::new(id), Duration::from_millis(10));
+        }
+        for _ in 0..40 {
+            lb.record_outcome(&BackendId::new("flaky"), false);
+        }
+        clock.advance(Duration::from_secs(60));
+        let flaky = (0..400)
+            .filter(|_| lb.pick(&pool, "") == Some(BackendId::new("flaky")))
+            .count();
+        assert!(
+            flaky > 120,
+            "a minute after its last failure the penalty should have faded, got {flaky}/400"
         );
     }
 

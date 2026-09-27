@@ -28,6 +28,7 @@ struct BackendState {
     active_conns: AtomicUsize,
     awaiting_first_probe: AtomicBool,
     became_eligible_nanos: AtomicU64,
+    eligibility_generation: AtomicU64,
 }
 
 struct PoolState {
@@ -75,6 +76,7 @@ impl PoolState {
                 active_conns: AtomicUsize::new(0),
                 awaiting_first_probe: AtomicBool::new(false),
                 became_eligible_nanos: AtomicU64::new(0),
+                eligibility_generation: AtomicU64::new(0),
             });
             order.push(id.clone());
             ordered.push(Arc::clone(&state));
@@ -141,7 +143,16 @@ impl BackendPool {
         if !before && is_confirmed(s) {
             let now = (self.epoch.elapsed().as_nanos() as u64).max(1);
             s.became_eligible_nanos.store(now, Ordering::SeqCst);
+            s.eligibility_generation.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    pub fn eligibility_generation(&self, id: &BackendId) -> u64 {
+        self.inner
+            .load()
+            .states
+            .get(id)
+            .map_or(0, |s| s.eligibility_generation.load(Ordering::SeqCst))
     }
 
     pub fn warmup_fraction(&self, id: &BackendId, window: std::time::Duration) -> f64 {
@@ -413,6 +424,7 @@ impl BackendPool {
                     active_conns: AtomicUsize::new(0),
                     awaiting_first_probe: AtomicBool::new(true),
                     became_eligible_nanos: AtomicU64::new(0),
+                    eligibility_generation: AtomicU64::new(0),
                 }),
             };
             ordered.push(Arc::clone(&state));
