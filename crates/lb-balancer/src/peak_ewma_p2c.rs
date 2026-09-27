@@ -30,6 +30,7 @@ pub struct PeakEwmaP2c<C: Clock> {
     creation: Instant,
     decay: Duration,
     entries: RwLock<HashMap<BackendId, EwmaEntry>>,
+    pruned_for_version: AtomicU64,
     rng_state: AtomicU64,
 }
 
@@ -46,6 +47,7 @@ impl<C: Clock> PeakEwmaP2c<C> {
             creation,
             decay,
             entries: RwLock::new(HashMap::new()),
+            pruned_for_version: AtomicU64::new(0),
             rng_state: AtomicU64::new(seed | 1),
         }
     }
@@ -79,6 +81,19 @@ impl<C: Clock> PeakEwmaP2c<C> {
             .unwrap()
             .get(id)
             .is_some_and(|entry| entry.estimate_nanos.load(Ordering::Relaxed) != NO_SAMPLE)
+    }
+
+    fn forget_removed_backends(&self, pool: &BackendPool) {
+        let version = pool.version().wrapping_add(1);
+        if self.pruned_for_version.swap(version, Ordering::Relaxed) == version {
+            return;
+        }
+        let live: std::collections::HashSet<BackendId> =
+            pool.all_backend_ids().into_iter().collect();
+        self.entries
+            .write()
+            .unwrap()
+            .retain(|id, _| live.contains(id));
     }
 
     fn cost(&self, pool: &BackendPool, id: &BackendId) -> u128 {
@@ -115,6 +130,7 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
         _key: &str,
         excluded: &[BackendId],
     ) -> Option<BackendId> {
+        self.forget_removed_backends(pool);
         let mut eligible = pool.eligible_backends();
         eligible.retain(|id| !excluded.contains(id));
         match eligible.len() {
@@ -184,6 +200,33 @@ fn store_sample(entry: &EwmaEntry, sample_nanos: u64, now_nanos: u64, decay: Dur
     };
     entry.estimate_nanos.store(new_estimate, Ordering::Relaxed);
     entry.last_update_nanos.store(now_nanos, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod pruning_tests {
+    use super::*;
+    use lb_core::test_util::FakeClock;
+    use lb_core::Backend;
+
+    #[test]
+    fn latency_state_for_a_removed_backend_is_dropped() {
+        let pool = BackendPool::new(vec![
+            Backend::new("a", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("b", "127.0.0.1:9001".parse().unwrap(), 1, None),
+        ]);
+        let lb = PeakEwmaP2c::new(FakeClock::new());
+        lb.pick(&pool, "k");
+        lb.record_latency(&BackendId::new("a"), Duration::from_millis(5));
+        lb.record_latency(&BackendId::new("b"), Duration::from_millis(5));
+        pool.apply_resolved(vec![
+            Backend::new("b", "127.0.0.1:9001".parse().unwrap(), 1, None),
+            Backend::new("c", "127.0.0.1:9002".parse().unwrap(), 1, None),
+        ]);
+        lb.pick(&pool, "k");
+        let entries = lb.entries.read().unwrap();
+        assert!(!entries.contains_key(&BackendId::new("a")));
+        assert!(entries.contains_key(&BackendId::new("b")));
+    }
 }
 
 #[cfg(test)]

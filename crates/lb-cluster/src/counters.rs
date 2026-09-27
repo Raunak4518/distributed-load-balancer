@@ -27,6 +27,11 @@ pub struct CounterStore {
 
 pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
 
+fn overflow_key(key: &str) -> String {
+    let listener = key.split('\u{1}').next().unwrap_or_default();
+    format!("{listener}\u{1}\u{0}overflow")
+}
+
 const MAX_SNAPSHOT_BUCKET_ENTRIES: usize = 5_000;
 const MAX_SNAPSHOT_BYTES: usize = 1024 * 1024;
 
@@ -89,16 +94,34 @@ impl CounterStore {
         // Borrowed lookup first: every key past its first request in this
         // window takes this path and allocates nothing. `key.to_string()`
         // below is only worth paying the first time a key is seen.
-        let admitted = if let Some(mut counts) = self.keys.get_mut(key) {
+        let existing = self.keys.get_mut(key).map(|mut counts| {
             Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit)
+        });
+        if let Some(admitted) = existing {
+            if admitted {
+                self.mark_changed(key);
+            }
+            return admitted;
+        }
+        let tracked = if self.keys.len() >= MAX_TRACKED_KEYS {
+            overflow_key(key)
         } else {
-            let mut counts = self.keys.entry(key.to_string()).or_default();
+            key.to_string()
+        };
+        let admitted = {
+            let mut counts = self.keys.entry(tracked.clone()).or_default();
             Self::try_record(&mut counts, node_id, now_secs, self.window_secs, limit)
         };
-        if admitted && !self.changed.contains(key) {
-            self.changed.insert(key.to_string());
+        if admitted {
+            self.mark_changed(&tracked);
         }
         admitted
+    }
+
+    fn mark_changed(&self, key: &str) {
+        if !self.changed.contains(key) {
+            self.changed.insert(key.to_string());
+        }
     }
 
     fn own_in_window(&self, key: &str, node_id: &str, cutoff: u64) -> Option<Vec<(u64, u64)>> {
@@ -710,6 +733,23 @@ mod tests {
 
         store.merge("k", "n1", &[(NOW + 2, 5)], NOW);
         assert_eq!(counter.with_label_values(&["n1"]).get(), 0);
+    }
+
+    #[test]
+    fn locally_admitted_keys_past_the_cap_share_one_overflow_budget() {
+        let store = CounterStore::new(10);
+        for i in 0..MAX_TRACKED_KEYS {
+            assert!(store.try_admit(&format!("web\u{1}k{i}"), "me", NOW, 1_000));
+        }
+        for i in 0..50 {
+            assert!(store.try_admit(&format!("web\u{1}spray{i}"), "me", NOW, 50));
+        }
+        assert_eq!(store.key_count(), MAX_TRACKED_KEYS + 1);
+        assert!(
+            !store.try_admit("web\u{1}one-more", "me", NOW, 50),
+            "newcomers past the cap must share one budget, not each get their own"
+        );
+        assert!(store.try_admit("web\u{1}k7", "me", NOW, 1_000));
     }
 
     #[test]
