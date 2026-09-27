@@ -20,7 +20,7 @@ pub(crate) fn is_ready(
             .iter()
             .all(|cert| cert.not_after_unix > now_unix)
     });
-    every_listener_can_forward && no_expired_certificate
+    every_listener_can_forward && no_expired_certificate && !reload.overload.rejects_new_work()
 }
 
 pub(crate) fn unix_now() -> i64 {

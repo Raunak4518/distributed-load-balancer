@@ -85,6 +85,7 @@ pub struct ListenerMetrics {
     pub timeouts_body: IntCounter,
     pub timeouts_upstream_body: IntCounter,
     pub timeouts_request: IntCounter,
+    pub overload_rejected: IntCounter,
     pub upstream_overflow_queue_full: IntCounter,
     pub upstream_overflow_queue_timeout: IntCounter,
     pub upstream_queue_duration: Histogram,

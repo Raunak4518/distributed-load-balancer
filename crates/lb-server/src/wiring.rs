@@ -210,6 +210,7 @@ pub struct ConnectionLimits {
     /// Global cap. Acquired *before* `accept()` so that at capacity we stop
     /// accepting and the kernel refuses on our behalf.
     pub global: Arc<tokio::sync::Semaphore>,
+    pub capacity: usize,
     /// Per-source cap, checked after `accept()` — the peer address is not
     /// knowable before then.
     pub per_ip: Arc<crate::limits::PerIpLimiter>,
@@ -247,6 +248,7 @@ pub struct WiredApp {
 pub struct ReloadState {
     pub metrics: Arc<Metrics>,
     pub acme_challenges: Arc<lb_tls::AcmeChallengeStore>,
+    pub overload: Arc<lb_core::OverloadState>,
     pub cluster_node: Option<Arc<AppClusterNode>>,
     pub listeners: HashMap<String, ListenerReloadHandle>,
     /// This listener's health checkers, DNS poller, and rate-limit sweeper —
@@ -322,6 +324,7 @@ pub fn build_app(
     // listener/backend below — never on the request path.
     let metrics = Arc::new(Metrics::new().expect("metric names are valid and unique"));
     let acme_challenges = Arc::new(lb_tls::AcmeChallengeStore::new());
+    let overload = Arc::new(lb_core::OverloadState::new());
 
     // Built here for the same reason as the acceptors above: an unreadable
     // `ca_file` is operator input, and must fail startup rather than turn
@@ -379,6 +382,7 @@ pub fn build_app(
             &config.logging,
             &metrics,
             &acme_challenges,
+            &overload,
             None,
         );
         let tasks = spawn_listener_tasks(lc, &core, &metrics);
@@ -387,6 +391,7 @@ pub fn build_app(
         let listener_metrics = Arc::new(metrics.listener(&lc.name));
         let connection_limits = ConnectionLimits {
             global: Arc::new(tokio::sync::Semaphore::new(lc.max_connections())),
+            capacity: lc.max_connections(),
             per_ip: Arc::new(crate::limits::PerIpLimiter::new(
                 lc.max_connections_per_ip(),
             )),
@@ -505,6 +510,7 @@ pub fn build_app(
         reload: Arc::new(ReloadState {
             metrics,
             acme_challenges,
+            overload,
             cluster_node,
             listeners: reload_listeners,
             tasks: Arc::new(tokio::sync::Mutex::new(reload_tasks)),
@@ -778,6 +784,7 @@ pub(crate) fn build_listener_core(
     logging: &LoggingConfig,
     metrics: &Metrics,
     acme_challenges: &Arc<lb_tls::AcmeChallengeStore>,
+    overload: &Arc<lb_core::OverloadState>,
     previous: Option<&PreviousListenerState>,
 ) -> ListenerCore {
     let backends: Vec<Backend> = lc
@@ -1059,6 +1066,7 @@ pub(crate) fn build_listener_core(
                 request_timeout: lc.request_timeout(),
                 retry_on_status: lc.retry_on_status.clone(),
                 request_buffer_bytes: lc.request_buffer_bytes(),
+                overload: Arc::clone(overload),
                 upstream_limits: lc
                     .upstream_limits
                     .as_ref()

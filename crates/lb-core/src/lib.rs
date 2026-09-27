@@ -8,6 +8,7 @@ pub mod dns;
 pub mod error;
 pub mod health;
 pub mod http2;
+pub mod overload;
 pub mod pool;
 pub mod ratelimit;
 pub mod resolve;
@@ -23,14 +24,15 @@ pub use cluster::ClusterCoordinator;
 pub use config::{
     AdminConfig, BackendConfig, BackendTlsConfig, CacheConfig, CanaryPoolConfig, CertificateConfig,
     ClusterConfig, Config, HealthCheckConfig, ListenerConfig, LoadBalancingConfig,
-    LoadBalancingStrategy, LogFormat, LoggingConfig, PeerTlsConfig, Protocol, RateLimitConfig,
-    RateLimitKeySource, RouteConfig, ServerConfig, StickyConfig, TcpKeepaliveConfig, TlsConfig,
-    TlsVersion, TracingConfig, WafConfig, WafMode,
+    LoadBalancingStrategy, LogFormat, LoggingConfig, OverloadConfig, PeerTlsConfig, Protocol,
+    RateLimitConfig, RateLimitKeySource, RouteConfig, ServerConfig, StickyConfig,
+    TcpKeepaliveConfig, TlsConfig, TlsVersion, TracingConfig, WafConfig, WafMode,
 };
 pub use dns::DnsDiscoveryConfig;
 pub use error::ConfigError;
 pub use health::HealthProbe;
 pub use http2::Http2Config;
+pub use overload::{OverloadState, OVERLOAD_NORMAL, OVERLOAD_REJECT, OVERLOAD_SHED_KEEPALIVE};
 pub use pool::BackendPool;
 pub use ratelimit::{Decision, RateLimiter};
 pub use resolve::Resolve;

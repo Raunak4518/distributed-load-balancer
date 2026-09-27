@@ -71,6 +71,9 @@ pub struct Metrics {
     /// exported as a metric" pattern, so an open admin port never ships
     /// silently.
     pub admin_auth_disabled: IntGauge,
+    pub overload_level: IntGauge,
+    pub overload_pressure: IntGaugeVec,
+    overload_rejected: IntCounterVec,
     pub admin_auth_failures: IntCounter,
 
     retry_attempts: IntCounterVec,
@@ -388,6 +391,27 @@ impl Metrics {
         registry.register(Box::new(websocket_upgrades.clone()))?;
         registry.register(Box::new(admin_auth_disabled.clone()))?;
         registry.register(Box::new(admin_auth_failures.clone()))?;
+        let overload_level = IntGauge::new(
+            "lb_overload_level",
+            "Current overload level: 0 normal, 1 shedding keep-alive, 2 rejecting new work",
+        )?;
+        registry.register(Box::new(overload_level.clone()))?;
+        let overload_pressure = IntGaugeVec::new(
+            Opts::new(
+                "lb_overload_pressure_permille",
+                "Resource use as a fraction of its limit, in thousandths, by resource",
+            ),
+            &["resource"],
+        )?;
+        registry.register(Box::new(overload_pressure.clone()))?;
+        let overload_rejected = IntCounterVec::new(
+            Opts::new(
+                "lb_overload_rejected_total",
+                "Requests or connections refused because the process was overloaded, by listener",
+            ),
+            &["listener"],
+        )?;
+        registry.register(Box::new(overload_rejected.clone()))?;
         registry.register(Box::new(retry_attempts.clone()))?;
         registry.register(Box::new(retry_successes.clone()))?;
         registry.register(Box::new(retry_failures.clone()))?;
@@ -436,6 +460,9 @@ impl Metrics {
             websocket_upgrades,
             admin_auth_disabled,
             admin_auth_failures,
+            overload_level,
+            overload_pressure,
+            overload_rejected,
             retry_attempts,
             retry_successes,
             retry_failures,
@@ -501,6 +528,7 @@ impl Metrics {
                 .request_timeouts
                 .with_label_values(&[name, "upstream_body"]),
             timeouts_request: self.request_timeouts.with_label_values(&[name, "request"]),
+            overload_rejected: self.overload_rejected.with_label_values(&[name]),
             upstream_overflow_queue_full: self
                 .upstream_overflow
                 .with_label_values(&[name, "queue_full"]),

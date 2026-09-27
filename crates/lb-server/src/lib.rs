@@ -3,6 +3,7 @@ mod compression;
 mod dns;
 mod first_byte;
 mod limits;
+mod overload;
 mod proxy_protocol;
 mod readiness;
 pub mod reload;
@@ -234,6 +235,18 @@ pub async fn run_and_report_reload_handle(
         ));
     }
 
+    if let Some(overload_cfg) = config.server.overload.clone() {
+        cluster_tasks.push(overload::spawn_overload_monitor(
+            Arc::clone(&reload.overload),
+            bound
+                .iter()
+                .map(|(_, runtime)| Arc::clone(runtime))
+                .collect(),
+            overload_cfg,
+            Arc::clone(&metrics),
+        ));
+    }
+
     // Spawned only when this config came from a file at all — see `run`'s
     // doc comment on `config_path`. Its own handle joins `cluster_tasks`:
     // like the cluster/admin tasks, it carries no client-facing state, so
@@ -250,6 +263,7 @@ pub async fn run_and_report_reload_handle(
         listener_tasks.push(tokio::spawn(serve_listener(
             listener,
             runtime,
+            Arc::clone(&reload.overload),
             shutdown_rx.clone(),
             drain_timeout,
         )));
@@ -282,6 +296,7 @@ fn reap_finished(connections: &mut JoinSet<()>) {
 async fn serve_listener(
     listener: TcpListener,
     runtime: Arc<ListenerRuntime>,
+    overload: Arc<lb_core::OverloadState>,
     mut shutdown: watch::Receiver<bool>,
     drain_timeout: Duration,
 ) {
@@ -316,6 +331,11 @@ async fn serve_listener(
             },
             _ = shutdown.changed() => break,
         };
+
+        if runtime.protocol_name() == "tcp" && overload.rejects_new_work() {
+            runtime.metrics().overload_rejected.inc();
+            continue;
+        }
 
         if runtime.proxy_protocol() && !runtime.proxy_source_trusted(peer.ip()) {
             runtime.metrics().connections_rejected_untrusted_proxy.inc();

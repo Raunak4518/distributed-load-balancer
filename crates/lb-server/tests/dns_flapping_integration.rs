@@ -331,6 +331,7 @@ fn build_ctx(
         retry_on_status: Vec::new(),
         request_buffer_bytes: 64 * 1024,
         upstream_limits: None,
+        overload: std::sync::Arc::new(lb_core::OverloadState::new()),
         backend_gates: lb_core::BackendMap::new(),
         max_request_body_bytes: 1024 * 1024,
         cluster: None,

@@ -284,14 +284,42 @@ impl ClusterConfig {
 pub struct ServerConfig {
     #[serde(default = "default_drain_timeout_ms")]
     pub drain_timeout_ms: u64,
+    #[serde(default)]
+    pub overload: Option<OverloadConfig>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             drain_timeout_ms: default_drain_timeout_ms(),
+            overload: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverloadConfig {
+    #[serde(default)]
+    pub max_memory_bytes: Option<u64>,
+    #[serde(default = "default_shed_keepalive_at")]
+    pub shed_keepalive_at: f64,
+    #[serde(default = "default_reject_at")]
+    pub reject_at: f64,
+    #[serde(default = "default_overload_check_interval_ms")]
+    pub check_interval_ms: u64,
+}
+
+fn default_shed_keepalive_at() -> f64 {
+    0.8
+}
+
+fn default_reject_at() -> f64 {
+    0.95
+}
+
+fn default_overload_check_interval_ms() -> u64 {
+    1_000
 }
 
 fn default_drain_timeout_ms() -> u64 {
@@ -1105,6 +1133,23 @@ impl Config {
             }
         }
 
+        if let Some(overload) = &self.server.overload {
+            if !(0.0 < overload.shed_keepalive_at
+                && overload.shed_keepalive_at < overload.reject_at
+                && overload.reject_at <= 1.0)
+            {
+                return Err(ConfigError::Invalid(
+                    "server.overload requires 0 < shed_keepalive_at < reject_at <= 1".into(),
+                ));
+            }
+            if overload.check_interval_ms == 0 || overload.max_memory_bytes == Some(0) {
+                return Err(ConfigError::Invalid(
+                    "server.overload.check_interval_ms and max_memory_bytes must be positive"
+                        .into(),
+                ));
+            }
+        }
+
         if let Some(admin) = &self.admin {
             if let Some(clash) = self.listeners.iter().find(|l| l.listen == admin.listen) {
                 return Err(ConfigError::Invalid(format!(
@@ -1797,6 +1842,20 @@ mod tests {
             "        listen = \"0.0.0.0:5432\"\n        retry_on_status = [503]",
         );
         assert!(Config::parse(&tcp).is_err());
+    }
+
+    #[test]
+    fn overload_settings_parse_with_defaults_and_are_validated() {
+        let with = |body: &str| format!("[server.overload]\n{body}\n{VALID}");
+        let cfg = Config::parse(&with("")).unwrap();
+        let overload = cfg.server.overload.unwrap();
+        assert_eq!(overload.shed_keepalive_at, 0.8);
+        assert_eq!(overload.reject_at, 0.95);
+        assert_eq!(overload.max_memory_bytes, None);
+        assert!(Config::parse(&with("shed_keepalive_at = 0.9\nreject_at = 0.8")).is_err());
+        assert!(Config::parse(&with("reject_at = 1.5")).is_err());
+        assert!(Config::parse(&with("max_memory_bytes = 0")).is_err());
+        assert!(Config::parse(VALID).unwrap().server.overload.is_none());
     }
 
     #[test]

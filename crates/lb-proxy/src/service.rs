@@ -113,6 +113,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub max_request_body_bytes: usize,
     pub request_buffer_bytes: usize,
     pub upstream_limits: Option<crate::gate::UpstreamLimits>,
+    pub overload: Arc<lb_core::OverloadState>,
     pub backend_gates: BackendMap<crate::gate::BackendGate>,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
@@ -630,6 +631,10 @@ where
         if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
             resp.headers_mut().insert("x-request-id", value);
         }
+        if !is_h2 && status != StatusCode::SWITCHING_PROTOCOLS && ctx.overload.sheds_keepalive() {
+            resp.headers_mut()
+                .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        }
 
         // Unconditional on every response from a qualifying listener, not
         // just successful proxied ones: HSTS is a property of the host, and
@@ -665,6 +670,13 @@ where
     R: RateLimiter,
     C: Clock,
 {
+    if ctx.overload.rejects_new_work() {
+        ctx.metrics.overload_rejected.inc();
+        let mut resp = simple_response(StatusCode::SERVICE_UNAVAILABLE, "overloaded");
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return Ok(resp);
+    }
     let deadline = ctx
         .request_timeout
         .map(|timeout| tokio::time::Instant::now() + timeout);
@@ -1566,6 +1578,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1609,6 +1622,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1671,6 +1685,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1718,6 +1733,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1781,6 +1797,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1826,6 +1843,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1888,6 +1906,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1984,6 +2003,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2264,6 +2284,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2391,6 +2412,7 @@ mod tests {
             max_request_body_bytes,
             request_buffer_bytes,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2542,6 +2564,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: Some(limits),
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: gates,
             cluster: None,
             metrics: test_metrics(),
@@ -2551,6 +2574,68 @@ mod tests {
             hsts_max_age_secs: None,
             retry_budget: None,
         })
+    }
+
+    #[tokio::test]
+    async fn overload_levels_shed_keepalive_then_reject_new_requests() {
+        let backend_addr = spawn_fixed_response_backend(StatusCode::OK, "ok").await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let base = ctx_retrying(&backend, pool, Vec::new());
+        let overload = Arc::new(lb_core::OverloadState::new());
+        let ctx = Arc::new(ProxyContext {
+            overload: Arc::clone(&overload),
+            rate_limiter: Arc::clone(&base.rate_limiter),
+            balancer: Arc::clone(&base.balancer),
+            pool: Arc::clone(&base.pool),
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: base.client.clone(),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: base.websocket_idle_timeout,
+            response_body_idle_timeout: base.response_body_idle_timeout,
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: base.forward_timeout,
+            request_timeout: None,
+            retry_on_status: Vec::new(),
+            max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        });
+
+        let normal = run_through_proxy(ctx.clone()).await;
+        assert_eq!(normal.status(), StatusCode::OK);
+        assert!(normal.headers().get(header::CONNECTION).is_none());
+
+        overload.set_level(lb_core::OVERLOAD_SHED_KEEPALIVE);
+        let shedding = run_through_proxy(ctx.clone()).await;
+        assert_eq!(shedding.status(), StatusCode::OK);
+        assert_eq!(shedding.headers().get(header::CONNECTION).unwrap(), "close");
+
+        overload.set_level(lb_core::OVERLOAD_REJECT);
+        let rejected = run_through_proxy(ctx.clone()).await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers().get(header::RETRY_AFTER).unwrap(), "1");
+        assert_eq!(ctx.metrics.overload_rejected.get(), 1);
     }
 
     #[tokio::test]
@@ -2719,6 +2804,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2772,6 +2858,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2839,6 +2926,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2934,6 +3022,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3009,6 +3098,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3084,6 +3174,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3250,6 +3341,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3396,6 +3488,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3443,6 +3536,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3566,6 +3660,7 @@ mod tests {
                 max_request_body_bytes: 1024,
                 request_buffer_bytes: 64 * 1024,
                 upstream_limits: None,
+                overload: Arc::new(lb_core::OverloadState::new()),
                 backend_gates: BackendMap::new(),
                 cluster: None,
                 metrics: test_metrics(),
@@ -3645,6 +3740,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3827,6 +3923,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3882,6 +3979,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3933,6 +4031,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3982,6 +4081,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4423,6 +4523,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4470,6 +4571,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4524,6 +4626,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4578,6 +4681,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4626,6 +4730,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4672,6 +4777,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4724,6 +4830,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4780,6 +4887,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4913,6 +5021,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4986,6 +5095,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5072,6 +5182,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5186,6 +5297,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5357,6 +5469,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5459,6 +5572,7 @@ mod tests {
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
             upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
