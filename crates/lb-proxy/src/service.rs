@@ -4916,7 +4916,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_cache_keeps_serving_stored_entries_and_proxies_the_rest_uncached() {
+    async fn a_full_cache_makes_room_by_evicting_its_least_recently_used_entry() {
         let one_entry = {
             let probe = test_cache();
             let (addr, _) = cached_proxy("hello", &[], probe.clone(), None).await;
@@ -4940,13 +4940,14 @@ mod tests {
             cache_send(addr, Method::GET, "/k1", None).await.body(),
             "hello"
         );
-        assert_eq!(backend_hits(&count), 3);
+        assert_eq!(backend_hits(&count), 2);
         assert_eq!(
             cache_send(addr, Method::GET, "/k0", None).await.body(),
             "hello"
         );
         assert_eq!(backend_hits(&count), 3);
         assert_eq!(cache.accounted_bytes(), one_entry);
+        assert_eq!(cache.evictions(), 2);
     }
 
     #[tokio::test]
