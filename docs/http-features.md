@@ -140,11 +140,11 @@ Two independent size limits apply:
 
 - `max_entry_bytes`: caps one entry's body size. A response whose declared `Content-Length` exceeds this is never cached.
 - `max_total_bytes`: caps the cache's aggregate accounted size across all entries. Accounted size per entry is `320 bytes` fixed overhead + key length + body length +, per response header, `128 bytes` overhead plus that header's name and value lengths. This means headers are not free — a response with many or large headers (e.g. several `Set-Cookie` values) counts meaningfully toward the budget even with a tiny body, and a zero-length body still consumes its full header/key/overhead accounting.
-- `max_total_bytes` is a **hard cap**: an entry's bytes are reserved with an atomic compare-and-swap before it is inserted, so concurrent inserts can never push the accounted total past the configured budget. A replacement for an existing key reserves its full size before the old entry's bytes are released, so a replacement that does not fit alongside the current entry is not admitted.
+- `max_total_bytes` is a **hard cap**: an entry's bytes are reserved with an atomic compare-and-swap before it is inserted, so concurrent inserts can never push the accounted total past the configured budget. A replacement for an existing key reserves its full size before the old entry's bytes are released, so it is treated like any other new entry when the cache is full.
 
-### No eviction policy
+### Eviction
 
-There is no LRU, LFU, or any other eviction algorithm. Once `max_total_bytes` is reached, **new entries are simply rejected** until something already stored expires and is reclaimed — existing live entries are never evicted to make room for a new one. An operator who wants headroom for new content under sustained load needs enough `max_total_bytes` for it, or an appropriately short `default_ttl_secs`/`Cache-Control: max-age`; there is no cache pressure mechanism beyond expiry.
+When a new entry does not fit in `max_total_bytes`, the cache first drops expired entries, then evicts the least recently used live ones (an entry counts as used when it is stored and each time it is served) until the new entry fits with 10% of the budget left free. Freeing that headroom in one pass means the scan over all entries happens once per tenth of the cache's capacity rather than on every insert. One eviction runs at a time; the byte reservation above still guarantees the total never passes the budget. An entry larger than the whole budget evicts nothing and is not stored.
 
 ### Sweep
 
@@ -155,7 +155,6 @@ A background task runs `sweep_expired()` on a fixed interval for the life of the
 - **Cookies on requests are not part of the key.** A backend that personalizes a response by cookie must say so with `Cache-Control: private` or `no-store`, or `Vary: Cookie`; any of these keeps it out of the cache. A cookie-personalized response with none of them is shared. This matches nginx's default; bypassing every cookie-bearing request would make the cache useless for browser traffic.
 - **The load balancer's own sticky cookie is never stored.** The cache decision and body buffering happen before the sticky `Set-Cookie` is added to the outgoing response.
 - **No revalidation.** `ETag`, `Last-Modified` and conditional requests are not supported: a conditional request that hits the cache receives the full stored `200` rather than a `304`, and an expired entry is refetched rather than revalidated.
-- **No eviction.** See above; a full cache admits nothing new until entries expire.
 - **Hits bypass pool selection.** The cache is consulted before route matching, the canary split and the sticky pin, so a hit is served without choosing a pool. A canary pool's configured `percent` therefore applies to cache misses only, and a response stored from one pool can be served to clients the split would have sent to the other. Keep canary-sensitive paths out of the cache with `Cache-Control: no-store` or `private` from the backend.
 
 ### Configuration

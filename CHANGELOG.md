@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cache eviction.** A full response cache now evicts its least recently
+  used entries to admit new ones, instead of refusing new entries until old
+  ones expire.
 - **Request mirroring.** `[listeners.mirror]` copies a share of requests to
   a shadow backend in the background; the client never waits for it.
 - **Redirects and fixed responses.** `[[listeners.direct_responses]]`
