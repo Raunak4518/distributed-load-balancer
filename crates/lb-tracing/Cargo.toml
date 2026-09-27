@@ -11,7 +11,7 @@ description = "Structured logging and OpenTelemetry (OTLP) trace export"
 lb-core = { path = "../lb-core" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "registry"] }
-tracing-opentelemetry = "0.31"
+tracing-opentelemetry = "0.34"
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
 opentelemetry-http = "0.30"
