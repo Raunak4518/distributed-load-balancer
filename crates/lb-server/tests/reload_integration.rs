@@ -118,3 +118,54 @@ async fn a_running_server_reloads_its_backend_list_without_dropping_the_listener
         "the first backend should not have received a second request after reload"
     );
 }
+
+#[tokio::test]
+async fn a_keep_alive_connection_uses_the_reloaded_backends_on_its_next_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (backend1, count1) = spawn_counting_backend(StatusCode::OK).await;
+    let (backend2, count2) = spawn_counting_backend(StatusCode::OK).await;
+    let listen = free_addr().await;
+    let config = Config::parse(&config_text(listen, backend1)).unwrap();
+    let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(lb_server::run_and_report_reload_handle(
+        config,
+        None,
+        Some(report_tx),
+    ));
+    support::wait_until_listening(listen).await;
+    let reload_state = report_rx.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut conn = tokio::net::TcpStream::connect(listen).await.unwrap();
+    let request = b"GET / HTTP/1.1
+Host: x
+
+";
+    let mut buf = [0u8; 1024];
+    conn.write_all(request).await.unwrap();
+    let n = conn.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    assert_eq!(count1.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let outcome = apply_reload(
+        &Config::parse(&config_text(listen, backend2)).unwrap(),
+        &Config::parse(&config_text(listen, backend1)).unwrap(),
+        &reload_state,
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        lb_server::reload::ReloadOutcome::Applied { .. }
+    ));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    conn.write_all(request).await.unwrap();
+    let n = conn.read(&mut buf).await.unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    assert_eq!(
+        count2.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the same keep-alive connection must reach the reloaded backend"
+    );
+    assert_eq!(count1.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

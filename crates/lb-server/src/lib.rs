@@ -530,13 +530,13 @@ where
             http2,
             ..
         } => {
-            // Loaded fresh here, not once at listener startup: this is what
+            // Loaded per request, not once per connection: this is what
             // lets `reload::apply_reload` change a running listener's
             // backends/rate limit/health checks without dropping a single
-            // connection — this one and every connection already in flight
-            // keep whichever snapshot they loaded, while the next one to
-            // reach this line sees whatever is current then.
-            let ctx = ctx.load_full();
+            // connection — a request already in flight keeps the snapshot it
+            // loaded, while the next request on any connection, including a
+            // long-lived keep-alive or HTTP/2 one, sees whatever is current.
+            let ctx = Arc::clone(ctx);
             let listener_metrics = runtime.metrics();
             listener_metrics.connections_total.inc();
             listener_metrics.active_connections.inc();
@@ -549,7 +549,7 @@ where
             // type regardless of `compression`'s value: see `compression`'s
             // module docs for why that's a predicate, not a branch here.
             let base =
-                tower::service_fn(move |req| lb_proxy::handle(req, Arc::clone(&ctx), peer_ip));
+                tower::service_fn(move |req| lb_proxy::handle(req, ctx.load_full(), peer_ip));
             let svc = hyper_util::service::TowerToHyperService::new(
                 tower::ServiceBuilder::new()
                     .layer(
