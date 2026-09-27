@@ -18,7 +18,8 @@ use hyper::header::{
 };
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 use lb_core::Clock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// One stored response. Cheap to clone: `Bytes` is a refcounted buffer, and
@@ -30,6 +31,7 @@ pub struct CacheEntry {
     pub body: Bytes,
     expires_at: Instant,
     accounted_size: usize,
+    last_used: Arc<AtomicU64>,
 }
 
 const ENTRY_OVERHEAD_BYTES: usize = 320;
@@ -193,6 +195,9 @@ pub struct ResponseCache<C: Clock> {
     max_total_bytes: usize,
     default_ttl: Duration,
     clock: C,
+    access_tick: AtomicU64,
+    eviction: Mutex<()>,
+    evictions: AtomicU64,
 }
 
 impl<C: Clock> ResponseCache<C> {
@@ -209,7 +214,18 @@ impl<C: Clock> ResponseCache<C> {
             max_total_bytes,
             default_ttl,
             clock,
+            access_tick: AtomicU64::new(0),
+            eviction: Mutex::new(()),
+            evictions: AtomicU64::new(0),
         }
+    }
+
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
+    }
+
+    fn tick(&self) -> u64 {
+        self.access_tick.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn max_entry_bytes(&self) -> usize {
@@ -231,6 +247,7 @@ impl<C: Clock> ResponseCache<C> {
         {
             let entry = self.entries.get(key)?;
             if entry.expires_at > now {
+                entry.last_used.store(self.tick(), Ordering::Relaxed);
                 return Some(entry.clone());
             }
         }
@@ -242,10 +259,10 @@ impl<C: Clock> ResponseCache<C> {
     }
 
     /// Stores `body` under `key` for `ttl`. A no-op (the caller's response
-    /// is unaffected either way) if `body` alone exceeds `max_entry_bytes`
-    /// or would push the aggregate past `max_total_bytes` -- there is no
-    /// eviction algorithm in v1, just "stop admitting new entries until
-    /// something already stored expires and is swept."
+    /// is unaffected either way) if `body` alone exceeds `max_entry_bytes`.
+    /// When it would push the aggregate past `max_total_bytes`, expired
+    /// entries and then the least recently used ones are evicted to make
+    /// room; if there is still no room, nothing is stored.
     pub fn put(
         &self,
         key: String,
@@ -258,17 +275,14 @@ impl<C: Clock> ResponseCache<C> {
             return;
         }
         let size = accounted_size(&key, &headers, body.len());
-        // A hard cap: the bytes are reserved atomically before the entry is
-        // inserted, so concurrent inserts can never push the total past it.
-        let reserved =
-            self.total_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
-                    total
-                        .checked_add(size)
-                        .filter(|next| *next <= self.max_total_bytes)
-                });
-        if reserved.is_err() {
+        if size > self.max_total_bytes {
             return;
+        }
+        if !self.reserve(size) {
+            self.make_room(size);
+            if !self.reserve(size) {
+                return;
+            }
         }
         let expires_at = self.clock.now() + ttl;
         let entry = CacheEntry {
@@ -277,10 +291,52 @@ impl<C: Clock> ResponseCache<C> {
             body,
             expires_at,
             accounted_size: size,
+            last_used: Arc::new(AtomicU64::new(self.tick())),
         };
         if let Some(old) = self.entries.insert(key, entry) {
             self.total_bytes
                 .fetch_sub(old.accounted_size, Ordering::Relaxed);
+        }
+    }
+
+    // A hard cap: the bytes are reserved atomically before the entry is
+    // inserted, so concurrent inserts can never push the total past it.
+    fn reserve(&self, size: usize) -> bool {
+        self.total_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                total
+                    .checked_add(size)
+                    .filter(|next| *next <= self.max_total_bytes)
+            })
+            .is_ok()
+    }
+
+    fn make_room(&self, size: usize) {
+        let _guard = self.eviction.lock().unwrap_or_else(|p| p.into_inner());
+        self.sweep_expired();
+        let headroom = self.max_total_bytes / 10;
+        let target = self
+            .max_total_bytes
+            .saturating_sub(size)
+            .saturating_sub(headroom);
+        if self.accounted_bytes() <= self.max_total_bytes - size {
+            return;
+        }
+        let mut by_age: Vec<(u64, String)> = self
+            .entries
+            .iter()
+            .map(|e| (e.last_used.load(Ordering::Relaxed), e.key().clone()))
+            .collect();
+        by_age.sort_unstable();
+        for (_, key) in by_age {
+            if self.accounted_bytes() <= target {
+                break;
+            }
+            if let Some((_, removed)) = self.entries.remove(&key) {
+                self.total_bytes
+                    .fetch_sub(removed.accounted_size, Ordering::Relaxed);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -546,28 +602,14 @@ mod tests {
             Bytes::from_static(b"hello"),
             Duration::from_secs(10),
         );
-        // Budget is full -- a second entry is rejected.
-        cache.put(
-            "second".to_string(),
-            StatusCode::OK,
-            HeaderMap::new(),
-            Bytes::from_static(b"world"),
-            Duration::from_secs(10),
-        );
-        assert!(cache.get("second").is_none());
+        assert!(cache.accounted_bytes() > 0);
 
         clock.advance(Duration::from_secs(11));
         cache.sweep_expired();
 
-        // The first entry's expiry freed the budget, so this now succeeds.
-        cache.put(
-            "second".to_string(),
-            StatusCode::OK,
-            HeaderMap::new(),
-            Bytes::from_static(b"world"),
-            Duration::from_secs(10),
-        );
-        assert!(cache.get("second").is_some());
+        assert_eq!(cache.accounted_bytes(), 0);
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.evictions(), 0);
     }
 
     #[test]
@@ -723,24 +765,37 @@ mod tests {
     }
 
     #[test]
-    fn a_full_cache_admits_nothing_new_and_never_evicts_live_entries() {
+    fn a_full_cache_evicts_the_least_recently_used_entries_to_admit_a_new_one() {
         let entry = accounted_size("key-0", &HeaderMap::new(), 100);
-        let cache = ResponseCache::new(1024, entry * 3, Duration::from_secs(60), FakeClock::new());
-        for i in 0..3 {
+        let cache = ResponseCache::new(1024, entry * 10, Duration::from_secs(60), FakeClock::new());
+        for i in 0..10 {
             put_body(&cache, &format!("key-{i}"), 100, 60);
         }
-        assert_eq!(cache.accounted_bytes(), entry * 3);
-        for i in 3..10 {
-            put_body(&cache, &format!("key-{i}"), 100, 60);
-        }
-        assert_eq!(cache.entries.len(), 3);
-        assert_eq!(cache.accounted_bytes(), entry * 3);
-        for i in 0..3 {
+        for i in 0..5 {
             assert!(cache.get(&format!("key-{i}")).is_some());
         }
-        for i in 3..10 {
-            assert!(cache.get(&format!("key-{i}")).is_none());
+        put_body(&cache, "new-0", 100, 60);
+        assert!(cache.get("new-0").is_some());
+        for i in [5, 6] {
+            assert!(cache.get(&format!("key-{i}")).is_none(), "key-{i}");
         }
+        for i in [0, 1, 2, 3, 4, 7, 8, 9] {
+            assert!(cache.get(&format!("key-{i}")).is_some(), "key-{i}");
+        }
+        assert_eq!(cache.evictions(), 2);
+        assert!(cache.accounted_bytes() <= entry * 10);
+        assert_accounting_matches_entries(&cache);
+    }
+
+    #[test]
+    fn an_entry_larger_than_the_whole_cache_evicts_nothing() {
+        let entry = accounted_size("key-0", &HeaderMap::new(), 100);
+        let cache = ResponseCache::new(4096, entry * 2, Duration::from_secs(60), FakeClock::new());
+        put_body(&cache, "key-0", 100, 60);
+        put_body(&cache, "huge", 3000, 60);
+        assert!(cache.get("key-0").is_some());
+        assert!(cache.get("huge").is_none());
+        assert_eq!(cache.evictions(), 0);
     }
 
     #[test]
@@ -858,8 +913,8 @@ mod tests {
                     });
                 }
             });
-            assert_eq!(cache.entries.len(), 4);
-            assert_eq!(cache.accounted_bytes(), cap);
+            assert!(cache.entries.len() <= 4);
+            assert!(cache.accounted_bytes() <= cap);
             assert_accounting_matches_entries(&cache);
         }
     }
