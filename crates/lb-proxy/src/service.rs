@@ -117,6 +117,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub backend_gates: BackendMap<crate::gate::BackendGate>,
     pub adaptive: Option<crate::adaptive::AdaptiveConfig>,
     pub slow_start: Option<Duration>,
+    pub forwarded: Option<crate::forwarded::ForwardedHeaders>,
     pub adaptive_limits: BackendMap<crate::adaptive::AdaptiveLimit>,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
@@ -884,6 +885,17 @@ where
                 });
             }
         }
+    }
+
+    let mut req = req;
+    if let Some(forwarded) = &ctx.forwarded {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri().authority().map(|a| a.to_string()));
+        forwarded.apply(req.headers_mut(), peer_ip, host.as_deref());
     }
 
     // Bypasses the cache-store/retry-loop machinery below entirely -- none
@@ -1658,6 +1670,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1705,6 +1718,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1771,6 +1785,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1822,6 +1837,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1889,6 +1905,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1938,6 +1955,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2004,6 +2022,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2104,6 +2123,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2388,6 +2408,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2519,6 +2540,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2674,6 +2696,7 @@ mod tests {
             backend_gates: gates,
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2724,6 +2747,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2818,6 +2842,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: Some(fixed),
             slow_start: None,
+            forwarded: None,
             adaptive_limits: limits,
             cluster: None,
             metrics: test_metrics(),
@@ -2859,6 +2884,7 @@ mod tests {
                 std::sync::atomic::AtomicUsize::new(0),
             )),
             slow_start: Some(Duration::from_secs(60)),
+            forwarded: None,
             rate_limiter: Arc::clone(&base.rate_limiter),
             pool,
             routes: Vec::new(),
@@ -2907,6 +2933,102 @@ mod tests {
         assert!(
             cold < 25,
             "a backend 0% into its warm-up got {cold} of 100 requests instead of a small share"
+        );
+    }
+
+    async fn spawn_forwarded_echo_backend() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let svc = service_fn(|req: Request<Incoming>| async move {
+                        let seen = ["x-forwarded-for", "x-forwarded-proto", "forwarded"]
+                            .iter()
+                            .map(|name| {
+                                req.headers()
+                                    .get(*name)
+                                    .and_then(|v| v.to_str().ok())
+                                    .unwrap_or("-")
+                                    .to_string()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|");
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(seen))))
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn the_backend_sees_the_real_client_not_a_forged_header() {
+        let addr = spawn_forwarded_echo_backend().await;
+        let backend = Backend::new("b1", addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let base = ctx_retrying(&backend, pool, Vec::new());
+        let ctx = Arc::new(ProxyContext {
+            forwarded: Some(crate::forwarded::ForwardedHeaders {
+                trusted_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
+                client_tls: false,
+            }),
+            balancer: Arc::clone(&base.balancer),
+            rate_limiter: Arc::clone(&base.rate_limiter),
+            pool: Arc::clone(&base.pool),
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: base.client.clone(),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: base.websocket_idle_timeout,
+            response_body_idle_timeout: base.response_body_idle_timeout,
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: base.forward_timeout,
+            request_timeout: None,
+            retry_on_status: Vec::new(),
+            max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
+            backend_gates: BackendMap::new(),
+            adaptive: None,
+            adaptive_limits: BackendMap::new(),
+            slow_start: None,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        });
+        let resp = run_through_proxy_with_header(
+            ctx,
+            header::HeaderName::from_static("x-forwarded-for"),
+            "6.6.6.6",
+        )
+        .await;
+        let seen = String::from_utf8_lossy(resp.body()).to_string();
+        assert!(
+            seen.starts_with("127.0.0.1|http|for=127.0.0.1;proto=http;host=\"127.0.0.1:"),
+            "the forged 6.6.6.6 must be replaced by the real peer: {seen}"
         );
     }
 
@@ -2964,6 +3086,7 @@ mod tests {
                 adaptive: None,
                 adaptive_limits: BackendMap::new(),
                 slow_start: None,
+                forwarded: None,
                 cluster: None,
                 metrics: test_metrics(),
                 backend_metrics: BackendMap::new(),
@@ -3147,6 +3270,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3204,6 +3328,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3275,6 +3400,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3374,6 +3500,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3453,6 +3580,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3532,6 +3660,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3702,6 +3831,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3852,6 +3982,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3903,6 +4034,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4030,6 +4162,7 @@ mod tests {
                 backend_gates: BackendMap::new(),
                 adaptive: None,
                 slow_start: None,
+                forwarded: None,
                 adaptive_limits: BackendMap::new(),
                 cluster: None,
                 metrics: test_metrics(),
@@ -4113,6 +4246,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4299,6 +4433,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4358,6 +4493,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4413,6 +4549,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4466,6 +4603,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4911,6 +5049,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4962,6 +5101,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5020,6 +5160,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5078,6 +5219,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5130,6 +5272,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5180,6 +5323,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5236,6 +5380,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5296,6 +5441,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5433,6 +5579,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5510,6 +5657,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5600,6 +5748,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5718,6 +5867,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5893,6 +6043,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5999,6 +6150,7 @@ mod tests {
             backend_gates: BackendMap::new(),
             adaptive: None,
             slow_start: None,
+            forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),

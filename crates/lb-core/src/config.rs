@@ -356,6 +356,8 @@ pub struct ListenerConfig {
     pub slow_start_ms: Option<u64>,
     #[serde(default)]
     pub local_zone: Option<String>,
+    #[serde(default)]
+    pub forwarded: Option<ForwardedConfig>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -500,6 +502,13 @@ pub struct ListenerConfig {
 
     #[serde(default)]
     pub adaptive_concurrency: Option<AdaptiveConcurrencyConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedConfig {
+    #[serde(default)]
+    pub trusted_cidrs: Vec<ipnet::IpNet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1659,6 +1668,12 @@ impl ListenerConfig {
                 if self.upstream_limits.is_some() {
                     return Err(invalid("upstream_limits is an http-only setting".into()));
                 }
+                if self.forwarded.is_some() {
+                    return Err(invalid(
+                        "forwarded is an http-only setting -- use proxy_protocol to pass client addresses over tcp"
+                            .into(),
+                    ));
+                }
                 if self.adaptive_concurrency.is_some() {
                     return Err(invalid(
                         "adaptive_concurrency is an http-only setting".into(),
@@ -1965,6 +1980,23 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(cfg.listeners[0].local_zone.as_deref(), Some("eu-1"));
+    }
+
+    #[test]
+    fn forwarded_headers_parse_and_are_http_only() {
+        let web = VALID.replacen(
+            "        [listeners.load_balancing]",
+            "        [listeners.forwarded]\n        trusted_cidrs = [\"10.0.0.0/8\"]\n\n        [listeners.load_balancing]",
+            1,
+        );
+        let cfg = Config::parse(&web).unwrap();
+        assert_eq!(
+            cfg.listeners[0].forwarded.as_ref().unwrap().trusted_cidrs,
+            vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]
+        );
+        assert!(Config::parse(VALID).unwrap().listeners[0]
+            .forwarded
+            .is_none());
     }
 
     #[test]

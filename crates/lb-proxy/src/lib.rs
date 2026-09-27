@@ -1,6 +1,7 @@
 pub mod adaptive;
 pub mod cache;
 pub mod forward;
+pub mod forwarded;
 pub mod gate;
 pub mod per_backend;
 pub mod resolver;
@@ -15,6 +16,7 @@ pub use forward::{
     build_client, forward, full_body, ForwardError, ProbeCapableClient, ProxyClient,
     ProxyRequestBody,
 };
+pub use forwarded::ForwardedHeaders;
 pub use gate::{BackendGate, GateRefusal, UpstreamLimits};
 pub use per_backend::PerBackendClients;
 pub use resolver::PinnedResolver;

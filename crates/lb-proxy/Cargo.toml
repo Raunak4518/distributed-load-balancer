@@ -8,6 +8,7 @@ homepage.workspace = true
 description = "HTTP/1.1 and HTTP/2 reverse-proxy data plane: forwarding, retries, sticky sessions, caching, WAF, and WebSocket upgrades"
 
 [dependencies]
+ipnet = "2"
 lb-core = { path = "../lb-core" }
 lb-healthcheck = { path = "../lb-healthcheck" }
 lb-metrics = { path = "../lb-metrics" }

@@ -1104,6 +1104,10 @@ pub(crate) fn build_listener_core(
                     }),
                 adaptive: lc.adaptive_concurrency.as_ref().map(adaptive_config),
                 slow_start: lc.slow_start_ms.map(Duration::from_millis),
+                forwarded: lc.forwarded.as_ref().map(|f| lb_proxy::ForwardedHeaders {
+                    trusted_cidrs: f.trusted_cidrs.clone(),
+                    client_tls: lc.tls.is_some(),
+                }),
                 adaptive_limits: match &lc.adaptive_concurrency {
                     Some(a) => all_backends()
                         .map(|b| {
