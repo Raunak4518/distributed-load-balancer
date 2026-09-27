@@ -344,6 +344,8 @@ Absent by default: no metrics/health endpoints at all. See [operations.md](opera
 | `listen` | socket address | required | must not collide with any listener's `listen` or with `cluster.listen` | Bind address for the admin/metrics listener. Bind privately — this surface exposes internal topology. |
 | `token_env` | string | none | at most one of `token_env`/`token`; named env var must be set and non-empty | Environment variable holding the admin bearer token. |
 | `token` | string | none | at most one of `token_env`/`token`; must not be empty | Literal bearer token. |
+| `read_token_env` | string | none | at most one of `read_token_env`/`read_token`; requires `token`/`token_env`; must differ from the admin token | Environment variable holding a read-only token: it may `GET` every admin route but any write (drain/undrain) gets `403`. |
+| `read_token` | string | none | same as `read_token_env` | Literal read-only token. |
 | `allow_unauthenticated` | boolean | `false` | none | Accept an admin listener on a non-loopback address with no token. |
 
 Unlike `cluster`'s secret, leaving *both* `token_env` and `token` unset is valid when `listen` is a loopback address, which only this host can reach. On any other address it is a startup error unless `allow_unauthenticated = true`. `/healthz` and `/ready` never require the token.

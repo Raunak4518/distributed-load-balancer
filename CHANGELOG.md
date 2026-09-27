@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read-only admin token and admin audit log.** `[admin] read_token` /
+  `read_token_env` may read every admin route but gets `403` on writes. Every
+  non-`GET` admin request is logged under the `lb_admin_audit` target with
+  method, path, client address, role, decision and status.
 - **Gossip push metrics:** `lb_cluster_peer_push_total{peer,outcome}` and
   `lb_cluster_last_successful_push_timestamp_seconds{peer}`.
 - **`retry_on_status`: retry listed 5xx responses on another backend** for

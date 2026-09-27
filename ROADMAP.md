@@ -38,8 +38,8 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] ACME keys written atomically, `0600`, fsynced
 - [x] Unknown config fields rejected (`deny_unknown_fields`)
 - [x] Release checksums and verified installs
-- [ ] Audit log of admin write operations (drain/undrain)
-- [ ] Separate read-only and read-write admin tokens (authorization, not just authentication)
+- [x] Audit log of admin write operations (drain/undrain)
+- [x] Separate read-only and read-write admin tokens (authorization, not just authentication)
 - [ ] Optional mTLS for the admin listener
 - [ ] `cargo deny` (licenses, sources, duplicate versions) in CI
 

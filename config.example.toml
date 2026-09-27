@@ -527,5 +527,7 @@ max_connections_per_ip = 100
 # silently. /healthz and /ready never require the token.
 # token = "..."
 # token_env = "LB_ADMIN_TOKEN"
+# A second token that may only read (GET); drain/undrain with it gets 403.
+# read_token_env = "LB_ADMIN_READ_TOKEN"
 # allow_unauthenticated = false
 # A request must then carry: Authorization: Bearer <token>
