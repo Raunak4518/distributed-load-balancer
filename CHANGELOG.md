@@ -65,6 +65,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Large request bodies are streamed instead of buffered.** Bodies up to the
+  new `request_buffer_bytes` (default 64 KiB) are buffered as before and can
+  be retried. Larger ones are streamed to the backend as they arrive, still
+  capped at `max_request_body_bytes` (`413` mid-stream), so memory per request
+  no longer grows with the body limit. A streamed request is not retried.
+  Counted by `lb_requests_streamed_total`.
 - **Breaking: with `[cluster.tls]`, a peer certificate must name its node's
   `node_id`.** Gossip is merged only under a `node_id` that appears as a DNS,
   URI or IP Subject Alternative Name in the sender's client certificate, so a

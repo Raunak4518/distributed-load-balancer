@@ -216,11 +216,12 @@ See [`load-balancing.md`](load-balancing.md#retries-and-backend-selection) for t
 | `lb_retry_attempts_total` | The first attempt failed (connect error or timeout), the method is idempotent, and a retry budget (if configured) admitted the retry — i.e., a second attempt is about to be made. |
 | `lb_retry_successes_total` | The second (retry) attempt succeeded. |
 | `lb_retry_failures_total` | The second (retry) attempt also failed. |
-| `lb_retry_not_idempotent_total` | The first attempt failed but the request method is not idempotent, so no retry is attempted. |
+| `lb_retry_not_idempotent_total` | The first attempt failed after the request may have reached the backend, and the method is not idempotent, so no retry is attempted. A connect failure is retried for any method and does not count here. |
+| `lb_requests_streamed_total` | The request body was larger than `request_buffer_bytes`, so it was streamed to the backend instead of buffered; such a request is never retried. |
 | `lb_retry_budget_admits_total` | A configured retry budget allowed the retry. |
 | `lb_retry_budget_denials_total` | A configured retry budget denied the retry (no second attempt is made). |
 
-All six are counters (`IntCounterVec`). Note that `lb_retry_failures_total` and `lb_retry_successes_total` only ever fire on the retry (second) attempt — a first-attempt failure that is never retried (denied by budget, or non-idempotent) shows up only as `lb_backend_requests_total{outcome=...}` and one of `lb_retry_not_idempotent_total` / `lb_retry_budget_denials_total`, never as a "failure."
+All seven are counters (`IntCounterVec`). Note that `lb_retry_failures_total` and `lb_retry_successes_total` only ever fire on the retry (second) attempt — a first-attempt failure that is never retried (denied by budget, or non-idempotent) shows up only as `lb_backend_requests_total{outcome=...}` and one of `lb_retry_not_idempotent_total` / `lb_retry_budget_denials_total`, never as a "failure."
 
 ## Admin API
 

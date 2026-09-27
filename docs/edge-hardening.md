@@ -64,7 +64,9 @@ write_timeout_ms = 30000
 
 ## Request body size limit
 
-`max_request_body_bytes` (default `1048576`, i.e. 1 MiB) bounds how much of a request body the proxy will buffer, and the bound holds while reading: a request declaring a larger `Content-Length` is refused with `413 Payload Too Large` before any of its body is read, and a body without a declared length is read through a counting limiter that stops as soon as the limit is passed, so memory per request never exceeds the limit plus one frame. The request is never forwarded. This is enforced independently of the body read timeout below — a body can be rejected for being too large well before it would have timed out.
+`max_request_body_bytes` (default `1048576`, i.e. 1 MiB) bounds how much of a request body the proxy will buffer, and the bound holds while reading: a request declaring a larger `Content-Length` is refused with `413 Payload Too Large` before any of its body is read, and a body without a declared length is read through a counting limiter that stops as soon as the limit is passed, so memory per request never exceeds the limit plus one frame. The request is never forwarded.
+
+Only bodies up to `request_buffer_bytes` (default 64 KiB) are buffered whole; those can be retried on another backend. Once a body passes that size, what has been read is sent to the backend and the rest is streamed through as the client sends it, still counted against `max_request_body_bytes`: a client that goes over the limit mid-stream gets `413`, the upstream request is aborted, and `lb_requests_streamed_total` counts every streamed request. Memory per request is therefore bounded by `request_buffer_bytes` plus one frame, not by `max_request_body_bytes`. A streamed request is never retried, since its body has already been consumed; the upload as a whole must still finish within `body_read_timeout` (and `request_timeout_ms`, if set). This is enforced independently of the body read timeout below — a body can be rejected for being too large well before it would have timed out.
 
 ```toml
 [[listeners]]
