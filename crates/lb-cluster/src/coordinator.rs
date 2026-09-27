@@ -20,6 +20,8 @@ pub struct ClusterMetrics {
     pub auth_failures: lb_metrics::IntCounterVec,
     pub peer_sync: lb_metrics::IntCounterVec,
     pub tracked_keys: lb_metrics::IntGauge,
+    pub peer_push: lb_metrics::IntCounterVec,
+    pub last_successful_push: lb_metrics::IntGaugeVec,
     pub known_peers: Vec<std::net::IpAddr>,
 }
 
@@ -66,6 +68,22 @@ impl<C: Clock> ClusterNode<C> {
                 .peer_sync
                 .with_label_values(&[metrics.peer_label(peer).as_str(), outcome])
                 .inc();
+        }
+    }
+
+    pub(crate) fn record_push(&self, peer: std::net::SocketAddr, outcome: &str) {
+        if let Some(metrics) = &self.metrics {
+            let label = metrics.peer_label(peer);
+            metrics
+                .peer_push
+                .with_label_values(&[label.as_str(), outcome])
+                .inc();
+            if outcome == "ok" {
+                metrics
+                    .last_successful_push
+                    .with_label_values(&[label.as_str()])
+                    .set(self.clock.unix_secs() as i64);
+            }
         }
     }
 

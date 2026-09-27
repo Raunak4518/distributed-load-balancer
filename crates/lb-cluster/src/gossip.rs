@@ -210,17 +210,51 @@ where
                 let Ok(framed) = encode(&message, node.secret()) else {
                     continue;
                 };
-                for peer in &peers {
-                    // A peer being down is normal, not an error: its counts
-                    // age out of the window on their own.
-                    let _ = push_to_peer(*peer, &framed, connect_timeout, tls.as_deref()).await;
-                }
+                push_to_all(&node, &peers, framed.into(), connect_timeout, tls.clone()).await;
             }
 
             node.prune();
             node.publish_tracked_keys();
         }
     })
+}
+
+const MAX_CONCURRENT_PUSHES: usize = 16;
+
+async fn push_to_all<C: Clock + 'static>(
+    node: &Arc<ClusterNode<C>>,
+    peers: &[SocketAddr],
+    framed: Arc<[u8]>,
+    connect_timeout: Duration,
+    tls: Option<Arc<PeerTls>>,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PUSHES));
+    let mut pushes = tokio::task::JoinSet::new();
+    for peer in peers.iter().copied() {
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            break;
+        };
+        let framed = Arc::clone(&framed);
+        let tls = tls.clone();
+        let node = Arc::clone(node);
+        pushes.spawn(async move {
+            let _slot = slot;
+            // A peer being down is normal, not an error: its counts
+            // age out of the window on their own.
+            let outcome = match tokio::time::timeout(
+                connect_timeout * 2,
+                push_to_peer(peer, &framed, connect_timeout, tls.as_deref()),
+            )
+            .await
+            {
+                Ok(Ok(())) => "ok",
+                Ok(Err(_)) => "failed",
+                Err(_) => "timeout",
+            };
+            node.record_push(peer, outcome);
+        });
+    }
+    while pushes.join_next().await.is_some() {}
 }
 
 async fn push_to_peer(
@@ -700,6 +734,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_peer_does_not_delay_pushes_to_the_others() {
+        let clock = FakeClock::new();
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+
+        let dir = tmpdir();
+        let ca = TestCa::new();
+        let ca_cert_path = dir.join("ca.crt");
+        std::fs::write(&ca_cert_path, ca.cert.pem()).unwrap();
+        let receiver_tls = Arc::new(
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "receiver", &ca_cert_path, &ca)).unwrap(),
+        );
+        let mut slow_handshakes = peer_tls_config(&dir, "sender", &ca_cert_path, &ca);
+        slow_handshakes.handshake_timeout_ms = Some(10_000);
+        let sender_tls = Arc::new(lb_tls::PeerTls::new(&slow_handshakes).unwrap());
+
+        let (stalled_listener, stalled_addr) = bound_listener().await;
+        let _hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = stalled_listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, Some(receiver_tls));
+
+        let coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 5);
+        for _ in 0..3 {
+            assert!(coord.try_admit("1.2.3.4"));
+        }
+        let _sync = spawn_sync_loop(
+            Arc::clone(&sender),
+            vec![stalled_addr, addr],
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            Some(sender_tls),
+        );
+
+        let started = std::time::Instant::now();
+        let mut converged = false;
+        while started.elapsed() < Duration::from_secs(2) {
+            if receiver
+                .store()
+                .total_in_window("web\u{1}1.2.3.4", clock.unix_secs())
+                == 3
+            {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "a peer stuck in its handshake must not hold back the others"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_outcomes_and_the_last_successful_push_are_recorded_per_peer() {
+        let clock = FakeClock::new();
+        let metrics = lb_metrics::Metrics::new().unwrap();
+        let (listener, addr) = bound_listener().await;
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.2:0")
+                .or_else(|_| std::net::TcpListener::bind("127.0.0.1:0"))
+                .unwrap();
+            listener.local_addr().unwrap()
+        };
+        let sender = Arc::new(
+            ClusterNode::new("sender", 10, clock.clone(), SECRET.to_vec()).with_metrics(
+                crate::ClusterMetrics {
+                    auth_failures: metrics.cluster_auth_failures.clone(),
+                    peer_sync: metrics.cluster_peer_sync.clone(),
+                    tracked_keys: metrics.cluster_tracked_keys.clone(),
+                    peer_push: metrics.cluster_peer_push.clone(),
+                    last_successful_push: metrics.cluster_last_successful_push.clone(),
+                    known_peers: vec![addr.ip()],
+                },
+            ),
+        );
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, None);
+        let coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 5);
+        assert!(coord.try_admit("1.2.3.4"));
+        let _sync = spawn_sync_loop(
+            Arc::clone(&sender),
+            vec![addr, dead],
+            Duration::from_millis(20),
+            Duration::from_millis(300),
+            None,
+        );
+
+        let label = addr.ip().to_string();
+        let mut recorded = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if metrics
+                .cluster_peer_push
+                .with_label_values(&[label.as_str(), "ok"])
+                .get()
+                > 0
+            {
+                recorded = true;
+                break;
+            }
+        }
+        assert!(recorded, "a successful push must be counted");
+        assert_eq!(
+            metrics
+                .cluster_last_successful_push
+                .with_label_values(&[label.as_str()])
+                .get(),
+            clock.unix_secs() as i64
+        );
+        let failure_recorded = |text: &str| {
+            ["failed", "timeout"].iter().any(|outcome| {
+                ["unknown", "127.0.0.1"].iter().any(|peer| {
+                    text.contains(&format!(
+                        "lb_cluster_peer_push_total{{outcome=\"{outcome}\",peer=\"{peer}\"}}"
+                    ))
+                })
+            })
+        };
+        let mut text = metrics.gather_text();
+        for _ in 0..150 {
+            if failure_recorded(&text) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            text = metrics.gather_text();
+        }
+        assert!(
+            failure_recorded(&text),
+            "a push to a closed port must be counted as a failure:
+{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn an_unreachable_peer_does_not_break_the_sync_loop() {
         let clock = FakeClock::new();
         let sender = Arc::new(ClusterNode::new(
@@ -764,6 +952,8 @@ mod tests {
                     auth_failures: metrics.cluster_auth_failures.clone(),
                     peer_sync: metrics.cluster_peer_sync.clone(),
                     tracked_keys: metrics.cluster_tracked_keys.clone(),
+                    peer_push: metrics.cluster_peer_push.clone(),
+                    last_successful_push: metrics.cluster_last_successful_push.clone(),
                     known_peers: vec!["127.0.0.1".parse().unwrap()],
                 },
             ),
@@ -841,6 +1031,8 @@ mod tests {
                 auth_failures: metrics.cluster_auth_failures.clone(),
                 peer_sync: metrics.cluster_peer_sync.clone(),
                 tracked_keys: metrics.cluster_tracked_keys.clone(),
+                peer_push: metrics.cluster_peer_push.clone(),
+                last_successful_push: metrics.cluster_last_successful_push.clone(),
                 known_peers: vec!["10.0.0.2".parse().unwrap()],
             },
         );

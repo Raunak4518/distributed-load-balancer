@@ -344,6 +344,8 @@ pub fn build_app(
                     auth_failures: metrics.cluster_auth_failures.clone(),
                     peer_sync: metrics.cluster_peer_sync.clone(),
                     tracked_keys: metrics.cluster_tracked_keys.clone(),
+                    peer_push: metrics.cluster_peer_push.clone(),
+                    last_successful_push: metrics.cluster_last_successful_push.clone(),
                     known_peers: c.peers.iter().map(|p| p.ip()).collect(),
                 }),
         )),

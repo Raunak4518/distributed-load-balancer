@@ -10,10 +10,10 @@ pub use handles::{
 
 /// Re-exported so consumer crates can hold metric handles without taking a
 /// direct dependency on the metrics backend.
-pub use prometheus::{IntCounter, IntCounterVec, IntGauge, Opts};
+pub use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts};
 
 use prometheus::{
-    exponential_buckets, Encoder, HistogramOpts, HistogramVec, IntGaugeVec, Registry, TextEncoder,
+    exponential_buckets, Encoder, HistogramOpts, HistogramVec, Registry, TextEncoder,
 };
 
 /// Process-wide metric families. Per-listener and per-backend handles are
@@ -31,6 +31,8 @@ pub struct Metrics {
     upstream_duration: HistogramVec,
     pub cluster_peer_sync: IntCounterVec,
     pub cluster_tracked_keys: IntGauge,
+    pub cluster_peer_push: IntCounterVec,
+    pub cluster_last_successful_push: IntGaugeVec,
 
     // Edge hardening (Phase 5)
     connections_rejected: IntCounterVec,
@@ -148,6 +150,20 @@ impl Metrics {
         let cluster_tracked_keys = IntGauge::new(
             "lb_cluster_tracked_keys",
             "Distinct rate-limit keys currently tracked",
+        )?;
+        let cluster_peer_push = IntCounterVec::new(
+            Opts::new(
+                "lb_cluster_peer_push_total",
+                "Outbound pushes of this node's counters to a peer, by outcome",
+            ),
+            &["peer", "outcome"],
+        )?;
+        let cluster_last_successful_push = IntGaugeVec::new(
+            Opts::new(
+                "lb_cluster_last_successful_push_timestamp_seconds",
+                "Unix time of the last push a peer accepted",
+            ),
+            &["peer"],
         )?;
         let connections_rejected = IntCounterVec::new(
             Opts::new(
@@ -334,6 +350,8 @@ impl Metrics {
         registry.register(Box::new(upstream_duration.clone()))?;
         registry.register(Box::new(cluster_peer_sync.clone()))?;
         registry.register(Box::new(cluster_tracked_keys.clone()))?;
+        registry.register(Box::new(cluster_peer_push.clone()))?;
+        registry.register(Box::new(cluster_last_successful_push.clone()))?;
         registry.register(Box::new(connections_rejected.clone()))?;
         registry.register(Box::new(request_timeouts.clone()))?;
         registry.register(Box::new(ratelimit_tracked_keys.clone()))?;
@@ -378,6 +396,8 @@ impl Metrics {
             upstream_duration,
             cluster_peer_sync,
             cluster_tracked_keys,
+            cluster_peer_push,
+            cluster_last_successful_push,
             connections_rejected,
             request_timeouts,
             ratelimit_tracked_keys,
