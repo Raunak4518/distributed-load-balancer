@@ -327,6 +327,7 @@ fn build_ctx(
         backend_tcp_keepalive: None,
         rate_limit_key: RateLimitKeySource::SourceIp,
         forward_timeout: Duration::from_secs(30),
+        request_timeout: None,
         max_request_body_bytes: 1024 * 1024,
         cluster: None,
         metrics: test_metrics(listener_name),

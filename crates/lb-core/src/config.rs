@@ -269,6 +269,8 @@ pub struct ListenerConfig {
     pub write_timeout_ms: Option<u64>,
     #[serde(default)]
     pub response_body_idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -628,6 +630,10 @@ impl ListenerConfig {
 
     pub fn response_body_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.response_body_idle_timeout_ms.unwrap_or(60_000))
+    }
+
+    pub fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout_ms.map(Duration::from_millis)
     }
 
     /// Whether this listener serves HTTP/2.
@@ -1216,6 +1222,9 @@ impl ListenerConfig {
                     .into(),
             ));
         }
+        if self.request_timeout_ms == Some(0) {
+            return Err(invalid("request_timeout_ms must be positive".into()));
+        }
         if self.proxy_protocol_timeout().is_zero() {
             return Err(invalid("proxy_protocol_timeout_ms must be positive".into()));
         }
@@ -1360,9 +1369,10 @@ impl ListenerConfig {
                     || self.write_timeout_ms.is_some()
                     || self.websocket_idle_timeout_ms.is_some()
                     || self.response_body_idle_timeout_ms.is_some()
+                    || self.request_timeout_ms.is_some()
                 {
                     return Err(invalid(
-                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
+                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms/request_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
                             .into(),
                     ));
                 }
@@ -1651,6 +1661,30 @@ mod tests {
           [listeners.load_balancing]
           strategy = "round_robin"
     "#;
+
+    #[test]
+    fn request_timeout_is_unset_by_default_and_validated() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert_eq!(cfg.listeners[0].request_timeout(), None);
+        let set = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        request_timeout_ms = 15000",
+        );
+        assert_eq!(
+            Config::parse(&set).unwrap().listeners[0].request_timeout(),
+            Some(Duration::from_secs(15))
+        );
+        let zero = VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        request_timeout_ms = 0",
+        );
+        assert!(Config::parse(&zero).is_err());
+        let tcp = VALID.replace(
+            "        listen = \"0.0.0.0:5432\"",
+            "        listen = \"0.0.0.0:5432\"\n        request_timeout_ms = 1000",
+        );
+        assert!(Config::parse(&tcp).is_err());
+    }
 
     #[test]
     fn response_body_idle_timeout_defaults_and_is_http_only() {

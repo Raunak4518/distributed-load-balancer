@@ -359,6 +359,7 @@ async fn dns_churn_experiment() {
         backend_tcp_keepalive: None,
         rate_limit_key: RateLimitKeySource::SourceIp,
         forward_timeout: Duration::from_secs(2),
+        request_timeout: None,
         max_request_body_bytes: 1024 * 1024,
         cluster: None,
         metrics: test_metrics(),

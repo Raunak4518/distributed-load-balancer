@@ -1054,6 +1054,7 @@ pub(crate) fn build_listener_core(
                 backend_tls_connector: backend_tls.clone(),
                 rate_limit_key: lc.rate_limit.key.clone(),
                 forward_timeout: lc.forward_timeout(),
+                request_timeout: lc.request_timeout(),
                 max_request_body_bytes: lc.max_request_body_bytes(),
                 websocket_idle_timeout: lc.websocket_idle_timeout(),
                 response_body_idle_timeout: lc.response_body_idle_timeout(),

@@ -105,6 +105,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub backend_tls_connector: Option<Arc<lb_tls::BackendConnector>>,
     pub rate_limit_key: RateLimitKeySource,
     pub forward_timeout: Duration,
+    pub request_timeout: Option<Duration>,
     pub max_request_body_bytes: usize,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
@@ -465,6 +466,21 @@ fn build_outbound_request(
 
 const RETRY_BUDGET_KEY: &str = "retry";
 
+fn deadline_exceeded(deadline: Option<tokio::time::Instant>) -> bool {
+    deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+}
+
+fn within_deadline(deadline: Option<tokio::time::Instant>, timeout: Duration) -> Duration {
+    deadline.map_or(timeout, |deadline| {
+        timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+    })
+}
+
+fn request_deadline_response(metrics: &ListenerMetrics) -> Response<ProxyBody> {
+    metrics.timeouts_request.inc();
+    simple_response(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded")
+}
+
 fn is_idempotent_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -563,6 +579,9 @@ where
     R: RateLimiter,
     C: Clock,
 {
+    let deadline = ctx
+        .request_timeout
+        .map(|timeout| tokio::time::Instant::now() + timeout);
     if let Some(challenges) = &ctx.acme_challenges {
         if let Some(token) = req
             .uri()
@@ -744,7 +763,7 @@ where
         ));
     }
     let bytes = match tokio::time::timeout(
-        ctx.body_read_timeout,
+        within_deadline(deadline, ctx.body_read_timeout),
         read_bounded(body, ctx.max_request_body_bytes),
     )
     .await
@@ -755,6 +774,9 @@ where
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body too large",
             ))
+        }
+        Err(_) if deadline_exceeded(deadline) => {
+            return Ok(request_deadline_response(&ctx.metrics));
         }
         // 408 is the right answer to a client that took too long, and
         // distinguishes a slow sender from one that sent too much.
@@ -770,6 +792,9 @@ where
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE;
     let mut tried: Vec<BackendId> = Vec::new();
     for attempt in 0..2u8 {
+        if deadline_exceeded(deadline) {
+            return Ok(request_deadline_response(&ctx.metrics));
+        }
         let pinned = (attempt == 0)
             .then(|| sticky_pin.clone())
             .flatten()
@@ -809,7 +834,13 @@ where
             Some(per_backend) => per_backend.get_or_build(&backend),
             None => ctx.client.clone(),
         };
-        match forward(&client, outbound, ctx.forward_timeout).await {
+        match forward(
+            &client,
+            outbound,
+            within_deadline(deadline, ctx.forward_timeout),
+        )
+        .await
+        {
             Ok(resp) => {
                 if attempt == 1 {
                     ctx.metrics.retry_successes.inc();
@@ -884,7 +915,12 @@ where
                     // side -- so a timeout or transport error here
                     // surfaces as a clean error instead of a truncated
                     // stream.
-                    match tokio::time::timeout(ctx.body_read_timeout, resp_body.collect()).await {
+                    match tokio::time::timeout(
+                        within_deadline(deadline, ctx.body_read_timeout),
+                        resp_body.collect(),
+                    )
+                    .await
+                    {
                         Ok(Ok(collected)) => {
                             let bytes = collected.to_bytes();
                             cache.put(key.clone(), cache_status, cache_headers, bytes.clone(), ttl);
@@ -903,6 +939,7 @@ where
                         ctx.response_body_idle_timeout,
                         Some(ctx.metrics.timeouts_upstream_body.clone()),
                     )
+                    .with_deadline(deadline, Some(ctx.metrics.timeouts_request.clone()))
                     .boxed()
                 };
 
@@ -935,6 +972,9 @@ where
                     // sees a freshly-tripped breaker instead of the stale flag
                     // from the top-of-request refresh.
                     pool.set_circuit_open(&backend_id, breaker.is_open());
+                }
+                if deadline_exceeded(deadline) {
+                    return Ok(request_deadline_response(&ctx.metrics));
                 }
                 last_status = StatusCode::BAD_GATEWAY;
                 if attempt == 1 {
@@ -1348,6 +1388,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1386,6 +1427,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1443,6 +1485,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1485,6 +1528,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1543,6 +1587,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1583,6 +1628,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1640,6 +1686,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1700,6 +1747,128 @@ mod tests {
             .await
             .expect("the proxy must end a stalled response instead of holding it open");
         response
+    }
+
+    fn ctx_with_deadline(
+        backend: &Backend,
+        pool: Arc<BackendPool>,
+        request_timeout: Duration,
+        forward_timeout: Duration,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout,
+            request_timeout: Some(request_timeout),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        })
+    }
+
+    async fn spawn_slow_headers_backend(delay: Duration) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let Ok(n) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                    }
+                    tokio::time::sleep(delay).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn the_request_deadline_cuts_off_a_slow_backend_before_the_attempt_timeout() {
+        let backend_addr = spawn_slow_headers_backend(Duration::from_millis(1_500)).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_with_deadline(
+            &backend,
+            pool,
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        );
+        let metrics = ctx.metrics.clone();
+        let started = std::time::Instant::now();
+
+        let resp = run_through_proxy(ctx).await;
+
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_millis(1_200),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(metrics.timeouts_request.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_request_deadline_bounds_a_body_that_never_goes_idle() {
+        let backend_addr = spawn_trickling_backend(40, Duration::from_millis(50), false).await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_with_deadline(
+            &backend,
+            pool,
+            Duration::from_millis(400),
+            Duration::from_secs(5),
+        );
+        let metrics = ctx.metrics.clone();
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let response = fetch_raw(addr).await;
+
+        let text = String::from_utf8_lossy(&response);
+        assert!(text.contains("hello"), "{text}");
+        assert!(
+            !text.ends_with("0\r\n\r\n"),
+            "a body cut off by the deadline must not be presented as complete: {text}"
+        );
+        assert_eq!(metrics.timeouts_request.get(), 1);
+        assert_eq!(metrics.timeouts_upstream_body.get(), 0);
     }
 
     #[tokio::test]
@@ -1939,6 +2108,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1987,6 +2157,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2049,6 +2220,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2139,6 +2311,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2209,6 +2382,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2279,6 +2453,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2440,6 +2615,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2581,6 +2757,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2623,6 +2800,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2741,6 +2919,7 @@ mod tests {
                 backend_tcp_keepalive: None,
                 rate_limit_key: RateLimitKeySource::SourceIp,
                 forward_timeout: Duration::from_secs(1),
+                request_timeout: None,
                 max_request_body_bytes: 1024,
                 cluster: None,
                 metrics: test_metrics(),
@@ -2815,6 +2994,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2992,6 +3172,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3042,6 +3223,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3088,6 +3270,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3132,6 +3315,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3568,6 +3752,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3610,6 +3795,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3659,6 +3845,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3708,6 +3895,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3751,6 +3939,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3792,6 +3981,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3839,6 +4029,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3890,6 +4081,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4018,6 +4210,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4086,6 +4279,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4167,6 +4361,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4276,6 +4471,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4417,6 +4613,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::Header("X-Api-Key".to_string()),
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4514,6 +4711,7 @@ mod tests {
             backend_tcp_keepalive: None,
             rate_limit_key: RateLimitKeySource::Header("X-Trigger".to_string()),
             forward_timeout: Duration::from_secs(1),
+            request_timeout: None,
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),

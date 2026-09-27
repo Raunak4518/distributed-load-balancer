@@ -446,6 +446,7 @@ impl Metrics {
             timeouts_upstream_body: self
                 .request_timeouts
                 .with_label_values(&[name, "upstream_body"]),
+            timeouts_request: self.request_timeouts.with_label_values(&[name, "request"]),
             tracked_keys: self.ratelimit_tracked_keys.with_label_values(&[name]),
             cluster_convergence_bound: self
                 .ratelimit_cluster_convergence_bound

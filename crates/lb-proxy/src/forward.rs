@@ -278,11 +278,24 @@ impl std::fmt::Display for UpstreamBodyIdleTimeout {
 
 impl std::error::Error for UpstreamBodyIdleTimeout {}
 
+#[derive(Debug)]
+pub struct RequestDeadlineExceeded;
+
+impl std::fmt::Display for RequestDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request deadline exceeded before the response body completed")
+    }
+}
+
+impl std::error::Error for RequestDeadlineExceeded {}
+
 pub struct IdleTimeoutBody<B> {
     inner: B,
     idle: Duration,
+    deadline: Option<tokio::time::Instant>,
     timer: std::pin::Pin<Box<tokio::time::Sleep>>,
     on_timeout: Option<lb_metrics::IntCounter>,
+    on_deadline: Option<lb_metrics::IntCounter>,
 }
 
 impl<B> IdleTimeoutBody<B> {
@@ -290,9 +303,28 @@ impl<B> IdleTimeoutBody<B> {
         IdleTimeoutBody {
             inner,
             idle,
+            deadline: None,
             timer: Box::pin(tokio::time::sleep(idle)),
             on_timeout,
+            on_deadline: None,
         }
+    }
+
+    pub fn with_deadline(
+        mut self,
+        deadline: Option<tokio::time::Instant>,
+        on_deadline: Option<lb_metrics::IntCounter>,
+    ) -> Self {
+        self.deadline = deadline;
+        self.on_deadline = on_deadline;
+        let wake = self.next_wake();
+        self.timer.as_mut().reset(wake);
+        self
+    }
+
+    fn next_wake(&self) -> tokio::time::Instant {
+        let idle = tokio::time::Instant::now() + self.idle;
+        self.deadline.map_or(idle, |deadline| deadline.min(idle))
     }
 }
 
@@ -313,7 +345,7 @@ where
         let me = self.get_mut();
         match std::pin::Pin::new(&mut me.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                let next = tokio::time::Instant::now() + me.idle;
+                let next = me.next_wake();
                 me.timer.as_mut().reset(next);
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -321,6 +353,15 @@ where
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => {
                 if me.timer.as_mut().poll(cx).is_ready() {
+                    if me
+                        .deadline
+                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                    {
+                        if let Some(counter) = me.on_deadline.take() {
+                            counter.inc();
+                        }
+                        return Poll::Ready(Some(Err(Box::new(RequestDeadlineExceeded))));
+                    }
                     if let Some(counter) = me.on_timeout.take() {
                         counter.inc();
                     }
