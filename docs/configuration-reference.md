@@ -348,7 +348,17 @@ Absent by default: no metrics/health endpoints at all. See [operations.md](opera
 | `read_token` | string | none | same as `read_token_env` | Literal read-only token. |
 | `allow_unauthenticated` | boolean | `false` | none | Accept an admin listener on a non-loopback address with no token. |
 
-Unlike `cluster`'s secret, leaving *both* `token_env` and `token` unset is valid when `listen` is a loopback address, which only this host can reach. On any other address it is a startup error unless `allow_unauthenticated = true`. `/healthz` and `/ready` never require the token.
+Unlike `cluster`'s secret, leaving *both* `token_env` and `token` unset is valid when `listen` is a loopback address, which only this host can reach. On any other address it is a startup error unless client certificates are required (`[admin.tls] client_ca_file`) or `allow_unauthenticated = true`. `/healthz` and `/ready` never require the token.
+
+### `[admin.tls]`
+
+Optional. Serves the admin API over TLS instead of plaintext. Restart-only, like the rest of `[admin]`; the certificate is loaded once at startup, and a missing or malformed file fails startup.
+
+| Field | Type | Default | Validation | Meaning |
+|---|---|---|---|---|
+| `cert_file` | path | required | readable PEM chain | Certificate the admin listener presents. |
+| `key_file` | path | required | readable PEM key matching `cert_file` | Its private key. |
+| `client_ca_file` | path | none | readable PEM with at least one certificate | When set, every client must present a certificate chaining to this CA (mutual TLS); a client without one never completes the handshake. Counts as authentication for the non-loopback rule above, and can be combined with the tokens. |
 
 ## `[logging]`
 

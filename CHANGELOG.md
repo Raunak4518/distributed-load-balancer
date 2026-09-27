@@ -46,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **TLS and mutual TLS for the admin listener.** `[admin.tls]` with
+  `cert_file`/`key_file` serves the admin API over TLS; `client_ca_file`
+  requires client certificates, which also satisfies the non-loopback
+  authentication rule.
 - **Read-only admin token and admin audit log.** `[admin] read_token` /
   `read_token_env` may read every admin route but gets `403` on writes. Every
   non-`GET` admin request is logged under the `lb_admin_audit` target with

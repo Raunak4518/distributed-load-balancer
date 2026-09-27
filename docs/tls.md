@@ -155,7 +155,7 @@ Trust is standard WebPKI, both directions, against the same `ca_file`: the accep
 
 ## Security notes and limitations
 
-- **The admin listener has no TLS.** `AdminConfig` (`[admin]`) has no TLS field at all — the admin HTTP listener (metrics, health endpoints, backend drain/undrain) is always plaintext. It must be bound to a private interface and never exposed to a public network; see [`edge-hardening.md`](edge-hardening.md) and [`operations.md`](operations.md).
+- **The admin listener is plaintext unless `[admin.tls]` is set.** With `cert_file`/`key_file` it serves TLS, and with `client_ca_file` it also requires a client certificate from that CA ([`admin.rs`](../crates/lb-tls/src/admin.rs), see [`configuration-reference.md`](configuration-reference.md#admintls)). Its certificate is loaded once at startup and is not hot-reloaded. Without `[admin.tls]` a bearer token crosses the wire in plaintext, so keep such a listener on a private interface; see [`edge-hardening.md`](edge-hardening.md) and [`operations.md`](operations.md).
 - Cipher suites are not configurable; only the minimum protocol version (`min_version`) can be set.
 - TLS session ticket keys are per-process and not shared across cluster nodes, so session resumption does not cross nodes.
 - With more than one certificate configured on a listener, an SNI that matches none of them is rejected outright — there is no default/fallback certificate.
