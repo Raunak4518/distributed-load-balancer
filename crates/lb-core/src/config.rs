@@ -493,6 +493,44 @@ pub struct ListenerConfig {
 
     #[serde(default)]
     pub upstream_limits: Option<UpstreamLimitsConfig>,
+
+    #[serde(default)]
+    pub adaptive_concurrency: Option<AdaptiveConcurrencyConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveConcurrencyConfig {
+    #[serde(default = "default_adaptive_initial_limit")]
+    pub initial_limit: usize,
+    #[serde(default = "default_adaptive_min_limit")]
+    pub min_limit: usize,
+    #[serde(default = "default_adaptive_max_limit")]
+    pub max_limit: usize,
+    #[serde(default = "default_adaptive_smoothing")]
+    pub smoothing: f64,
+    #[serde(default = "default_adaptive_tolerance")]
+    pub tolerance: f64,
+}
+
+fn default_adaptive_initial_limit() -> usize {
+    20
+}
+
+fn default_adaptive_min_limit() -> usize {
+    1
+}
+
+fn default_adaptive_max_limit() -> usize {
+    1_000
+}
+
+fn default_adaptive_smoothing() -> f64 {
+    0.2
+}
+
+fn default_adaptive_tolerance() -> f64 {
+    1.5
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1366,6 +1404,23 @@ impl ListenerConfig {
                 "retry_on_status may only list 5xx statuses, got {status}"
             )));
         }
+        if let Some(adaptive) = &self.adaptive_concurrency {
+            if !(1 <= adaptive.min_limit
+                && adaptive.min_limit <= adaptive.initial_limit
+                && adaptive.initial_limit <= adaptive.max_limit)
+            {
+                return Err(invalid(
+                    "adaptive_concurrency requires 1 <= min_limit <= initial_limit <= max_limit"
+                        .into(),
+                ));
+            }
+            if !(adaptive.smoothing > 0.0 && adaptive.smoothing <= 1.0) || adaptive.tolerance < 1.0
+            {
+                return Err(invalid(
+                    "adaptive_concurrency requires 0 < smoothing <= 1 and tolerance >= 1".into(),
+                ));
+            }
+        }
         if let Some(limits) = &self.upstream_limits {
             if limits.max_active_per_backend == 0 || limits.max_queue_ms == 0 {
                 return Err(invalid(
@@ -1577,6 +1632,11 @@ impl ListenerConfig {
                 }
                 if self.upstream_limits.is_some() {
                     return Err(invalid("upstream_limits is an http-only setting".into()));
+                }
+                if self.adaptive_concurrency.is_some() {
+                    return Err(invalid(
+                        "adaptive_concurrency is an http-only setting".into(),
+                    ));
                 }
                 if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
                     return Err(invalid(format!(
@@ -1856,6 +1916,32 @@ mod tests {
         assert!(Config::parse(&with("reject_at = 1.5")).is_err());
         assert!(Config::parse(&with("max_memory_bytes = 0")).is_err());
         assert!(Config::parse(VALID).unwrap().server.overload.is_none());
+    }
+
+    #[test]
+    fn adaptive_concurrency_parses_with_defaults_and_is_validated() {
+        let web_only = |body: &str| {
+            VALID.replacen(
+                "        [listeners.load_balancing]",
+                &format!(
+                    "        [listeners.adaptive_concurrency]\n{body}\n\n        [listeners.load_balancing]"
+                ),
+                1,
+            )
+        };
+        let cfg = Config::parse(&web_only("")).unwrap();
+        let adaptive = cfg.listeners[0].adaptive_concurrency.clone().unwrap();
+        assert_eq!(
+            (
+                adaptive.initial_limit,
+                adaptive.min_limit,
+                adaptive.max_limit
+            ),
+            (20, 1, 1_000)
+        );
+        assert!(Config::parse(&web_only("        min_limit = 50")).is_err());
+        assert!(Config::parse(&web_only("        smoothing = 0.0")).is_err());
+        assert!(Config::parse(&web_only("        tolerance = 0.5")).is_err());
     }
 
     #[test]

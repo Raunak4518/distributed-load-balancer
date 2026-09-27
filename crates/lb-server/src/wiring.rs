@@ -768,6 +768,16 @@ fn build_outlier_detector(
     )))
 }
 
+fn adaptive_config(a: &lb_core::AdaptiveConcurrencyConfig) -> lb_proxy::AdaptiveConfig {
+    lb_proxy::AdaptiveConfig {
+        initial_limit: a.initial_limit,
+        min_limit: a.min_limit,
+        max_limit: a.max_limit,
+        smoothing: a.smoothing,
+        tolerance: a.tolerance,
+    }
+}
+
 /// Builds one listener's pool, rate limiter, circuit breakers, and
 /// protocol-specific context. Infallible: the one fallible step for a
 /// listener (`build_backend_connector`, real file I/O) has already happened
@@ -1075,6 +1085,18 @@ pub(crate) fn build_listener_core(
                         max_pending: u.max_pending_per_backend,
                         max_queue: Duration::from_millis(u.max_queue_ms),
                     }),
+                adaptive: lc.adaptive_concurrency.as_ref().map(adaptive_config),
+                adaptive_limits: match &lc.adaptive_concurrency {
+                    Some(a) => all_backends()
+                        .map(|b| {
+                            (
+                                b.id.clone(),
+                                lb_proxy::AdaptiveLimit::new(adaptive_config(a)),
+                            )
+                        })
+                        .collect(),
+                    None => BackendMap::new(),
+                },
                 backend_gates: match &lc.upstream_limits {
                     Some(u) => all_backends()
                         .map(|b| {
@@ -1216,6 +1238,8 @@ pub(crate) fn spawn_listener_tasks(
                         outlier: core.outlier.clone(),
                         gates: ctx.backend_gates.clone(),
                         gate_size: ctx.upstream_limits.map(|l| l.max_active),
+                        adaptive: ctx.adaptive_limits.clone(),
+                        adaptive_config: ctx.adaptive,
                     },
                 ));
             }
@@ -1286,6 +1310,8 @@ pub(crate) fn spawn_listener_tasks(
                         outlier: core.outlier.clone(),
                         gates: BackendMap::new(),
                         gate_size: None,
+                        adaptive: BackendMap::new(),
+                        adaptive_config: None,
                     },
                 ));
             }

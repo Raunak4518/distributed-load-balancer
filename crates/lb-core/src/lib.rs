@@ -22,11 +22,11 @@ pub use clock::test_util;
 pub use clock::{Clock, SystemClock};
 pub use cluster::ClusterCoordinator;
 pub use config::{
-    AdminConfig, BackendConfig, BackendTlsConfig, CacheConfig, CanaryPoolConfig, CertificateConfig,
-    ClusterConfig, Config, HealthCheckConfig, ListenerConfig, LoadBalancingConfig,
-    LoadBalancingStrategy, LogFormat, LoggingConfig, OverloadConfig, PeerTlsConfig, Protocol,
-    RateLimitConfig, RateLimitKeySource, RouteConfig, ServerConfig, StickyConfig,
-    TcpKeepaliveConfig, TlsConfig, TlsVersion, TracingConfig, WafConfig, WafMode,
+    AdaptiveConcurrencyConfig, AdminConfig, BackendConfig, BackendTlsConfig, CacheConfig,
+    CanaryPoolConfig, CertificateConfig, ClusterConfig, Config, HealthCheckConfig, ListenerConfig,
+    LoadBalancingConfig, LoadBalancingStrategy, LogFormat, LoggingConfig, OverloadConfig,
+    PeerTlsConfig, Protocol, RateLimitConfig, RateLimitKeySource, RouteConfig, ServerConfig,
+    StickyConfig, TcpKeepaliveConfig, TlsConfig, TlsVersion, TracingConfig, WafConfig, WafMode,
 };
 pub use dns::DnsDiscoveryConfig;
 pub use error::ConfigError;

@@ -1,3 +1,4 @@
+pub mod adaptive;
 pub mod cache;
 pub mod forward;
 pub mod gate;
@@ -8,6 +9,7 @@ pub mod sticky;
 pub mod upgrade;
 pub mod waf;
 
+pub use adaptive::{AdaptiveConfig, AdaptiveGuard, AdaptiveLimit};
 pub use cache::{spawn_cache_sweeper, ResponseCache};
 pub use forward::{
     build_client, forward, full_body, ForwardError, ProbeCapableClient, ProxyClient,

@@ -48,6 +48,8 @@ pub(crate) struct DnsBackendRuntime {
     pub(crate) outlier: Option<Arc<OutlierDetector>>,
     pub(crate) gates: BackendMap<lb_proxy::BackendGate>,
     pub(crate) gate_size: Option<usize>,
+    pub(crate) adaptive: BackendMap<lb_proxy::AdaptiveLimit>,
+    pub(crate) adaptive_config: Option<lb_proxy::AdaptiveConfig>,
 }
 
 impl DnsBackendRuntime {
@@ -71,6 +73,10 @@ impl DnsBackendRuntime {
         if let Some(size) = self.gate_size {
             self.gates
                 .reconcile(live, |_| lb_proxy::BackendGate::new(size));
+        }
+        if let Some(cfg) = self.adaptive_config {
+            self.adaptive
+                .reconcile(live, |_| lb_proxy::AdaptiveLimit::new(cfg));
         }
         for id in departed {
             self.metrics.remove_backend(&self.listener_name, &id.0);
@@ -271,6 +277,8 @@ mod tests {
             outlier: None,
             gates: BackendMap::new(),
             gate_size: None,
+            adaptive: BackendMap::new(),
+            adaptive_config: None,
         }
     }
 

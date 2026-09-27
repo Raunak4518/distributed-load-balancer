@@ -88,6 +88,7 @@ pub struct ListenerMetrics {
     pub overload_rejected: IntCounter,
     pub upstream_overflow_queue_full: IntCounter,
     pub upstream_overflow_queue_timeout: IntCounter,
+    pub upstream_overflow_concurrency_limit: IntCounter,
     pub upstream_queue_duration: Histogram,
     pub requests_streamed: IntCounter,
     /// Early warning that the rate-limit overflow bucket is about to engage.
@@ -244,4 +245,5 @@ pub struct BackendMetrics {
     pub requests_failure: IntCounter,
     pub requests_timeout: IntCounter,
     pub upstream_duration: Histogram,
+    pub concurrency_limit: IntGauge,
 }

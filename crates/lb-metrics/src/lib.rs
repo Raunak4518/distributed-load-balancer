@@ -24,6 +24,7 @@ pub struct Metrics {
     requests_total: IntCounterVec,
     request_duration: HistogramVec,
     upstream_overflow: IntCounterVec,
+    backend_concurrency_limit: IntGaugeVec,
     upstream_queue_duration: HistogramVec,
     active_connections: IntGaugeVec,
     connections_total: IntCounterVec,
@@ -355,6 +356,14 @@ impl Metrics {
             &["listener", "reason"],
         )?;
         registry.register(Box::new(upstream_overflow.clone()))?;
+        let backend_concurrency_limit = IntGaugeVec::new(
+            Opts::new(
+                "lb_backend_concurrency_limit",
+                "Current adaptive concurrency limit of a backend",
+            ),
+            &["listener", "backend"],
+        )?;
+        registry.register(Box::new(backend_concurrency_limit.clone()))?;
         let upstream_queue_duration = HistogramVec::new(
             HistogramOpts::new(
                 "lb_upstream_queue_duration_seconds",
@@ -432,6 +441,7 @@ impl Metrics {
             requests_total,
             request_duration,
             upstream_overflow,
+            backend_concurrency_limit,
             upstream_queue_duration,
             active_connections,
             connections_total,
@@ -535,6 +545,9 @@ impl Metrics {
             upstream_overflow_queue_timeout: self
                 .upstream_overflow
                 .with_label_values(&[name, "queue_timeout"]),
+            upstream_overflow_concurrency_limit: self
+                .upstream_overflow
+                .with_label_values(&[name, "concurrency_limit"]),
             upstream_queue_duration: self.upstream_queue_duration.with_label_values(&[name]),
             tracked_keys: self.ratelimit_tracked_keys.with_label_values(&[name]),
             cluster_convergence_bound: self
@@ -609,6 +622,9 @@ impl Metrics {
             upstream_duration: self
                 .upstream_duration
                 .with_label_values(&[listener, backend]),
+            concurrency_limit: self
+                .backend_concurrency_limit
+                .with_label_values(&[listener, backend]),
         }
     }
 
@@ -626,6 +642,9 @@ impl Metrics {
         }
         let _ = self
             .upstream_duration
+            .remove_label_values(&[listener, backend]);
+        let _ = self
+            .backend_concurrency_limit
             .remove_label_values(&[listener, backend]);
     }
 
