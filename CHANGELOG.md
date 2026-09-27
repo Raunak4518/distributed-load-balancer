@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cache purge API.** `POST /cache/{listener}/purge` on the admin listener
+  removes cached entries, optionally only for one `host` or `path_prefix`.
 - **Cache eviction.** A full response cache now evicts its least recently
   used entries to admit new ones, instead of refusing new entries until old
   ones expire.

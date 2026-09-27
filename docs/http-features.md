@@ -157,6 +157,15 @@ A background task runs `sweep_expired()` on a fixed interval for the life of the
 - **No revalidation.** `ETag`, `Last-Modified` and conditional requests are not supported: a conditional request that hits the cache receives the full stored `200` rather than a `304`, and an expired entry is refetched rather than revalidated.
 - **Hits bypass pool selection.** The cache is consulted before route matching, the canary split and the sticky pin, so a hit is served without choosing a pool. A canary pool's configured `percent` therefore applies to cache misses only, and a response stored from one pool can be served to clients the split would have sent to the other. Keep canary-sensitive paths out of the cache with `Cache-Control: no-store` or `private` from the backend.
 
+### Purging
+
+`POST /cache/{listener}/purge` on the admin listener drops cached entries before they expire, for example after a deploy. `host` and `path_prefix` query parameters narrow it; without either, the listener's whole cache is emptied. `path_prefix` matches whole path segments (`/docs` purges `/docs` and `/docs/a`, not `/docsite`), `host` is case-insensitive, and both are taken literally rather than percent-decoded. The response is JSON with the number of entries removed. Like drain, it is a write: it needs the full admin token, gets `403` with the read-only one, and is written to the admin audit log.
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN"   "http://127.0.0.1:9090/cache/web/purge?host=shop.example&path_prefix=/docs"
+# {"listener":"web","host":"shop.example","path_prefix":"/docs","purged":3}
+```
+
 ### Configuration
 
 ```toml

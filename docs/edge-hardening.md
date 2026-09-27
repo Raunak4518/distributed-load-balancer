@@ -155,7 +155,7 @@ Matches are recorded per rule: `lb_waf_blocked_total{listener, rule="sql_injecti
 
 ## Admin API authentication
 
-The admin listener (`[admin]`) serves `/metrics`, `/healthz`, `/ready`, and any `/backends/...` drain/undrain routes on a port meant to stay off the public internet. Configuring `token` or `token_env` under `[admin]` gates every one of those routes except the `/healthz` and `/ready` probes behind a bearer token:
+The admin listener (`[admin]`) serves `/metrics`, `/healthz`, `/ready`, any `/backends/...` drain/undrain routes, and `/cache/.../purge` on a port meant to stay off the public internet. Configuring `token` or `token_env` under `[admin]` gates every one of those routes except the `/healthz` and `/ready` probes behind a bearer token:
 
 ```toml
 [admin]
@@ -169,7 +169,7 @@ token_env = "LB_ADMIN_TOKEN"   # preferred: config files end up in version contr
 - A missing or mismatched token — including one of a different length than the real token, which must not panic the constant-time comparison — returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header, and increments `lb_admin_auth_failures_total`.
 - `token` and `token_env` are mutually exclusive; setting both is a config validation error. An empty resolved token is also rejected at startup.
 - `[admin.tls]` serves the admin API over TLS, and `client_ca_file` makes it require a client certificate from that CA (mutual TLS), which on its own satisfies the non-loopback authentication rule. A token alone over plaintext can be sniffed by anything on the path, so prefer TLS whenever the admin port is reachable beyond the host.
-- A second, read-only token (`read_token` / `read_token_env`) can be issued to dashboards and scrapers: it may read every route, but a write (`POST` to drain/undrain) with it gets `403 Forbidden`. The full `token` can do both.
+- A second, read-only token (`read_token` / `read_token_env`) can be issued to dashboards and scrapers: it may read every route, but a write (`POST` to drain/undrain or cache purge) with it gets `403 Forbidden`. The full `token` can do both.
 - Every admin request that is not a `GET`/`HEAD` — allowed or refused — is logged under the `lb_admin_audit` tracing target with its method, path, client address, role (`admin`, `read_only`, `unauthenticated`, or `none` for an unrecognized token), whether it was allowed, and the response status. Route that target to durable storage to keep an audit trail of who drained what.
 - The admin listener accepts at most 64 connections at once (further ones wait in the kernel backlog) and closes any connection that has not sent a complete request head within 5 seconds, so it cannot be held open by idle or slowloris clients.
 - `/healthz` and `/ready` answer without a token, so an orchestrator or load balancer can probe them without holding the secret. Each reveals one bit.
