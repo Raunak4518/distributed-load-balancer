@@ -337,6 +337,7 @@ fn build_ctx(
         slow_start: None,
         headers: None,
         direct_responses: Vec::new(),
+        mirror: None,
         forwarded: None,
         adaptive_limits: lb_core::BackendMap::new(),
         max_request_body_bytes: 1024 * 1024,

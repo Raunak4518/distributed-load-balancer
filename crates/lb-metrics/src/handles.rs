@@ -91,6 +91,10 @@ pub struct ListenerMetrics {
     pub upstream_overflow_concurrency_limit: IntCounter,
     pub upstream_queue_duration: Histogram,
     pub requests_streamed: IntCounter,
+    pub mirror_sent: IntCounter,
+    pub mirror_failed: IntCounter,
+    pub mirror_dropped: IntCounter,
+    pub mirror_skipped: IntCounter,
     /// Early warning that the rate-limit overflow bucket is about to engage.
     pub tracked_keys: IntGauge,
     /// Worst-case count by which this listener's cluster-wide rate limit

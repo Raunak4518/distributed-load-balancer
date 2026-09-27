@@ -84,6 +84,7 @@ pub struct Metrics {
     retry_budget_denials: IntCounterVec,
     retry_not_idempotent: IntCounterVec,
     requests_streamed: IntCounterVec,
+    mirror_requests: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -435,6 +436,14 @@ impl Metrics {
             &["listener"],
         )?;
         registry.register(Box::new(requests_streamed.clone()))?;
+        let mirror_requests = IntCounterVec::new(
+            Opts::new(
+                "lb_mirror_requests_total",
+                "Requests copied to the listener's mirror, by listener and result",
+            ),
+            &["listener", "result"],
+        )?;
+        registry.register(Box::new(mirror_requests.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -480,6 +489,7 @@ impl Metrics {
             retry_budget_denials,
             retry_not_idempotent,
             requests_streamed,
+            mirror_requests,
         })
     }
 
@@ -600,6 +610,10 @@ impl Metrics {
             retry_budget_denials: self.retry_budget_denials.with_label_values(&[name]),
             retry_not_idempotent: self.retry_not_idempotent.with_label_values(&[name]),
             requests_streamed: self.requests_streamed.with_label_values(&[name]),
+            mirror_sent: self.mirror_requests.with_label_values(&[name, "sent"]),
+            mirror_failed: self.mirror_requests.with_label_values(&[name, "failed"]),
+            mirror_dropped: self.mirror_requests.with_label_values(&[name, "dropped"]),
+            mirror_skipped: self.mirror_requests.with_label_values(&[name, "skipped"]),
         }
     }
 

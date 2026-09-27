@@ -1104,6 +1104,9 @@ pub(crate) fn build_listener_core(
                     }),
                 adaptive: lc.adaptive_concurrency.as_ref().map(adaptive_config),
                 slow_start: lc.slow_start_ms.map(Duration::from_millis),
+                mirror: lc.mirror.as_ref().map(|m| {
+                    lb_proxy::Mirror::new(m.address, m.percent, m.max_in_flight, m.timeout())
+                }),
                 direct_responses: lc
                     .direct_responses
                     .iter()

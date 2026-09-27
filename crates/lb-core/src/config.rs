@@ -362,6 +362,8 @@ pub struct ListenerConfig {
     pub headers: Option<HeaderRewriteConfig>,
     #[serde(default)]
     pub direct_responses: Vec<DirectResponseConfig>,
+    #[serde(default)]
+    pub mirror: Option<MirrorConfig>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -537,6 +539,52 @@ pub struct DirectResponseConfig {
     pub redirect: Option<String>,
     #[serde(default)]
     pub keep_path: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorConfig {
+    pub address: SocketAddr,
+    #[serde(default = "default_mirror_percent")]
+    pub percent: u8,
+    #[serde(default = "default_mirror_max_in_flight")]
+    pub max_in_flight: usize,
+    #[serde(default = "default_mirror_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_mirror_percent() -> u8 {
+    100
+}
+
+fn default_mirror_max_in_flight() -> usize {
+    64
+}
+
+fn default_mirror_timeout_ms() -> u64 {
+    1_000
+}
+
+impl MirrorConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=100).contains(&self.percent) {
+            return Err(format!(
+                "mirror.percent must be between 1 and 100, got {}",
+                self.percent
+            ));
+        }
+        if self.max_in_flight == 0 {
+            return Err("mirror.max_in_flight must be at least 1".into());
+        }
+        if self.timeout_ms == 0 {
+            return Err("mirror.timeout_ms must be at least 1".into());
+        }
+        Ok(())
+    }
+
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
 }
 
 const REDIRECT_STATUSES: &[u16] = &[301, 302, 303, 307, 308];
@@ -1622,6 +1670,9 @@ impl ListenerConfig {
                 for direct in &self.direct_responses {
                     direct.validate().map_err(invalid)?;
                 }
+                if let Some(mirror) = &self.mirror {
+                    mirror.validate().map_err(invalid)?;
+                }
                 if self.health_check.path.is_none() {
                     return Err(invalid(
                         "health_check.path is required for http listeners".into(),
@@ -1765,6 +1816,9 @@ impl ListenerConfig {
                 }
                 if !self.direct_responses.is_empty() {
                     return Err(invalid("direct_responses is an http-only setting".into()));
+                }
+                if self.mirror.is_some() {
+                    return Err(invalid("mirror is an http-only setting".into()));
                 }
                 if !self.routes.is_empty() {
                     return Err(invalid(
@@ -2120,6 +2174,31 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(cfg.listeners[0].local_zone.as_deref(), Some("eu-1"));
+    }
+
+    #[test]
+    fn mirror_parses_with_defaults_and_is_validated() {
+        let with = |body: &str| {
+            VALID.replacen(
+                "        [listeners.load_balancing]",
+                &format!("        [listeners.mirror]\n        address = \"127.0.0.1:9000\"\n{body}\n\n        [listeners.load_balancing]"),
+                1,
+            )
+        };
+        let cfg = Config::parse(&with("")).unwrap();
+        let mirror = cfg.listeners[0].mirror.as_ref().unwrap();
+        assert_eq!(mirror.address, "127.0.0.1:9000".parse().unwrap());
+        assert_eq!(mirror.percent, 100);
+        assert_eq!(mirror.max_in_flight, 64);
+        assert_eq!(mirror.timeout(), Duration::from_secs(1));
+        for bad in [
+            "        percent = 0",
+            "        percent = 101",
+            "        max_in_flight = 0",
+            "        timeout_ms = 0",
+        ] {
+            assert!(Config::parse(&with(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
