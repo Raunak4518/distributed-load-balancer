@@ -23,6 +23,8 @@ pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncMessage {
     pub node_id: String,
+    #[serde(default)]
+    pub incarnation: u64,
     pub entries: Vec<KeyEntry>,
 }
 
@@ -101,6 +103,7 @@ mod tests {
     fn sample() -> SyncMessage {
         SyncMessage {
             node_id: "lb-1".into(),
+            incarnation: 0,
             entries: vec![KeyEntry {
                 key: "127.0.0.1".into(),
                 buckets: vec![(1_700_000_000, 5), (1_700_000_001, 2)],
@@ -249,6 +252,7 @@ mod tests {
         }
         let msg = SyncMessage {
             node_id: "lb-1".into(),
+            incarnation: 0,
             entries,
         };
 

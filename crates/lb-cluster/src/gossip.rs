@@ -1198,6 +1198,7 @@ mod tests {
                 .collect();
             let msg = SyncMessage {
                 node_id: "attacker".to_string(),
+                incarnation: 0,
                 entries,
             };
             let framed = encode(&msg, SECRET).unwrap();

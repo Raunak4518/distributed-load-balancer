@@ -323,6 +323,7 @@ mod duplication_and_reordering {
         use crate::protocol::KeyEntry;
         SyncMessage {
             node_id: format!("peer-{sender}"),
+            incarnation: 0,
             entries: vec![KeyEntry {
                 key: format!("k{}", salt % 3),
                 buckets: vec![(now - (salt % 4), 1 + salt % 7)],

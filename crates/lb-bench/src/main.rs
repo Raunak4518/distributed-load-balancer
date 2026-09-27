@@ -304,6 +304,7 @@ fn bench_counter_store_at_scale() {
         let bucket_entry_count: usize = snap.iter().map(|(_, buckets)| buckets.len()).sum();
         let msg = SyncMessage {
             node_id: "self".to_string(),
+            incarnation: 0,
             entries: snap
                 .iter()
                 .map(|(key, buckets)| KeyEntry {

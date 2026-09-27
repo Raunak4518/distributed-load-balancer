@@ -38,6 +38,7 @@ impl ClusterMetrics {
 pub struct ClusterNode<C: Clock> {
     metrics: Option<ClusterMetrics>,
     node_id: String,
+    incarnation: u64,
     store: CounterStore,
     clock: C,
     /// Pre-shared key authenticating every peer message. Mandatory: the peer
@@ -51,10 +52,24 @@ impl<C: Clock> ClusterNode<C> {
         ClusterNode {
             metrics: None,
             node_id: node_id.into(),
+            incarnation: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1)
+                .max(1),
             store: CounterStore::new(window_secs),
             clock,
             secret,
         }
+    }
+
+    pub fn with_incarnation(mut self, incarnation: u64) -> Self {
+        self.incarnation = incarnation;
+        self
+    }
+
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     pub fn with_metrics(mut self, metrics: ClusterMetrics) -> Self {
@@ -127,9 +142,9 @@ impl<C: Clock> ClusterNode<C> {
             return MergeOutcome::OwnNodeIdEcho;
         }
         let now = self.clock.unix_secs();
+        let slot = crate::counters::node_slot(&msg.node_id, msg.incarnation);
         for entry in &msg.entries {
-            self.store
-                .merge(&entry.key, &msg.node_id, &entry.buckets, now);
+            self.store.merge(&entry.key, &slot, &entry.buckets, now);
         }
         MergeOutcome::Merged
     }
@@ -139,6 +154,7 @@ impl<C: Clock> ClusterNode<C> {
         let now = self.clock.unix_secs();
         SyncMessage {
             node_id: self.node_id.clone(),
+            incarnation: self.incarnation,
             entries: self
                 .store
                 .snapshot_own(&self.node_id, now)
@@ -207,6 +223,50 @@ pub fn convergence_over_admission_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restarted_peer_adds_to_its_previous_boot_instead_of_being_maxed_with_it() {
+        let clock = lb_core::test_util::FakeClock::new();
+        let receiver = ClusterNode::new("receiver", 10, clock.clone(), b"s".to_vec());
+        let first_boot = Arc::new(
+            ClusterNode::new("peer", 10, clock.clone(), b"s".to_vec()).with_incarnation(1),
+        );
+        let first = ListenerCoordinator::new(Arc::clone(&first_boot), "web", 1_000);
+        for _ in 0..30 {
+            assert!(first.try_admit("1.2.3.4"));
+        }
+        receiver.merge_message(&first_boot.snapshot_message());
+
+        let second_boot = Arc::new(
+            ClusterNode::new("peer", 10, clock.clone(), b"s".to_vec()).with_incarnation(2),
+        );
+        let second = ListenerCoordinator::new(Arc::clone(&second_boot), "web", 1_000);
+        for _ in 0..20 {
+            assert!(second.try_admit("1.2.3.4"));
+        }
+        receiver.merge_message(&second_boot.snapshot_message());
+
+        assert_eq!(
+            receiver
+                .store()
+                .total_in_window("web\u{1}1.2.3.4", clock.unix_secs()),
+            50
+        );
+    }
+
+    #[test]
+    fn a_message_from_a_peer_without_incarnations_still_merges() {
+        let clock = lb_core::test_util::FakeClock::new();
+        let receiver = ClusterNode::new("receiver", 10, clock.clone(), b"s".to_vec());
+        let now = clock.unix_secs();
+        let msg: SyncMessage = serde_json::from_str(&format!(
+            r#"{{"node_id":"old-peer","entries":[{{"key":"web\u0001k","buckets":[[{now},7]]}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(msg.incarnation, 0);
+        receiver.merge_message(&msg);
+        assert_eq!(receiver.store().total_in_window("web\u{1}k", now), 7);
+    }
     use lb_core::test_util::FakeClock;
     use std::time::Duration;
 
@@ -407,6 +467,7 @@ mod tests {
     fn sync_message_strategy(now: u64) -> impl Strategy<Value = SyncMessage> {
         prop::collection::vec(key_entry_strategy(now), 0..5).prop_map(|entries| SyncMessage {
             node_id: "peer".to_string(),
+            incarnation: 0,
             entries,
         })
     }
@@ -430,6 +491,7 @@ mod tests {
                 sender,
                 SyncMessage {
                     node_id: format!("peer{sender}"),
+                    incarnation: 0,
                     entries: vec![entry],
                 },
             )

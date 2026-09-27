@@ -27,6 +27,14 @@ pub struct CounterStore {
 
 pub(crate) const MAX_TRACKED_KEYS: usize = 100_000;
 
+pub(crate) fn node_slot(node_id: &str, incarnation: u64) -> String {
+    if incarnation == 0 {
+        node_id.to_string()
+    } else {
+        format!("{node_id}\u{0}{incarnation}")
+    }
+}
+
 fn overflow_key(key: &str) -> String {
     let listener = key.split('\u{1}').next().unwrap_or_default();
     format!("{listener}\u{1}\u{0}overflow")
@@ -219,6 +227,7 @@ impl CounterStore {
     }
 
     fn skew_peer_label<'a>(&self, node_id: &'a str) -> &'a str {
+        let node_id = node_id.split('\u{0}').next().unwrap_or(node_id);
         if self.skew_labeled_peers.contains(node_id) {
             return node_id;
         }
@@ -381,7 +390,8 @@ impl CounterStore {
                             .iter()
                             .map(|(epoch, count)| (*epoch, *count))
                             .collect();
-                        (node_id.clone(), cells)
+                        let node_id = node_id.split('\u{0}').next().unwrap_or(node_id);
+                        (node_id.to_string(), cells)
                     })
                     .collect();
                 (item.key().clone(), nodes)
