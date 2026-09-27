@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Duplicate or missing `Host` headers reached backends.** A request with
+  two `Host` headers was forwarded with both, letting the proxy route on one
+  name while the backend served another. Duplicate, malformed and (on
+  HTTP/1.1) missing `Host` headers are now refused with `400`, and an
+  absolute-form target or HTTP/2 `:authority` now overrides `Host`.
 - **Release downloads can be verified.** Every release now publishes a
   `SHA256SUMS` file, and `scripts/install.sh` checks the downloaded tarball
   against it before installing, refusing a release without one unless

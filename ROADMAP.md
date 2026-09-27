@@ -54,7 +54,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Random, P2C least-request, weighted random strategies
 - [x] Peak-EWMA score extended with error rate, tail latency and queue delay, with hysteresis
 - [x] `Forwarded` / `X-Forwarded-*` with trusted-proxy semantics
-- [ ] Request smuggling defenses audit (TE/CL, duplicate headers, authority/Host validation)
+- [x] Request smuggling defenses audit (TE/CL, duplicate headers, authority/Host validation)
 - [ ] Header rewrite, redirects, fixed/maintenance responses
 - [ ] Request mirroring / shadow traffic
 - [ ] Cache: `ETag`/`Last-Modified` revalidation, `stale-while-revalidate`, `stale-if-error`, request coalescing, purge API, LRU/TinyLFU eviction

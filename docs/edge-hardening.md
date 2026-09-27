@@ -191,6 +191,16 @@ Every structure that is keyed, directly or indirectly, by attacker-controlled in
 - **Rate-limit keys**: `rate_limit.max_tracked_keys` (default `100000`) caps how many distinct rate-limit keys (source IPs, or fixed-size hashes of header values) a listener tracks, so both the number and the size of tracked keys are bounded. Beyond this cap, additional distinct keys share one overflow budget rather than being individually rejected or causing an established key's state to be evicted. The cap is checked before insertion, so requests for new keys racing each other can exceed it by one small entry each. Full rate-limiting behavior is covered in [rate-limiting.md](rate-limiting.md).
 - **Response cache**: `cache.max_entry_bytes` (default 2 MiB) rejects caching any single response larger than this — the response is still served, just not stored. `cache.max_total_bytes` (default 64 MiB) is a hard aggregate budget across every entry a listener's cache holds (bytes are reserved atomically before insertion, so concurrent inserts cannot overshoot it); once full, new entries are simply not admitted until something already stored expires and is swept. There is no eviction algorithm competing for space. Cache behavior in full is out of this page's scope.
 
+## Request smuggling and Host confusion
+
+The proxy never forwards a client's framing as-is: hyper parses the client side, the proxy reads the body itself (buffered or streamed, see above), and hyper frames the request to the backend again, so the proxy and the backend cannot disagree about where a request ends. The cases are pinned by [`smuggling_integration.rs`](../crates/lb-server/tests/smuggling_integration.rs), which sends each attack over a raw socket and records every byte the backend receives:
+
+- **`Content-Length` together with `Transfer-Encoding: chunked`**: framed by chunked alone, the `Content-Length` is dropped before forwarding, and the connection is closed after the response (RFC 9112 §6.1), so bytes after the chunked body can never become a second request.
+- **Two different `Content-Length` values**: `400`, nothing forwarded.
+- **More than one `Host` header, an unparseable `Host`, or an HTTP/1.1 request with no `Host`**: `400`, nothing forwarded (RFC 9112 §3.2).
+- **Absolute-form target (`GET http://a.example/`) or HTTP/2 `:authority`**: `Host` is rewritten to that authority before routing and forwarding, so the route the proxy picks and the host the backend sees can never differ.
+- **Chunked request bodies** reach the backend with exactly one framing header.
+
 ## Overload shedding
 
 `[server.overload]` ([`overload.rs`](../crates/lb-server/src/overload.rs)) watches connection-slot use, resident memory and file descriptors, and sheds work before the process runs out of any of them: first by closing HTTP/1.1 connections after their current response, then by answering new requests `503` with `Retry-After`, refusing new TCP connections, and failing `/ready` so the instance is taken out of rotation. The admin listener is never shed, so operators can still see what is happening. `lb_overload_level` and `lb_overload_pressure_permille{resource}` show the state; `lb_overload_rejected_total{listener}` counts refused work. See [`configuration-reference.md`](configuration-reference.md#serveroverload).
