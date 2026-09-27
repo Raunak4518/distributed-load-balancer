@@ -27,6 +27,7 @@ struct BackendState {
     /// an early return from the caller.
     active_conns: AtomicUsize,
     awaiting_first_probe: AtomicBool,
+    became_eligible_nanos: AtomicU64,
 }
 
 struct PoolState {
@@ -51,6 +52,7 @@ impl PoolState {
                 outlier_ejected: AtomicBool::new(false),
                 active_conns: AtomicUsize::new(0),
                 awaiting_first_probe: AtomicBool::new(false),
+                became_eligible_nanos: AtomicU64::new(0),
             });
             order.push(id.clone());
             ordered.push(Arc::clone(&state));
@@ -66,6 +68,7 @@ impl PoolState {
 
 pub struct BackendPool {
     inner: ArcSwap<PoolState>,
+    epoch: std::time::Instant,
     max_ejected_fraction: Option<f64>,
     version: AtomicU64,
     ejection_lock: Mutex<()>,
@@ -82,6 +85,7 @@ impl BackendPool {
     ) -> Self {
         BackendPool {
             inner: ArcSwap::from_pointee(PoolState::from_backends(backends)),
+            epoch: std::time::Instant::now(),
             max_ejected_fraction,
             version: AtomicU64::new(0),
             ejection_lock: Mutex::new(()),
@@ -102,9 +106,35 @@ impl BackendPool {
 
     pub fn set_active_healthy(&self, id: &BackendId, healthy: bool) {
         if let Some(s) = self.inner.load().states.get(id) {
+            let before = is_confirmed(s);
             s.active_healthy.store(healthy, Ordering::SeqCst);
             s.awaiting_first_probe.store(false, Ordering::SeqCst);
+            self.stamp_if_became_eligible(s, before);
         }
+    }
+
+    fn stamp_if_became_eligible(&self, s: &BackendState, before: bool) {
+        if !before && is_confirmed(s) {
+            let now = (self.epoch.elapsed().as_nanos() as u64).max(1);
+            s.became_eligible_nanos.store(now, Ordering::SeqCst);
+        }
+    }
+
+    pub fn warmup_fraction(&self, id: &BackendId, window: std::time::Duration) -> f64 {
+        let Some(at) = self
+            .inner
+            .load()
+            .states
+            .get(id)
+            .map(|s| s.became_eligible_nanos.load(Ordering::SeqCst))
+        else {
+            return 1.0;
+        };
+        if at == 0 || window.is_zero() {
+            return 1.0;
+        }
+        let elapsed = (self.epoch.elapsed().as_nanos() as u64).saturating_sub(at);
+        (elapsed as f64 / window.as_nanos() as f64).clamp(MIN_WARMUP_FRACTION, 1.0)
     }
 
     pub fn mark_awaiting_first_probe(&self, id: &BackendId) {
@@ -130,6 +160,20 @@ impl BackendPool {
     }
 
     fn set_ejection_flag(
+        &self,
+        id: &BackendId,
+        value: bool,
+        flag: fn(&BackendState) -> &AtomicBool,
+    ) {
+        let state = self.inner.load().states.get(id).cloned();
+        let before = state.as_deref().is_some_and(is_confirmed);
+        self.store_ejection_flag(id, value, flag);
+        if let Some(s) = state {
+            self.stamp_if_became_eligible(&s, before);
+        }
+    }
+
+    fn store_ejection_flag(
         &self,
         id: &BackendId,
         value: bool,
@@ -200,7 +244,9 @@ impl BackendPool {
     /// from `active_healthy` rather than reusing it.
     pub fn set_manually_drained(&self, id: &BackendId, drained: bool) {
         if let Some(s) = self.inner.load().states.get(id) {
+            let before = is_confirmed(s);
             s.manually_drained.store(drained, Ordering::SeqCst);
+            self.stamp_if_became_eligible(s, before);
         }
     }
 
@@ -338,6 +384,7 @@ impl BackendPool {
                     outlier_ejected: AtomicBool::new(false),
                     active_conns: AtomicUsize::new(0),
                     awaiting_first_probe: AtomicBool::new(true),
+                    became_eligible_nanos: AtomicU64::new(0),
                 }),
             };
             ordered.push(Arc::clone(&state));
@@ -351,6 +398,8 @@ impl BackendPool {
         self.version.fetch_add(1, Ordering::SeqCst);
     }
 }
+
+const MIN_WARMUP_FRACTION: f64 = 0.1;
 
 fn passes_flags(s: &BackendState) -> bool {
     s.active_healthy.load(Ordering::SeqCst)
@@ -405,6 +454,45 @@ mod tests {
             .map(|id| Backend::new(*id, "127.0.0.1:9000".parse().unwrap(), 1, None))
             .collect();
         BackendPool::new(backends)
+    }
+
+    #[test]
+    fn a_backend_that_becomes_eligible_again_warms_up_while_startup_backends_are_warm() {
+        let pool = pool_of(&["a", "b"]);
+        let a = BackendId::new("a");
+        let b = BackendId::new("b");
+        let window = std::time::Duration::from_millis(300);
+        assert_eq!(pool.warmup_fraction(&a, window), 1.0);
+
+        pool.set_active_healthy(&a, false);
+        pool.set_active_healthy(&a, true);
+        assert!(pool.warmup_fraction(&a, window) < 0.5);
+        pool.set_active_healthy(&a, true);
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert_eq!(pool.warmup_fraction(&a, window), 1.0);
+        assert_eq!(pool.warmup_fraction(&b, window), 1.0);
+
+        pool.set_circuit_open(&b, true);
+        pool.set_circuit_open(&b, false);
+        assert!(pool.warmup_fraction(&b, window) < 0.5);
+        pool.set_manually_drained(&a, true);
+        pool.set_manually_drained(&a, false);
+        assert!(pool.warmup_fraction(&a, window) < 0.5);
+    }
+
+    #[test]
+    fn a_backend_added_by_discovery_warms_up_from_its_first_good_probe() {
+        let pool = pool_of(&["a"]);
+        let c = BackendId::new("c");
+        let window = std::time::Duration::from_secs(60);
+        pool.apply_resolved(vec![
+            Backend::new("a", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("c", "127.0.0.1:9002".parse().unwrap(), 1, None),
+        ]);
+        pool.set_active_healthy(&c, true);
+        let fraction = pool.warmup_fraction(&c, window);
+        assert!((0.1..0.2).contains(&fraction), "{fraction}");
+        assert_eq!(pool.warmup_fraction(&BackendId::new("a"), window), 1.0);
     }
 
     fn pool_with_ceiling(ids: &[&str], max_ejected_fraction: f64) -> BackendPool {

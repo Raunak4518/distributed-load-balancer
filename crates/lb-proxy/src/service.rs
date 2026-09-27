@@ -116,6 +116,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub overload: Arc<lb_core::OverloadState>,
     pub backend_gates: BackendMap<crate::gate::BackendGate>,
     pub adaptive: Option<crate::adaptive::AdaptiveConfig>,
+    pub slow_start: Option<Duration>,
     pub adaptive_limits: BackendMap<crate::adaptive::AdaptiveLimit>,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
@@ -570,6 +571,46 @@ fn retry_admitted<R: RateLimiter, C: Clock>(
     }
 }
 
+fn next_unit_random() -> f64 {
+    thread_local! {
+        static STATE: std::cell::Cell<u64> = std::cell::Cell::new(
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E37_79B9_7F4A_7C15))
+                | 1,
+        );
+    }
+    STATE.with(|state| {
+        let mut x = state.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
+fn pass_over_warming_backend(
+    balancer: &Arc<dyn LoadBalancer>,
+    pool: &BackendPool,
+    key: &str,
+    tried: &[BackendId],
+    candidate: BackendId,
+    window: Duration,
+) -> BackendId {
+    let fraction = pool.warmup_fraction(&candidate, window);
+    if fraction >= 1.0 || next_unit_random() < fraction {
+        return candidate;
+    }
+    let mut excluded = tried.to_vec();
+    excluded.push(candidate.clone());
+    match balancer.pick_excluding(pool, key, &excluded) {
+        Some(alternative) => alternative,
+        None => candidate,
+    }
+}
+
 fn is_idempotent_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -925,6 +966,7 @@ where
             .then(|| sticky_pin.clone())
             .flatten()
             .filter(|id| pool.is_eligible(id));
+        let was_pinned = pinned.is_some();
         let Some(backend_id) = pinned.or_else(|| {
             balancer
                 .pick_excluding(pool, &key, &tried)
@@ -934,6 +976,12 @@ where
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no healthy backend",
             ));
+        };
+        let backend_id = match ctx.slow_start {
+            Some(window) if !was_pinned => {
+                pass_over_warming_backend(balancer, pool, &key, &tried, backend_id, window)
+            }
+            _ => backend_id,
         };
         tried.push(backend_id.clone());
         let Some(backend) = pool.backend(&backend_id) else {
@@ -1607,6 +1655,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1653,6 +1702,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1718,6 +1768,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1768,6 +1819,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1834,6 +1886,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1882,6 +1935,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -1947,6 +2001,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2046,6 +2101,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2329,6 +2385,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2459,6 +2516,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2613,6 +2671,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: gates,
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2662,6 +2721,7 @@ mod tests {
             upstream_limits: None,
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -2755,6 +2815,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: Some(fixed),
+            slow_start: None,
             adaptive_limits: limits,
             cluster: None,
             metrics: test_metrics(),
@@ -2777,6 +2838,74 @@ mod tests {
         );
         assert_eq!(metrics.upstream_overflow_concurrency_limit.get(), 1);
         slow.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recovering_backend_gets_a_small_share_while_it_warms_up() {
+        let (warm_addr, warm_hits) = spawn_counting_cacheable_backend("warm", &[]).await;
+        let (cold_addr, cold_hits) = spawn_counting_cacheable_backend("cold", &[]).await;
+        let warm = Backend::new("warm", warm_addr, 1, None);
+        let cold = Backend::new("cold", cold_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![warm.clone(), cold.clone()]));
+        pool.set_active_healthy(&cold.id, false);
+        pool.set_active_healthy(&cold.id, true);
+
+        let base = ctx_retrying(&warm, Arc::clone(&pool), Vec::new());
+        let ctx = Arc::new(ProxyContext {
+            balancer: Arc::new(CycleThroughAll(
+                vec![warm.id.clone(), cold.id.clone()],
+                std::sync::atomic::AtomicUsize::new(0),
+            )),
+            slow_start: Some(Duration::from_secs(60)),
+            rate_limiter: Arc::clone(&base.rate_limiter),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: base.client.clone(),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: base.websocket_idle_timeout,
+            response_body_idle_timeout: base.response_body_idle_timeout,
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: base.forward_timeout,
+            request_timeout: None,
+            retry_on_status: Vec::new(),
+            max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            overload: Arc::new(lb_core::OverloadState::new()),
+            backend_gates: BackendMap::new(),
+            adaptive: None,
+            adaptive_limits: BackendMap::new(),
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        });
+        let addr = spawn_proxy_listener(ctx).await;
+        for _ in 0..100 {
+            fetch_raw(addr).await;
+        }
+        let cold = cold_hits.load(std::sync::atomic::Ordering::SeqCst);
+        let warm = warm_hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(cold + warm, 100);
+        assert!(
+            cold < 25,
+            "a backend 0% into its warm-up got {cold} of 100 requests instead of a small share"
+        );
     }
 
     #[tokio::test]
@@ -2948,6 +3077,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3004,6 +3134,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3074,6 +3205,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3172,6 +3304,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3250,6 +3383,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3328,6 +3462,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3497,6 +3632,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3646,6 +3782,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3696,6 +3833,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -3822,6 +3960,7 @@ mod tests {
                 overload: Arc::new(lb_core::OverloadState::new()),
                 backend_gates: BackendMap::new(),
                 adaptive: None,
+                slow_start: None,
                 adaptive_limits: BackendMap::new(),
                 cluster: None,
                 metrics: test_metrics(),
@@ -3904,6 +4043,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4089,6 +4229,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4147,6 +4288,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4201,6 +4343,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4253,6 +4396,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4697,6 +4841,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -4747,6 +4892,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4804,6 +4950,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4861,6 +5008,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4912,6 +5060,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -4961,6 +5110,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5016,6 +5166,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
@@ -5075,6 +5226,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5211,6 +5363,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5287,6 +5440,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5376,6 +5530,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5493,6 +5648,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5667,6 +5823,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
@@ -5772,6 +5929,7 @@ mod tests {
             overload: Arc::new(lb_core::OverloadState::new()),
             backend_gates: BackendMap::new(),
             adaptive: None,
+            slow_start: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),

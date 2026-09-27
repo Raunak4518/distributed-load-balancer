@@ -352,6 +352,8 @@ pub struct ListenerConfig {
     pub retry_on_status: Vec<u16>,
     #[serde(default)]
     pub request_buffer_bytes: Option<usize>,
+    #[serde(default)]
+    pub slow_start_ms: Option<u64>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -1429,6 +1431,9 @@ impl ListenerConfig {
                 ));
             }
         }
+        if self.slow_start_ms == Some(0) {
+            return Err(invalid("slow_start_ms must be positive".into()));
+        }
         if self.request_buffer_bytes == Some(0) {
             return Err(invalid("request_buffer_bytes must be positive".into()));
         }
@@ -1582,9 +1587,10 @@ impl ListenerConfig {
                     || self.request_timeout_ms.is_some()
                     || !self.retry_on_status.is_empty()
                     || self.request_buffer_bytes.is_some()
+                    || self.slow_start_ms.is_some()
                 {
                     return Err(invalid(
-                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms/request_timeout_ms/retry_on_status/request_buffer_bytes are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
+                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms/request_timeout_ms/retry_on_status/request_buffer_bytes/slow_start_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
                             .into(),
                     ));
                 }

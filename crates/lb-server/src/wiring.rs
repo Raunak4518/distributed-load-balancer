@@ -1086,6 +1086,7 @@ pub(crate) fn build_listener_core(
                         max_queue: Duration::from_millis(u.max_queue_ms),
                     }),
                 adaptive: lc.adaptive_concurrency.as_ref().map(adaptive_config),
+                slow_start: lc.slow_start_ms.map(Duration::from_millis),
                 adaptive_limits: match &lc.adaptive_concurrency {
                     Some(a) => all_backends()
                         .map(|b| {

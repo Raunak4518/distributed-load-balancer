@@ -366,6 +366,7 @@ async fn dns_churn_experiment() {
         overload: std::sync::Arc::new(lb_core::OverloadState::new()),
         backend_gates: lb_core::BackendMap::new(),
         adaptive: None,
+        slow_start: None,
         adaptive_limits: lb_core::BackendMap::new(),
         max_request_body_bytes: 1024 * 1024,
         cluster: None,
