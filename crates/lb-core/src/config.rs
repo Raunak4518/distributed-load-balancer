@@ -354,6 +354,8 @@ pub struct ListenerConfig {
     pub request_buffer_bytes: Option<usize>,
     #[serde(default)]
     pub slow_start_ms: Option<u64>,
+    #[serde(default)]
+    pub local_zone: Option<String>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -906,6 +908,19 @@ pub struct BackendConfig {
     pub weight: u32,
     #[serde(default)]
     pub server_name: Option<String>,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub zone: Option<String>,
+}
+
+impl BackendConfig {
+    pub fn effective_priority(&self, local_zone: Option<&str>) -> u32 {
+        let away = local_zone.is_some_and(|zone| self.zone.as_deref() != Some(zone));
+        self.priority
+            .saturating_mul(2)
+            .saturating_add(u32::from(away))
+    }
 }
 
 fn default_weight() -> u32 {
@@ -1922,6 +1937,29 @@ mod tests {
         assert!(Config::parse(&with("reject_at = 1.5")).is_err());
         assert!(Config::parse(&with("max_memory_bytes = 0")).is_err());
         assert!(Config::parse(VALID).unwrap().server.overload.is_none());
+    }
+
+    #[test]
+    fn same_zone_backends_rank_ahead_of_other_zones_within_a_priority() {
+        let backend = |priority: u32, zone: Option<&str>| BackendConfig {
+            id: "b".to_string(),
+            address: "127.0.0.1:1".parse().unwrap(),
+            weight: 1,
+            server_name: None,
+            priority,
+            zone: zone.map(str::to_string),
+        };
+        assert_eq!(backend(0, Some("a")).effective_priority(Some("a")), 0);
+        assert_eq!(backend(0, Some("b")).effective_priority(Some("a")), 1);
+        assert_eq!(backend(0, None).effective_priority(Some("a")), 1);
+        assert_eq!(backend(1, Some("a")).effective_priority(Some("a")), 2);
+        assert_eq!(backend(1, Some("b")).effective_priority(None), 2);
+        let cfg = Config::parse(&VALID.replace(
+            "        listen = \"0.0.0.0:8080\"",
+            "        listen = \"0.0.0.0:8080\"\n        local_zone = \"eu-1\"",
+        ))
+        .unwrap();
+        assert_eq!(cfg.listeners[0].local_zone.as_deref(), Some("eu-1"));
     }
 
     #[test]

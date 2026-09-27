@@ -34,6 +34,28 @@ struct PoolState {
     order: Vec<BackendId>,
     ordered: Vec<Arc<BackendState>>,
     states: HashMap<BackendId, Arc<BackendState>>,
+    tiered: bool,
+}
+
+fn has_several_tiers(ordered: &[Arc<BackendState>]) -> bool {
+    let mut priorities = ordered.iter().map(|s| s.backend.load().priority);
+    let first = priorities.next();
+    priorities.any(|p| Some(p) != first)
+}
+
+fn active_tier(snapshot: &PoolState) -> Option<u32> {
+    if !snapshot.tiered {
+        return None;
+    }
+    let confirmed_exists = snapshot.ordered.iter().any(|s| is_confirmed(s));
+    snapshot
+        .ordered
+        .iter()
+        .filter(|s| {
+            passes_flags(s) && (!s.awaiting_first_probe.load(Ordering::SeqCst) || !confirmed_exists)
+        })
+        .map(|s| s.backend.load().priority)
+        .min()
 }
 
 impl PoolState {
@@ -58,10 +80,12 @@ impl PoolState {
             ordered.push(Arc::clone(&state));
             states.insert(id, state);
         }
+        let tiered = has_several_tiers(&ordered);
         PoolState {
             order,
             ordered,
             states,
+            tiered,
         }
     }
 }
@@ -294,8 +318,9 @@ impl BackendPool {
         if !passes_flags(s) {
             return false;
         }
-        !s.awaiting_first_probe.load(Ordering::SeqCst)
-            || !snapshot.ordered.iter().any(|other| is_confirmed(other))
+        let eligible = !s.awaiting_first_probe.load(Ordering::SeqCst)
+            || !snapshot.ordered.iter().any(|other| is_confirmed(other));
+        eligible && active_tier(&snapshot).is_none_or(|tier| s.backend.load().priority == tier)
     }
 
     pub fn eligible_backends(&self) -> Vec<BackendId> {
@@ -308,21 +333,24 @@ impl BackendPool {
 
     fn eligible_map<R>(&self, f: impl Fn(&BackendState) -> R) -> Vec<R> {
         let snapshot = self.inner.load();
-        let confirmed: Vec<R> = snapshot
+        let mut eligible: Vec<&Arc<BackendState>> = snapshot
             .ordered
             .iter()
             .filter(|s| is_confirmed(s))
-            .map(|s| f(s))
             .collect();
-        if !confirmed.is_empty() {
-            return confirmed;
+        if eligible.is_empty() {
+            eligible = snapshot
+                .ordered
+                .iter()
+                .filter(|s| passes_flags(s))
+                .collect();
         }
-        snapshot
-            .ordered
-            .iter()
-            .filter(|s| passes_flags(s))
-            .map(|s| f(s))
-            .collect()
+        if snapshot.tiered {
+            if let Some(best) = eligible.iter().map(|s| s.backend.load().priority).min() {
+                eligible.retain(|s| s.backend.load().priority == best);
+            }
+        }
+        eligible.into_iter().map(|s| f(s)).collect()
     }
 
     pub fn all_backend_ids(&self) -> Vec<BackendId> {
@@ -390,10 +418,12 @@ impl BackendPool {
             ordered.push(Arc::clone(&state));
             states.insert(order.last().unwrap().clone(), state);
         }
+        let tiered = has_several_tiers(&ordered);
         self.inner.store(Arc::new(PoolState {
             order,
             ordered,
             states,
+            tiered,
         }));
         self.version.fetch_add(1, Ordering::SeqCst);
     }
@@ -478,6 +508,50 @@ mod tests {
         pool.set_manually_drained(&a, true);
         pool.set_manually_drained(&a, false);
         assert!(pool.warmup_fraction(&a, window) < 0.5);
+    }
+
+    fn tiered_pool() -> BackendPool {
+        BackendPool::new(vec![
+            Backend::new("p1", "127.0.0.1:9000".parse().unwrap(), 1, None),
+            Backend::new("p2", "127.0.0.1:9001".parse().unwrap(), 1, None),
+            Backend::new("backup", "127.0.0.1:9002".parse().unwrap(), 1, None).with_priority(1),
+        ])
+    }
+
+    #[test]
+    fn backups_take_traffic_only_once_every_primary_is_ineligible() {
+        let pool = tiered_pool();
+        let (p1, p2, backup) = (
+            BackendId::new("p1"),
+            BackendId::new("p2"),
+            BackendId::new("backup"),
+        );
+        assert_eq!(pool.eligible_backends(), vec![p1.clone(), p2.clone()]);
+        assert!(!pool.is_eligible(&backup));
+
+        pool.set_active_healthy(&p1, false);
+        assert_eq!(pool.eligible_backends(), vec![p2.clone()]);
+        assert!(!pool.is_eligible(&backup));
+
+        pool.set_circuit_open(&p2, true);
+        assert_eq!(pool.eligible_backends(), vec![backup.clone()]);
+        assert!(pool.is_eligible(&backup));
+        assert_eq!(pool.eligible_with_weights(), vec![(backup.clone(), 1)]);
+
+        pool.set_active_healthy(&p1, true);
+        assert_eq!(pool.eligible_backends(), vec![p1.clone()]);
+        assert!(!pool.is_eligible(&backup));
+    }
+
+    #[test]
+    fn a_pool_with_one_tier_is_unaffected_by_priorities() {
+        let pool = BackendPool::new(vec![
+            Backend::new("a", "127.0.0.1:9000".parse().unwrap(), 1, None).with_priority(3),
+            Backend::new("b", "127.0.0.1:9001".parse().unwrap(), 1, None).with_priority(3),
+        ]);
+        assert_eq!(pool.eligible_backends().len(), 2);
+        pool.set_active_healthy(&BackendId::new("a"), false);
+        assert_eq!(pool.eligible_backends(), vec![BackendId::new("b")]);
     }
 
     #[test]

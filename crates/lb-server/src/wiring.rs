@@ -800,7 +800,10 @@ pub(crate) fn build_listener_core(
     let backends: Vec<Backend> = lc
         .backends
         .iter()
-        .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
+        .map(|b| {
+            Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone())
+                .with_priority(b.effective_priority(lc.local_zone.as_deref()))
+        })
         .collect();
     let pool_backends: Vec<Backend> = match previous.and_then(|p| p.dns_backends.as_ref()) {
         Some(carried) if lc.dns_discovery.is_some() => carried.clone(),
@@ -831,7 +834,10 @@ pub(crate) fn build_listener_core(
             let route_backends: Vec<Backend> = r
                 .backends
                 .iter()
-                .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
+                .map(|b| {
+                    Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone())
+                        .with_priority(b.effective_priority(lc.local_zone.as_deref()))
+                })
                 .collect();
             let route_pool = Arc::new(BackendPool::with_max_ejected_fraction(
                 route_backends.clone(),
@@ -856,7 +862,10 @@ pub(crate) fn build_listener_core(
             let canary_backends: Vec<Backend> = c
                 .backends
                 .iter()
-                .map(|b| Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone()))
+                .map(|b| {
+                    Backend::new(b.id.clone(), b.address, b.weight, b.server_name.clone())
+                        .with_priority(b.effective_priority(lc.local_zone.as_deref()))
+                })
                 .collect();
             let canary_pool = Arc::new(BackendPool::with_max_ejected_fraction(
                 canary_backends.clone(),

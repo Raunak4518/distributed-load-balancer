@@ -39,6 +39,7 @@ pub struct Backend {
     /// validation requires it whenever `backend_tls` is set, so an empty
     /// name never reaches a TLS handshake.
     pub server_name: Option<String>,
+    pub priority: u32,
 }
 
 impl Backend {
@@ -53,7 +54,13 @@ impl Backend {
             address,
             weight,
             server_name,
+            priority: 0,
         }
+    }
+
+    pub fn with_priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
