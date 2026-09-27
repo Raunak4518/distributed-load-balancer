@@ -255,6 +255,14 @@ Labels: `listener`, `result` (`success` | `backend_declined` | `backend_unreacha
 
 Incremented in [`upgrade.rs`](../crates/lb-proxy/src/upgrade.rs): `backend_unreachable` when connecting to or sending the request to the backend times out or fails outright; `backend_declined` when the backend responds without `101 Switching Protocols` (it doesn't support the upgrade); `success` once the backend has answered `101` and both sides of the tunnel are about to be spliced.
 
+## Request mirroring
+
+### `lb_mirror_requests_total` — counter
+
+Labels: `listener`, `result` (`sent` | `failed` | `dropped` | `skipped`).
+
+Incremented in [`mirror.rs`](../crates/lb-proxy/src/mirror.rs) for each request sampled for `[listeners.mirror]`: `sent` when the shadow answered and its response was read; `failed` when it could not be reached, returned an error, or did not finish within `timeout_ms`; `dropped` when `max_in_flight` copies were already outstanding; `skipped` when the request's body was streamed rather than buffered, so no copy could be made.
+
 ## Retries
 
 See [`load-balancing.md`](load-balancing.md#retries-and-backend-selection) for the retry/idempotency rules and [`rate-limiting.md`](rate-limiting.md#retry-budget) for the retry budget. All six counters below share the label `listener` only, and are incremented from the single retry loop in `lb_proxy::service::handle_inner` (at most one retry is ever attempted per request):

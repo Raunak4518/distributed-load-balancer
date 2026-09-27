@@ -104,6 +104,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `forwarded` | table | none | HTTP-only | Adds `X-Forwarded-*` and `Forwarded` headers; `trusted_cidrs` lists proxies whose existing headers are kept and extended rather than replaced. See [http-features.md](http-features.md#x-forwarded-for--forwarded). |
 | `headers` | table | none | HTTP-only | Sets or removes request and response headers. See [`[listeners.headers]`](#listenersheaders). |
 | `direct_responses` | array of tables | `[]` | HTTP-only | Redirects and fixed responses answered without a backend. See [`[[listeners.direct_responses]]`](#listenersdirect_responses). |
+| `mirror` | table | none | HTTP-only | Copies requests to a shadow backend. See [`[listeners.mirror]`](#listenersmirror). |
 | `adaptive_concurrency` | table | none | HTTP-only | Per-backend in-flight limit that adapts to each backend's latency. |
 
 `http2_enabled()` — whether HTTP/2 is actually served — is `protocol == "http" && tls is set && (http2.enabled != false)`; a plaintext listener never serves HTTP/2 regardless of `http2.enabled`, because ALPN only exists inside a TLS handshake ([`config.rs`](../crates/lb-core/src/config.rs)). See [load-balancing.md](load-balancing.md) for routes/canary/sticky behavior, [http-features.md](http-features.md) for cache/compression/WebSocket behavior, [edge-hardening.md](edge-hardening.md) for connection limits, PROXY protocol and the WAF, and [request-lifecycle.md](request-lifecycle.md) for how the timeouts above compose.
@@ -376,6 +377,19 @@ host = "shop.example"
 status = 503
 body = "Down for maintenance"
 ```
+
+## `[listeners.mirror]`
+
+HTTP-only. Sends a copy of each sampled request to a shadow address, for testing a new version against real traffic. The copy is sent in the background: the client's response never waits for the shadow, and the shadow's response is read and discarded. The copy carries the same method, path, query, headers and body as the request sent to the real backend, with `-shadow` appended to `Host` so the shadow can tell mirrored traffic apart. Requests whose body is streamed (larger than `request_buffer_bytes`) are not mirrored. Counted in `lb_mirror_requests_total`.
+
+| Field | Type | Default | Validation | Meaning |
+|---|---|---|---|---|
+| `address` | socket address | required | — | Shadow backend, reached over plain HTTP. |
+| `percent` | integer | `100` | 1–100 | Share of requests mirrored. |
+| `max_in_flight` | integer | `64` | ≥ 1 | Copies outstanding at once; further requests are not mirrored until one finishes. |
+| `timeout_ms` | integer | `1000` | ≥ 1 | Time a copy may take before it is abandoned. |
+
+Non-idempotent requests are mirrored too, so a shadow must not have side effects the real backend would also cause, such as charging a card.
 
 ## `[listeners.retry_budget]`
 

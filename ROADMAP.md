@@ -56,7 +56,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] `Forwarded` / `X-Forwarded-*` with trusted-proxy semantics
 - [x] Request smuggling defenses audit (TE/CL, duplicate headers, authority/Host validation)
 - [x] Header rewrite, redirects, fixed/maintenance responses
-- [ ] Request mirroring / shadow traffic
+- [x] Request mirroring / shadow traffic
 - [ ] Cache: `ETag`/`Last-Modified` revalidation, `stale-while-revalidate`, `stale-if-error`, request coalescing, purge API, LRU/TinyLFU eviction
 - [ ] Health checks: gRPC, body/header matching, jitter, adaptive intervals
 - [ ] Multi-worker accept with `SO_REUSEPORT`, per-worker counters

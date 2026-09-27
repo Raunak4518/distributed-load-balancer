@@ -99,6 +99,10 @@ hsts_max_age_secs = 31536000
 
 Sources: [`service.rs`](../crates/lb-proxy/src/service.rs), [`config.rs`](../crates/lb-core/src/config.rs).
 
+## Request mirroring
+
+`[listeners.mirror]` ([`mirror.rs`](../crates/lb-proxy/src/mirror.rs)) copies a share of requests to a shadow backend in the background, so a new version can be tried on real traffic without affecting clients. See [configuration-reference.md](configuration-reference.md#listenersmirror).
+
 ## Response caching
 
 An in-memory, listener-scoped cache that answers a repeated request straight from memory, skipping backend selection, the sticky pin, and the retry loop entirely. It is deliberately narrow, and every precondition below exists to make buffering a response safe to do at all — a response that fails any check is proxied exactly as it always was: streamed, uncached.
