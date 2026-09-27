@@ -83,17 +83,7 @@ impl ConsistentHash {
 }
 
 fn hash_str(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in s.as_bytes() {
-        h ^= u64::from(*byte);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    h ^= h >> 33;
-    h
+    crate::hash::hash_parts(&[s.as_bytes()])
 }
 
 impl LoadBalancer for ConsistentHash {

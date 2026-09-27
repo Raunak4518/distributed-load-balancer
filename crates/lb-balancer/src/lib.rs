@@ -1,12 +1,17 @@
 mod consistent_hash;
+mod hash;
 mod least_connections;
+mod maglev;
 mod peak_ewma_p2c;
+mod rendezvous;
 mod round_robin;
 mod weighted_round_robin;
 
 pub use consistent_hash::ConsistentHash;
 pub use least_connections::LeastConnections;
+pub use maglev::Maglev;
 pub use peak_ewma_p2c::PeakEwmaP2c;
+pub use rendezvous::RendezvousHash;
 pub use round_robin::RoundRobin;
 pub use weighted_round_robin::WeightedRoundRobin;
 
@@ -29,6 +34,8 @@ mod tests {
             ("least_connections", Box::new(LeastConnections::new())),
             ("weighted_round_robin", Box::new(WeightedRoundRobin::new())),
             ("consistent_hash", Box::new(ConsistentHash::new())),
+            ("maglev", Box::new(Maglev::new())),
+            ("rendezvous_hash", Box::new(RendezvousHash::new())),
             (
                 "peak_ewma_p2c",
                 Box::new(PeakEwmaP2c::new(lb_core::SystemClock)),
@@ -61,6 +68,67 @@ mod tests {
                 None,
                 "{name}"
             );
+        }
+    }
+
+    fn hashing_strategies() -> Vec<(&'static str, Box<dyn LoadBalancer>)> {
+        vec![
+            ("consistent_hash", Box::new(ConsistentHash::new())),
+            ("maglev", Box::new(Maglev::new())),
+            ("rendezvous_hash", Box::new(RendezvousHash::new())),
+        ]
+    }
+
+    #[test]
+    fn removing_one_of_ten_backends_moves_close_to_a_tenth_of_keys() {
+        let ids: Vec<String> = (0..10).map(|i| format!("b{i}")).collect();
+        let all: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let before_pool = pool_of(&all);
+        let after_pool = pool_of(&all[1..]);
+        let keys: Vec<String> = (0..20_000)
+            .map(|i| format!("10.1.{}.{}", i / 256, i % 256))
+            .collect();
+        for (name, lb) in hashing_strategies() {
+            let before: Vec<_> = keys.iter().map(|k| lb.pick(&before_pool, k)).collect();
+            let after: Vec<_> = keys.iter().map(|k| lb.pick(&after_pool, k)).collect();
+            let moved = before.iter().zip(&after).filter(|(b, a)| b != a).count();
+            let fraction = moved as f64 / keys.len() as f64;
+            eprintln!(
+                "{name}: removing 1 of 10 backends moved {:.1}% of keys",
+                fraction * 100.0
+            );
+            let limit = if name == "consistent_hash" { 0.2 } else { 0.13 };
+            assert!(
+                fraction <= limit,
+                "{name} moved {:.1}% of keys, ideal is 10%",
+                fraction * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn hashing_strategies_spread_keys_evenly_over_equal_backends() {
+        let ids: Vec<String> = (0..10).map(|i| format!("b{i}")).collect();
+        let pool = pool_of(&ids.iter().map(String::as_str).collect::<Vec<_>>());
+        for (name, lb) in hashing_strategies() {
+            let mut counts = std::collections::HashMap::new();
+            for i in 0..20_000 {
+                *counts
+                    .entry(
+                        lb.pick(&pool, &format!("10.2.{}.{}", i / 256, i % 256))
+                            .unwrap(),
+                    )
+                    .or_insert(0usize) += 1;
+            }
+            let max = *counts.values().max().unwrap();
+            let min = *counts.values().min().unwrap();
+            eprintln!("{name}: busiest backend {max}, quietest {min} (mean 2000)");
+            let limit = if name == "consistent_hash" {
+                4_000
+            } else {
+                2_400
+            };
+            assert!(max <= limit, "{name} put {max} keys on one backend");
         }
     }
 

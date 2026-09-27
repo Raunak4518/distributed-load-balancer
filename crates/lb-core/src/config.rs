@@ -1102,6 +1102,8 @@ pub enum LoadBalancingStrategy {
     /// 1)`. Adapts to real backend responsiveness and current load, unlike
     /// the other four strategies, none of which look at latency at all.
     PeakEwmaP2c,
+    Maglev,
+    RendezvousHash,
 }
 
 impl Config {
