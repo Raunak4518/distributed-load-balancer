@@ -15,6 +15,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] WebSocket/Upgrade connections counted as in-flight load
 - [x] Retries exclude a backend that already failed this request
 - [x] WebSocket upgrades honor the sticky pin and retry connect failures
+- [x] Long-lived keep-alive and HTTP/2 connections pick up a reloaded config instead of keeping their startup snapshot
 - [x] Total request deadline (`request_timeout_ms`), separate from the per-attempt timeouts
 - [x] Retry policy classifies failures (connect error, timeout, reset, 5xx) and respects method idempotency
 - [x] Retry budget per route/pool, not only per listener

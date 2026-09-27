@@ -146,6 +146,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Long-lived HTTP connections ignored config reloads.** Each keep-alive or
+  HTTP/2 connection kept the configuration it connected under, so it could
+  keep sending requests to backends a reload had removed. The configuration
+  is now loaded per request.
 - **A restarted cluster node's counts were under-counted by its peers.**
   Its new counts were merged with `max` against the ones it gossiped before
   restarting. Gossip messages now carry a per-boot `incarnation`, and peers
