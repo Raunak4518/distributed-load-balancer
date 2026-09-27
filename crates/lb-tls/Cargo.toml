@@ -30,7 +30,7 @@ rustls-native-certs = { version = "0.8", default-features = false }
 hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
 x509-parser = "0.16"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 # `time` for the handshake timeout in `accept()` and the reload poll
 # interval; `rt` for the reloader's own `tokio::spawn`. `AsyncRead`/
