@@ -46,7 +46,7 @@ because every later phase builds on the guarantees of the earlier ones.
 ## Phase 1 — An elite proxy
 - [x] Per-backend in-flight request limit with a bounded wait queue, queue-time metric, overflow to another backend
 - [x] Overload manager: memory/FD/connection pressure → staged shedding levels
-- [ ] Adaptive concurrency limit per backend (gradient-based)
+- [x] Adaptive concurrency limit per backend (gradient-based)
 - [ ] Slow start / warm-up for recovered and newly added backends
 - [ ] Priority failover and backup pools; locality/zone-aware selection
 - [ ] Maglev and rendezvous (HRW) hashing; hash-movement measurement

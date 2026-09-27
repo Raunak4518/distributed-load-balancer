@@ -99,6 +99,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `waf` | table | none | HTTP-only | Built-in request-pattern blocking/logging. |
 | `retry_budget` | table | none | HTTP-only | Token-bucket cap on retried requests. |
 | `upstream_limits` | table | none | HTTP-only | Per-backend in-flight request cap and wait queue. |
+| `adaptive_concurrency` | table | none | HTTP-only | Per-backend in-flight limit that adapts to each backend's latency. |
 
 `http2_enabled()` — whether HTTP/2 is actually served — is `protocol == "http" && tls is set && (http2.enabled != false)`; a plaintext listener never serves HTTP/2 regardless of `http2.enabled`, because ALPN only exists inside a TLS handshake ([`config.rs`](../crates/lb-core/src/config.rs)). See [load-balancing.md](load-balancing.md) for routes/canary/sticky behavior, [http-features.md](http-features.md) for cache/compression/WebSocket behavior, [edge-hardening.md](edge-hardening.md) for connection limits, PROXY protocol and the WAF, and [request-lifecycle.md](request-lifecycle.md) for how the timeouts above compose.
 
@@ -308,6 +309,18 @@ HTTP-only. Caps how many requests each backend handles at once, so one slow back
 | `max_active_per_backend` | integer | required | must be > 0 | Requests one backend may have in flight at once. |
 | `max_pending_per_backend` | integer | `0` | none | Requests allowed to wait for a slot on a full backend; `0` means never wait, move on immediately. |
 | `max_queue_ms` | integer | `1000` | must be > 0 | Longest a request waits for a slot. |
+
+## `[listeners.adaptive_concurrency]`
+
+HTTP-only. Gives every backend its own in-flight limit that the proxy learns from the backend's latency (the Gradient2 algorithm from Netflix's concurrency-limits). After each response it compares the latency just seen with a slow-moving baseline (an average over roughly the last 600 responses). While latency stays within `tolerance` × the baseline, the limit grows by about its square root, so a healthy backend is allowed more work. When latency rises above that, the limit shrinks, by up to half per step, and a failure or 5xx cuts it by 10%. Samples taken while the backend was using less than half its limit don't change the limit, since an underused backend says nothing about capacity. A request that finds its backend at the limit goes to another backend, and gets `503` if every backend is full, exactly like `upstream_limits`. Both can be set; a request must pass both. The limit is held until the response body completes.
+
+| Field | Type | Default | Validation | Meaning |
+|---|---|---|---|---|
+| `initial_limit` | integer | `20` | `min_limit` ≤ value ≤ `max_limit` | Starting limit for each backend. |
+| `min_limit` | integer | `1` | ≥ 1 | Floor the limit never drops below. |
+| `max_limit` | integer | `1000` | ≥ `initial_limit` | Ceiling the limit never grows past. |
+| `smoothing` | float | `0.2` | 0 < value ≤ 1 | How far each sample moves the limit toward its new target. |
+| `tolerance` | float | `1.5` | ≥ 1 | How much slower than its baseline a backend may get before its limit shrinks. |
 
 ## `[listeners.retry_budget]`
 

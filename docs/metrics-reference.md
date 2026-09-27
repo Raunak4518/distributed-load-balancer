@@ -85,7 +85,7 @@ Labels: `listener`, `phase` (`header` | `body` | `upstream_body` | `request`).
 
 ### `lb_upstream_overflow_total` — counter
 
-Labels: `listener`, `reason` (`queue_full` | `queue_timeout`).
+Labels: `listener`, `reason` (`queue_full` | `queue_timeout` | `concurrency_limit`).
 
 Incremented when a picked backend was at `upstream_limits.max_active_per_backend` and the request could not get a slot: the wait queue was already at `max_pending_per_backend` (`queue_full`), or no slot freed up within `max_queue_ms` (`queue_timeout`). The request then goes to another backend, or is answered `503` if none has room.
 
@@ -94,6 +94,14 @@ Incremented when a picked backend was at `upstream_limits.max_active_per_backend
 Labels: `listener`.
 
 Time each gated request waited for a slot on its backend (0 when a slot was free). Only observed when `upstream_limits` is configured.
+
+`reason="concurrency_limit"` on `lb_upstream_overflow_total` counts picks refused because the backend was at its `adaptive_concurrency` limit.
+
+### `lb_backend_concurrency_limit` — gauge
+
+Labels: `listener`, `backend`.
+
+The backend's current `adaptive_concurrency` limit, updated after every response it serves.
 
 See [`health-checking.md`](health-checking.md) and [`load-balancing.md`](load-balancing.md) for the mechanisms behind these metrics.
 

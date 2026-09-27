@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Adaptive per-backend concurrency: `[listeners.adaptive_concurrency]`.**
+  Each backend gets an in-flight limit learned from its latency (Gradient2):
+  it grows while latency holds steady and shrinks when latency rises or
+  requests fail. Exposed as `lb_backend_concurrency_limit`.
 - **Overload manager: `[server.overload]`.** Samples connection-slot use,
   memory and file descriptors, then sheds in two stages: `Connection: close`
   on HTTP/1.1 responses, then `503` + `Retry-After` for new requests, dropped
