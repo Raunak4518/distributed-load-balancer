@@ -72,6 +72,7 @@ pub struct Metrics {
     retry_budget_admits: IntCounterVec,
     retry_budget_denials: IntCounterVec,
     retry_not_idempotent: IntCounterVec,
+    requests_streamed: IntCounterVec,
 }
 
 /// Latency buckets from 1ms to ~16s. An edge load balancer cares about the
@@ -353,6 +354,14 @@ impl Metrics {
         registry.register(Box::new(retry_budget_admits.clone()))?;
         registry.register(Box::new(retry_budget_denials.clone()))?;
         registry.register(Box::new(retry_not_idempotent.clone()))?;
+        let requests_streamed = IntCounterVec::new(
+            Opts::new(
+                "lb_requests_streamed_total",
+                "Requests whose body was streamed to the backend instead of buffered, by listener",
+            ),
+            &["listener"],
+        )?;
+        registry.register(Box::new(requests_streamed.clone()))?;
 
         Ok(Metrics {
             registry,
@@ -389,6 +398,7 @@ impl Metrics {
             retry_budget_admits,
             retry_budget_denials,
             retry_not_idempotent,
+            requests_streamed,
         })
     }
 
@@ -497,6 +507,7 @@ impl Metrics {
             retry_budget_admits: self.retry_budget_admits.with_label_values(&[name]),
             retry_budget_denials: self.retry_budget_denials.with_label_values(&[name]),
             retry_not_idempotent: self.retry_not_idempotent.with_label_values(&[name]),
+            requests_streamed: self.requests_streamed.with_label_values(&[name]),
         }
     }
 

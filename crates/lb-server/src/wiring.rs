@@ -1056,6 +1056,7 @@ pub(crate) fn build_listener_core(
                 forward_timeout: lc.forward_timeout(),
                 request_timeout: lc.request_timeout(),
                 retry_on_status: lc.retry_on_status.clone(),
+                request_buffer_bytes: lc.request_buffer_bytes(),
                 max_request_body_bytes: lc.max_request_body_bytes(),
                 websocket_idle_timeout: lc.websocket_idle_timeout(),
                 response_body_idle_timeout: lc.response_body_idle_timeout(),

@@ -1,5 +1,8 @@
 use crate::cache::{self, ResponseCache};
-use crate::forward::{backend_scheme_and_authority, forward, ForwardError, ProxyClient};
+use crate::forward::{
+    backend_scheme_and_authority, forward, full_body, BoxError, ForwardError, ProxyClient,
+    ProxyRequestBody,
+};
 use crate::sticky::{self, StickyRuntime};
 use crate::upgrade;
 use crate::waf;
@@ -108,6 +111,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub request_timeout: Option<Duration>,
     pub retry_on_status: Vec<u16>,
     pub max_request_body_bytes: usize,
+    pub request_buffer_bytes: usize,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
     /// `forward_timeout`/`body_read_timeout` never apply past that point.
@@ -360,16 +364,78 @@ fn hashed_header_key(value: &[u8]) -> String {
     key
 }
 
-async fn read_bounded<B>(body: B, max_bytes: usize) -> Result<Bytes, ()>
+enum RequestBody<B> {
+    Buffered(Bytes),
+    Streaming { prefix: Bytes, rest: B },
+}
+
+async fn read_request_body<B>(
+    mut body: B,
+    buffer_bytes: usize,
+    max_bytes: usize,
+) -> Result<RequestBody<B>, ()>
 where
-    B: hyper::body::Body<Data = Bytes>,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B: hyper::body::Body<Data = Bytes> + Unpin,
 {
-    http_body_util::Limited::new(body, max_bytes)
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes())
-        .map_err(|_| ())
+    let mut prefix = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(data) = frame.map_err(|_| ())?.into_data() else {
+            continue;
+        };
+        prefix.extend_from_slice(&data);
+        if prefix.len() > max_bytes {
+            return Err(());
+        }
+        if prefix.len() > buffer_bytes {
+            return Ok(RequestBody::Streaming {
+                prefix: prefix.freeze(),
+                rest: body,
+            });
+        }
+    }
+    Ok(RequestBody::Buffered(prefix.freeze()))
+}
+
+struct StreamedRequestBody<B> {
+    prefix: Option<Bytes>,
+    rest: B,
+    remaining: usize,
+    exceeded: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<B> hyper::body::Body for StreamedRequestBody<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        use std::task::Poll;
+        let me = self.get_mut();
+        if let Some(prefix) = me.prefix.take() {
+            return Poll::Ready(Some(Ok(hyper::body::Frame::data(prefix))));
+        }
+        match std::pin::Pin::new(&mut me.rest).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    if data.len() > me.remaining {
+                        me.exceeded.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return Poll::Ready(Some(Err("request body too large".into())));
+                    }
+                    me.remaining -= data.len();
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 fn declared_length_exceeds(headers: &hyper::HeaderMap, max_bytes: usize) -> bool {
@@ -429,10 +495,10 @@ pub(crate) fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
 /// nameless-backend arm below.
 fn build_outbound_request(
     parts: &http::request::Parts,
-    body: Bytes,
+    body: ProxyRequestBody,
     backend: &lb_core::Backend,
     backend_tls: bool,
-) -> Option<Request<Full<Bytes>>> {
+) -> Option<Request<ProxyRequestBody>> {
     let path_and_query = parts
         .uri
         .path_and_query()
@@ -460,7 +526,7 @@ fn build_outbound_request(
     }
     Some(
         builder
-            .body(Full::new(body))
+            .body(body)
             .expect("forwarded request is well-formed"),
     )
 }
@@ -780,9 +846,10 @@ where
             "request body too large",
         ));
     }
-    let bytes = match tokio::time::timeout(
+    let body_deadline = tokio::time::Instant::now() + ctx.body_read_timeout;
+    let request_body = match tokio::time::timeout(
         within_deadline(deadline, ctx.body_read_timeout),
-        read_bounded(body, ctx.max_request_body_bytes),
+        read_request_body(body, ctx.request_buffer_bytes, ctx.max_request_body_bytes),
     )
     .await
     {
@@ -804,6 +871,31 @@ where
                 StatusCode::REQUEST_TIMEOUT,
                 "request body read timed out",
             ));
+        }
+    };
+
+    let exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (bytes, mut streamed_body) = match request_body {
+        RequestBody::Buffered(bytes) => (bytes, None),
+        RequestBody::Streaming { prefix, rest } => {
+            ctx.metrics.requests_streamed.inc();
+            let remaining = ctx.max_request_body_bytes - prefix.len();
+            let (upload_deadline, upload_counter) = match deadline {
+                Some(deadline) if deadline < body_deadline => {
+                    (deadline, ctx.metrics.timeouts_request.clone())
+                }
+                _ => (body_deadline, ctx.metrics.timeouts_body.clone()),
+            };
+            let streamed = StreamedRequestBody {
+                prefix: Some(prefix),
+                rest,
+                remaining,
+                exceeded: Arc::clone(&exceeded),
+            };
+            let bounded =
+                crate::forward::IdleTimeoutBody::new(streamed, ctx.body_read_timeout, None)
+                    .with_deadline(Some(upload_deadline), Some(upload_counter));
+            (Bytes::new(), Some(bounded.boxed()))
         }
     };
 
@@ -835,8 +927,12 @@ where
         // iteration regardless of outcome -- the only way `LeastConnections`
         // has real numbers to compare.
         let _active_guard = pool.track_active(&backend_id);
+        let attempt_streamed = streamed_body.is_some();
+        let outbound_body = streamed_body
+            .take()
+            .unwrap_or_else(|| full_body(bytes.clone()));
         let Some(outbound) =
-            build_outbound_request(&parts, bytes.clone(), &backend, ctx.backend_tls)
+            build_outbound_request(&parts, outbound_body, &backend, ctx.backend_tls)
         else {
             // Not retried: every backend of this listener would hit the same
             // misconfiguration, and the one thing we must not do is fall back
@@ -852,10 +948,15 @@ where
             Some(per_backend) => per_backend.get_or_build(&backend),
             None => ctx.client.clone(),
         };
+        let attempt_timeout = if attempt_streamed {
+            ctx.forward_timeout + ctx.body_read_timeout
+        } else {
+            ctx.forward_timeout
+        };
         match forward(
             &client,
             outbound,
-            within_deadline(deadline, ctx.forward_timeout),
+            within_deadline(deadline, attempt_timeout),
         )
         .await
         {
@@ -898,6 +999,7 @@ where
                     pool.set_circuit_open(&backend_id, breaker.is_open());
                 }
                 if attempt == 0
+                    && !attempt_streamed
                     && ctx.retry_on_status.contains(&resp.status().as_u16())
                     && is_idempotent_method(&parts.method)
                     && !deadline_exceeded(deadline)
@@ -1003,10 +1105,19 @@ where
                     // from the top-of-request refresh.
                     pool.set_circuit_open(&backend_id, breaker.is_open());
                 }
+                if exceeded.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(simple_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body too large",
+                    ));
+                }
                 if deadline_exceeded(deadline) {
                     return Ok(request_deadline_response(&ctx.metrics));
                 }
                 last_status = StatusCode::BAD_GATEWAY;
+                if attempt_streamed {
+                    break;
+                }
                 if attempt == 1 {
                     ctx.metrics.retry_failures.inc();
                     break;
@@ -1239,7 +1350,7 @@ mod tests {
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let resp = client.request(req).await.unwrap();
+        let resp = client.request(req.map(full_body_of)).await.unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         Response::from_parts(parts, bytes)
@@ -1273,7 +1384,7 @@ mod tests {
             builder = builder.header(header::HOST, host);
         }
         let req = builder.body(Full::new(Bytes::new())).unwrap();
-        let resp = client.request(req).await.unwrap();
+        let resp = client.request(req.map(full_body_of)).await.unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         Response::from_parts(parts, bytes)
@@ -1305,7 +1416,7 @@ mod tests {
             builder = builder.header(header::COOKIE, cookie);
         }
         let req = builder.body(Full::new(Bytes::new())).unwrap();
-        let resp = client.request(req).await.unwrap();
+        let resp = client.request(req.map(full_body_of)).await.unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         Response::from_parts(parts, bytes)
@@ -1335,7 +1446,7 @@ mod tests {
             .header(name, value)
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let resp = client.request(req).await.unwrap();
+        let resp = client.request(req.map(full_body_of)).await.unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         Response::from_parts(parts, bytes)
@@ -1364,7 +1475,7 @@ mod tests {
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let resp = client.request(req).await.unwrap();
+        let resp = client.request(req.map(full_body_of)).await.unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         Response::from_parts(parts, bytes)
@@ -1377,6 +1488,10 @@ mod tests {
     /// Metrics are always-on in production, so tests supply real handles
     /// rather than a null object. Nothing scrapes them here; they just need
     /// to exist so the hot path stays branch-free.
+    fn full_body_of(body: Full<Bytes>) -> ProxyRequestBody {
+        body.map_err(|never| match never {}).boxed()
+    }
+
     fn test_metrics() -> Arc<ListenerMetrics> {
         let registry = lb_metrics::Metrics::new().expect("metrics registry");
         Arc::new(registry.listener("test"))
@@ -1415,6 +1530,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1455,6 +1571,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1514,6 +1631,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1558,6 +1676,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1618,6 +1737,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1660,6 +1780,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1719,6 +1840,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1812,6 +1934,7 @@ mod tests {
             request_timeout: Some(request_timeout),
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2089,6 +2212,7 @@ mod tests {
             request_timeout: None,
             retry_on_status,
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2181,6 +2305,151 @@ mod tests {
         );
     }
 
+    fn ctx_streaming(
+        backend: &Backend,
+        pool: Arc<BackendPool>,
+        request_buffer_bytes: usize,
+        max_request_body_bytes: usize,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(backend.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(5),
+            request_timeout: None,
+            retry_on_status: Vec::new(),
+            max_request_body_bytes,
+            request_buffer_bytes,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        })
+    }
+
+    async fn spawn_upload_counting_backend() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&received);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = Arc::clone(&counter);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let counter = Arc::clone(&counter);
+                        async move {
+                            let mut body = req.into_body();
+                            while let Some(Ok(frame)) = body.frame().await {
+                                if let Some(data) = frame.data_ref() {
+                                    counter
+                                        .fetch_add(data.len(), std::sync::atomic::Ordering::SeqCst);
+                                }
+                            }
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                                b"stored",
+                            ))))
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        (addr, received)
+    }
+
+    #[tokio::test]
+    async fn a_large_upload_reaches_the_backend_before_the_client_finishes_sending() {
+        let (backend_addr, received) = spawn_upload_counting_backend().await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_streaming(&backend, pool, 16 * 1024, 1024 * 1024);
+        let metrics = ctx.metrics.clone();
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: 200000\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        client.write_all(&vec![1u8; 100_000]).await.unwrap();
+        let mut streamed = false;
+        for _ in 0..100 {
+            if received.load(std::sync::atomic::Ordering::SeqCst) >= 100_000 {
+                streamed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            streamed,
+            "the backend must see the first half while the client still holds the second"
+        );
+
+        client.write_all(&vec![1u8; 100_000]).await.unwrap();
+        let (head, _) = read_response_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(received.load(std::sync::atomic::Ordering::SeqCst), 200_000);
+        assert_eq!(metrics.requests_streamed.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_upload_over_the_limit_is_refused_with_413() {
+        let (backend_addr, _) = spawn_upload_counting_backend().await;
+        let backend = Backend::new("b1", backend_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let ctx = ctx_streaming(&backend, pool, 16 * 1024, 100 * 1024);
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"POST /upload HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let chunk = vec![1u8; 8 * 1024];
+        for _ in 0..20 {
+            let mut frame = format!("{:x}\r\n", chunk.len()).into_bytes();
+            frame.extend_from_slice(&chunk);
+            frame.extend_from_slice(b"\r\n");
+            if client.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+        let _ = client.write_all(b"0\r\n\r\n").await;
+        let (head, _) = read_response_head(&mut client).await;
+        assert!(head.starts_with("HTTP/1.1 413"), "{head}");
+    }
+
     #[tokio::test]
     async fn a_post_to_a_flaky_backend_is_not_retried() {
         let addr = spawn_flaky_then_ok_backend().await;
@@ -2266,6 +2535,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2316,6 +2586,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2380,6 +2651,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2472,6 +2744,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2544,6 +2817,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2616,6 +2890,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2642,7 +2917,7 @@ mod tests {
             .body(())
             .unwrap()
             .into_parts();
-        build_outbound_request(&parts, Bytes::new(), backend, backend_tls)
+        build_outbound_request(&parts, full_body(Bytes::new()), backend, backend_tls)
             .map(|req| req.uri().to_string())
     }
 
@@ -2779,6 +3054,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2922,6 +3198,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2966,6 +3243,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3086,6 +3364,7 @@ mod tests {
                 request_timeout: None,
                 retry_on_status: Vec::new(),
                 max_request_body_bytes: 1024,
+                request_buffer_bytes: 64 * 1024,
                 cluster: None,
                 metrics: test_metrics(),
                 backend_metrics: BackendMap::new(),
@@ -3162,6 +3441,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3284,7 +3564,7 @@ mod tests {
             .uri(format!("http://{addr}/"))
             .body(Full::new(Bytes::new()))
             .unwrap();
-        let resp = client.request(req).await.unwrap();
+        let resp = client.request(req.map(full_body_of)).await.unwrap();
         let (parts, body) = resp.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         Response::from_parts(parts, bytes)
@@ -3341,6 +3621,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3393,6 +3674,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3441,6 +3723,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3487,6 +3770,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3522,7 +3806,7 @@ mod tests {
             builder = builder.header(header::HOST, host);
         }
         let resp = client
-            .request(builder.body(Full::new(Bytes::new())).unwrap())
+            .request(builder.body(full_body(Bytes::new())).unwrap())
             .await
             .unwrap();
         let (parts, body) = resp.into_parts();
@@ -3776,7 +4060,7 @@ mod tests {
             builder = builder.header(*name, *value);
         }
         let resp = client
-            .request(builder.body(Full::new(Bytes::new())).unwrap())
+            .request(builder.body(full_body(Bytes::new())).unwrap())
             .await
             .unwrap();
         let (parts, body) = resp.into_parts();
@@ -3925,6 +4209,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3969,6 +4254,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4020,6 +4306,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4071,6 +4358,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4116,6 +4404,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4159,6 +4448,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4208,6 +4498,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4261,6 +4552,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4391,6 +4683,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4461,6 +4754,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4544,6 +4838,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4655,6 +4950,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4709,9 +5005,12 @@ mod tests {
         let body = EndlessBody {
             frames_served: Arc::clone(&frames_served),
         };
-        let result = tokio::time::timeout(Duration::from_secs(5), read_bounded(body, 1024 * 1024))
-            .await
-            .expect("reading must finish");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_request_body(body, 1024 * 1024, 1024 * 1024),
+        )
+        .await
+        .expect("reading must finish");
         assert!(result.is_err());
         assert!(
             frames_served.load(std::sync::atomic::Ordering::SeqCst) <= 17,
@@ -4723,9 +5022,31 @@ mod tests {
     #[tokio::test]
     async fn a_body_within_the_limit_is_read_whole() {
         let body = Full::new(Bytes::from(vec![7u8; 1000]));
-        assert_eq!(read_bounded(body, 1000).await.unwrap().len(), 1000);
+        assert!(matches!(
+            read_request_body(body, 1000, 1000).await,
+            Ok(RequestBody::Buffered(b)) if b.len() == 1000
+        ));
         let body = Full::new(Bytes::from(vec![7u8; 1001]));
-        assert!(read_bounded(body, 1000).await.is_err());
+        assert!(read_request_body(body, 1000, 1000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_buffer_size_is_handed_over_as_a_stream() {
+        let frames_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = EndlessBody {
+            frames_served: Arc::clone(&frames_served),
+        };
+        let Ok(RequestBody::Streaming { prefix, .. }) =
+            read_request_body(body, 100 * 1024, 1024 * 1024).await
+        else {
+            panic!("a body larger than the buffer must be streamed");
+        };
+        assert_eq!(prefix.len(), 128 * 1024);
+        assert_eq!(
+            frames_served.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "no more than the buffer and one frame may be read before streaming"
+        );
     }
 
     #[test]
@@ -4798,6 +5119,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4897,6 +5219,7 @@ mod tests {
             request_timeout: None,
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),

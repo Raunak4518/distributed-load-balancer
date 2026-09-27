@@ -22,7 +22,13 @@ use std::time::Duration;
 /// directly), which `HttpConnector` short-circuits before ever consulting
 /// its resolver, so using the same connector type there costs nothing.
 pub type ProxyClient =
-    Client<hyper_rustls::HttpsConnector<HttpConnector<PinnedResolver>>, Full<Bytes>>;
+    Client<hyper_rustls::HttpsConnector<HttpConnector<PinnedResolver>>, ProxyRequestBody>;
+
+pub type ProxyRequestBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
+
+pub fn full_body(bytes: Bytes) -> ProxyRequestBody {
+    Full::new(bytes).map_err(|never| match never {}).boxed()
+}
 
 /// Connect timeout (time to establish the TCP connection) and pool idle
 /// timeout (how long a kept-alive backend connection may sit unused before
@@ -197,7 +203,7 @@ impl lb_core::ProbeClient for ProbeCapableClient {
         else {
             return Box::pin(std::future::ready(None));
         };
-        let Ok(req) = Request::builder().uri(uri).body(Full::new(Bytes::new())) else {
+        let Ok(req) = Request::builder().uri(uri).body(full_body(Bytes::new())) else {
             return Box::pin(std::future::ready(None));
         };
         Box::pin(async move {
@@ -256,7 +262,7 @@ pub enum ForwardError {
 
 pub async fn forward(
     client: &ProxyClient,
-    req: Request<Full<Bytes>>,
+    req: Request<ProxyRequestBody>,
     timeout: Duration,
 ) -> Result<Response<Incoming>, ForwardError> {
     match tokio::time::timeout(timeout, client.request(req)).await {
@@ -445,7 +451,7 @@ mod tests {
         let client = build_client(None, HashMap::new(), false, None);
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
-            .body(Full::new(Bytes::new()))
+            .body(full_body(Bytes::new()))
             .unwrap();
 
         let resp = forward(&client, req, Duration::from_secs(1)).await.unwrap();
@@ -463,7 +469,7 @@ mod tests {
         let client = build_client(None, HashMap::new(), false, None);
         let req = Request::builder()
             .uri("http://127.0.0.1:1")
-            .body(Full::new(Bytes::new()))
+            .body(full_body(Bytes::new()))
             .unwrap();
 
         let result = forward(&client, req, Duration::from_secs(1)).await;
@@ -494,7 +500,7 @@ mod tests {
         let client = build_client(None, server_names, false, None);
         let req = Request::builder()
             .uri(format!("http://nowhere.invalid:{}/", addr.port()))
-            .body(Full::new(Bytes::new()))
+            .body(full_body(Bytes::new()))
             .unwrap();
 
         let resp = tokio::time::timeout(
@@ -702,7 +708,7 @@ mod tests {
     async fn round_trip(client: ProxyClient, addr: SocketAddr) {
         let req = Request::builder()
             .uri(format!("http://{addr}/"))
-            .body(Full::new(Bytes::new()))
+            .body(full_body(Bytes::new()))
             .unwrap();
         let resp = forward(&client, req, Duration::from_secs(2)).await.unwrap();
         resp.into_body().collect().await.unwrap();

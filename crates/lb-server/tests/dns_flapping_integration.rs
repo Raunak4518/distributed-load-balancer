@@ -329,6 +329,7 @@ fn build_ctx(
         forward_timeout: Duration::from_secs(30),
         request_timeout: None,
         retry_on_status: Vec::new(),
+        request_buffer_bytes: 64 * 1024,
         max_request_body_bytes: 1024 * 1024,
         cluster: None,
         metrics: test_metrics(listener_name),

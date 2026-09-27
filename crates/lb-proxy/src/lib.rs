@@ -8,7 +8,10 @@ pub mod upgrade;
 pub mod waf;
 
 pub use cache::{spawn_cache_sweeper, ResponseCache};
-pub use forward::{build_client, forward, ForwardError, ProbeCapableClient, ProxyClient};
+pub use forward::{
+    build_client, forward, full_body, ForwardError, ProbeCapableClient, ProxyClient,
+    ProxyRequestBody,
+};
 pub use per_backend::PerBackendClients;
 pub use resolver::PinnedResolver;
 pub use service::{handle, AccessLog, CompiledCanaryPool, CompiledRoute, ProxyBody, ProxyContext};

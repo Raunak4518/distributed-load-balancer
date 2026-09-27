@@ -273,6 +273,8 @@ pub struct ListenerConfig {
     pub request_timeout_ms: Option<u64>,
     #[serde(default)]
     pub retry_on_status: Vec<u16>,
+    #[serde(default)]
+    pub request_buffer_bytes: Option<usize>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -632,6 +634,10 @@ impl ListenerConfig {
 
     pub fn response_body_idle_timeout(&self) -> Duration {
         Duration::from_millis(self.response_body_idle_timeout_ms.unwrap_or(60_000))
+    }
+
+    pub fn request_buffer_bytes(&self) -> usize {
+        self.request_buffer_bytes.unwrap_or(64 * 1024)
     }
 
     pub fn request_timeout(&self) -> Option<Duration> {
@@ -1233,6 +1239,9 @@ impl ListenerConfig {
                 "retry_on_status may only list 5xx statuses, got {status}"
             )));
         }
+        if self.request_buffer_bytes == Some(0) {
+            return Err(invalid("request_buffer_bytes must be positive".into()));
+        }
         if self.request_timeout_ms == Some(0) {
             return Err(invalid("request_timeout_ms must be positive".into()));
         }
@@ -1382,9 +1391,10 @@ impl ListenerConfig {
                     || self.response_body_idle_timeout_ms.is_some()
                     || self.request_timeout_ms.is_some()
                     || !self.retry_on_status.is_empty()
+                    || self.request_buffer_bytes.is_some()
                 {
                     return Err(invalid(
-                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms/request_timeout_ms/retry_on_status are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
+                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms/request_timeout_ms/retry_on_status/request_buffer_bytes are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
                             .into(),
                     ));
                 }
@@ -1694,6 +1704,27 @@ mod tests {
             "        listen = \"0.0.0.0:5432\"\n        retry_on_status = [503]",
         );
         assert!(Config::parse(&tcp).is_err());
+    }
+
+    #[test]
+    fn request_buffer_bytes_defaults_to_64_kib_and_is_validated() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert_eq!(cfg.listeners[0].request_buffer_bytes(), 64 * 1024);
+        let with = |line: &str, listen: &str| {
+            VALID.replace(
+                &format!("        listen = \"{listen}\""),
+                &format!("        listen = \"{listen}\"\n        {line}"),
+            )
+        };
+        assert_eq!(
+            Config::parse(&with("request_buffer_bytes = 4096", "0.0.0.0:8080"))
+                .unwrap()
+                .listeners[0]
+                .request_buffer_bytes(),
+            4096
+        );
+        assert!(Config::parse(&with("request_buffer_bytes = 0", "0.0.0.0:8080")).is_err());
+        assert!(Config::parse(&with("request_buffer_bytes = 4096", "0.0.0.0:5432")).is_err());
     }
 
     #[test]
