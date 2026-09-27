@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Redirects and fixed responses.** `[[listeners.direct_responses]]`
+  answers matching requests with a redirect or a fixed page (for example a
+  maintenance notice) without contacting a backend.
 - **Header rewrite.** `[listeners.headers]` sets or removes request and
   response headers. Framing and routing headers (`Host`, `Content-Length`,
   `Transfer-Encoding` and the hop-by-hop headers) are refused.

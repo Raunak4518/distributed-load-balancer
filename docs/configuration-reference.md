@@ -103,6 +103,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `upstream_limits` | table | none | HTTP-only | Per-backend in-flight request cap and wait queue. |
 | `forwarded` | table | none | HTTP-only | Adds `X-Forwarded-*` and `Forwarded` headers; `trusted_cidrs` lists proxies whose existing headers are kept and extended rather than replaced. See [http-features.md](http-features.md#x-forwarded-for--forwarded). |
 | `headers` | table | none | HTTP-only | Sets or removes request and response headers. See [`[listeners.headers]`](#listenersheaders). |
+| `direct_responses` | array of tables | `[]` | HTTP-only | Redirects and fixed responses answered without a backend. See [`[[listeners.direct_responses]]`](#listenersdirect_responses). |
 | `adaptive_concurrency` | table | none | HTTP-only | Per-backend in-flight limit that adapts to each backend's latency. |
 
 `http2_enabled()` — whether HTTP/2 is actually served — is `protocol == "http" && tls is set && (http2.enabled != false)`; a plaintext listener never serves HTTP/2 regardless of `http2.enabled`, because ALPN only exists inside a TLS handshake ([`config.rs`](../crates/lb-core/src/config.rs)). See [load-balancing.md](load-balancing.md) for routes/canary/sticky behavior, [http-features.md](http-features.md) for cache/compression/WebSocket behavior, [edge-hardening.md](edge-hardening.md) for connection limits, PROXY protocol and the WAF, and [request-lifecycle.md](request-lifecycle.md) for how the timeouts above compose.
@@ -347,6 +348,33 @@ request_set = { "x-env" = "prod" }
 request_remove = ["x-internal-debug"]
 response_set = { "x-frame-options" = "DENY" }
 response_remove = ["server"]
+```
+
+## `[[listeners.direct_responses]]`
+
+HTTP-only. Each entry answers matching requests itself, without contacting a backend: a redirect, or a fixed page such as a maintenance notice. Entries are checked in order and the first match wins. They are checked after rate limiting and the WAF, so neither can be bypassed through them, and after the ACME challenge path, so a catch-all maintenance page does not break certificate renewal. A request that matches no entry is routed as usual.
+
+| Field | Type | Default | Validation | Meaning |
+|---|---|---|---|---|
+| `path_prefix` | string | none | must start with `/` | Matched by whole path segments, like `[[listeners.routes]]`. Omitted matches every path. |
+| `host` | string | none | — | Case-insensitive exact match on `Host`. Omitted matches every host. |
+| `status` | integer | required | 200–599; 301, 302, 303, 307 and 308 need `redirect` | Response status. |
+| `body` | string | empty | — | Response body. |
+| `content_type` | string | `text/plain; charset=utf-8` when `body` is set | valid header value | `Content-Type` of the body. |
+| `redirect` | string | none | a URI; only with a redirect status | `Location` to send. |
+| `keep_path` | bool | `false` | only with `redirect` | Appends the request's path and query to `redirect`. |
+
+```toml
+[[listeners.direct_responses]]
+path_prefix = "/old"
+status = 308
+redirect = "https://new.example"
+keep_path = true              # /old/a?x=1 -> https://new.example/old/a?x=1
+
+[[listeners.direct_responses]]
+host = "shop.example"
+status = 503
+body = "Down for maintenance"
 ```
 
 ## `[listeners.retry_budget]`

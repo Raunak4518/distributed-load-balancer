@@ -84,6 +84,10 @@ The rate limiter still keys on the TCP (or PROXY protocol) peer, never on these 
 
 `[listeners.headers]` ([`headers.rs`](../crates/lb-proxy/src/headers.rs)) sets and removes request and response headers, for example to tag requests with an environment or to hide a backend's `Server` header. Headers that control framing or routing cannot be rewritten. See [configuration-reference.md](configuration-reference.md#listenersheaders) for the fields and ordering rules.
 
+### Redirects and fixed responses
+
+`[[listeners.direct_responses]]` ([`direct.rs`](../crates/lb-proxy/src/direct.rs)) answers matching requests without a backend: a redirect (optionally keeping the original path and query) or a fixed page with its own status and body, such as a `503` maintenance notice. See [configuration-reference.md](configuration-reference.md#listenersdirect_responses).
+
 ### HSTS injection
 
 When a listener terminates TLS and `tls.hsts_max_age_secs` is configured above its default of `0`, every response from that listener gets `Strict-Transport-Security: max-age=<seconds>` added, regardless of status code — a rate-limited `429` or an upstream `503` gets the header exactly as a `200` does, because HSTS is a property of the host, not of any one response. Setting it to `0` (or omitting it) adds no header at all — `0` is deliberately not sent as `max-age=0`, since that has the opposite, actively-forgetting effect in a browser. HSTS on a TCP listener, or on an HTTP listener with no TLS, is a config-validation error.
