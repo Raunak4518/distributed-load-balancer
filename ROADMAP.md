@@ -19,8 +19,8 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Retry policy classifies failures (connect error, timeout, reset, 5xx) and respects method idempotency
 - [x] Retry budget per route/pool, not only per listener
 - [x] Stream request bodies to the backend when no retry or cache needs them buffered
-- [ ] Audit: every `spawn()` has an owner and a shutdown path
-- [ ] Audit: every map keyed by client input has a cardinality bound
+- [x] Audit: every `spawn()` has an owner and a shutdown path
+- [x] Audit: every map keyed by client input has a cardinality bound
 - [ ] Audit: cancellation (client disconnect) propagates to the upstream request
 
 ### Cluster

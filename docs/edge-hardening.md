@@ -168,6 +168,7 @@ token_env = "LB_ADMIN_TOKEN"   # preferred: config files end up in version contr
 - The comparison uses `subtle::ConstantTimeEq` rather than a byte-wise `==`, specifically so that how much of a presented token matches the real one cannot be inferred from response timing.
 - A missing or mismatched token — including one of a different length than the real token, which must not panic the constant-time comparison — returns `401 Unauthorized` with a `WWW-Authenticate: Bearer` header, and increments `lb_admin_auth_failures_total`.
 - `token` and `token_env` are mutually exclusive; setting both is a config validation error. An empty resolved token is also rejected at startup.
+- The admin listener accepts at most 64 connections at once (further ones wait in the kernel backlog) and closes any connection that has not sent a complete request head within 5 seconds, so it cannot be held open by idle or slowloris clients.
 - `/healthz` and `/ready` answer without a token, so an orchestrator or load balancer can probe them without holding the secret. Each reveals one bit.
 - A token is **required** when `admin.listen` is not a loopback address: startup fails unless `token`/`token_env` is set or `allow_unauthenticated = true` explicitly accepts an open admin port. A loopback-only admin listener may still run without one.
 

@@ -98,6 +98,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The admin listener had no connection limit or header timeout.** It now
+  serves at most 64 connections at once and drops any that has not sent its
+  request head within 5 seconds.
+- **The cluster counter store's key cap only applied to gossip.** Keys
+  admitted locally past `MAX_TRACKED_KEYS` now share one overflow budget per
+  listener instead of each growing the store.
+- **Peak-EWMA kept latency state for removed backends forever.** Entries for
+  backends no longer in the pool are dropped when its membership changes.
 - **One failing route could spend the whole listener's retry budget.** The
   budget is now kept per pool: the default pool, each route and each canary
   pool get their own bucket of the configured size.
