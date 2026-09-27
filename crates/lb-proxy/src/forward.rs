@@ -250,6 +250,7 @@ impl lb_core::ProbeClient for ProbeCapableClient {
 #[derive(Debug)]
 pub enum ForwardError {
     Connect,
+    Transport,
     Timeout,
 }
 
@@ -260,7 +261,8 @@ pub async fn forward(
 ) -> Result<Response<Incoming>, ForwardError> {
     match tokio::time::timeout(timeout, client.request(req)).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(_)) => Err(ForwardError::Connect),
+        Ok(Err(err)) if err.is_connect() => Err(ForwardError::Connect),
+        Ok(Err(_)) => Err(ForwardError::Transport),
         Err(_) => Err(ForwardError::Timeout),
     }
 }
@@ -457,7 +459,7 @@ mod tests {
         // own timeout fires (Timeout) is platform-dependent — on Windows,
         // unlike most Unix TCP stacks, a closed loopback port does not
         // reliably send an immediate RST, so this test accepts either
-        // variant. lb-proxy's own retry logic treats them identically.
+        // variant. Both are retryable for an idempotent request.
         let client = build_client(None, HashMap::new(), false, None);
         let req = Request::builder()
             .uri("http://127.0.0.1:1")

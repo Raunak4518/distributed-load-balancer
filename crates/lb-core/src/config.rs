@@ -271,6 +271,8 @@ pub struct ListenerConfig {
     pub response_body_idle_timeout_ms: Option<u64>,
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_on_status: Vec<u16>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -1222,6 +1224,15 @@ impl ListenerConfig {
                     .into(),
             ));
         }
+        if let Some(status) = self
+            .retry_on_status
+            .iter()
+            .find(|status| !(500..=599).contains(*status))
+        {
+            return Err(invalid(format!(
+                "retry_on_status may only list 5xx statuses, got {status}"
+            )));
+        }
         if self.request_timeout_ms == Some(0) {
             return Err(invalid("request_timeout_ms must be positive".into()));
         }
@@ -1370,9 +1381,10 @@ impl ListenerConfig {
                     || self.websocket_idle_timeout_ms.is_some()
                     || self.response_body_idle_timeout_ms.is_some()
                     || self.request_timeout_ms.is_some()
+                    || !self.retry_on_status.is_empty()
                 {
                     return Err(invalid(
-                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms/request_timeout_ms are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
+                        "forward_timeout_ms/max_request_body_bytes/write_timeout_ms/websocket_idle_timeout_ms/response_body_idle_timeout_ms/request_timeout_ms/retry_on_status are http-only settings -- a tcp listener gets equivalent protection from idle_timeout_ms"
                             .into(),
                     ));
                 }
@@ -1661,6 +1673,28 @@ mod tests {
           [listeners.load_balancing]
           strategy = "round_robin"
     "#;
+
+    #[test]
+    fn retry_on_status_is_empty_by_default_and_only_accepts_5xx() {
+        let cfg = Config::parse(VALID).unwrap();
+        assert!(cfg.listeners[0].retry_on_status.is_empty());
+        let with = |value: &str| {
+            VALID.replace(
+                "        listen = \"0.0.0.0:8080\"",
+                &format!("        listen = \"0.0.0.0:8080\"\n        retry_on_status = {value}"),
+            )
+        };
+        assert_eq!(
+            Config::parse(&with("[502, 503]")).unwrap().listeners[0].retry_on_status,
+            vec![502, 503]
+        );
+        assert!(Config::parse(&with("[404]")).is_err());
+        let tcp = VALID.replace(
+            "        listen = \"0.0.0.0:5432\"",
+            "        listen = \"0.0.0.0:5432\"\n        retry_on_status = [503]",
+        );
+        assert!(Config::parse(&tcp).is_err());
+    }
 
     #[test]
     fn request_timeout_is_unset_by_default_and_validated() {

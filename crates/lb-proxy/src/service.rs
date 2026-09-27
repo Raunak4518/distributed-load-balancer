@@ -106,6 +106,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub rate_limit_key: RateLimitKeySource,
     pub forward_timeout: Duration,
     pub request_timeout: Option<Duration>,
+    pub retry_on_status: Vec<u16>,
     pub max_request_body_bytes: usize,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
@@ -479,6 +480,22 @@ fn within_deadline(deadline: Option<tokio::time::Instant>, timeout: Duration) ->
 fn request_deadline_response(metrics: &ListenerMetrics) -> Response<ProxyBody> {
     metrics.timeouts_request.inc();
     simple_response(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded")
+}
+
+fn retry_admitted<R: RateLimiter, C: Clock>(ctx: &ProxyContext<R, C>) -> bool {
+    let Some(budget) = &ctx.retry_budget else {
+        return true;
+    };
+    match budget.check(RETRY_BUDGET_KEY) {
+        Decision::Deny { .. } => {
+            ctx.metrics.retry_budget_denials.inc();
+            false
+        }
+        Decision::Allow => {
+            ctx.metrics.retry_budget_admits.inc();
+            true
+        }
+    }
 }
 
 fn is_idempotent_method(method: &Method) -> bool {
@@ -879,6 +896,16 @@ where
                     // burst, not only on the next request.
                     pool.set_circuit_open(&backend_id, breaker.is_open());
                 }
+                if attempt == 0
+                    && ctx.retry_on_status.contains(&resp.status().as_u16())
+                    && is_idempotent_method(&parts.method)
+                    && !deadline_exceeded(deadline)
+                    && retry_admitted(&ctx)
+                {
+                    ctx.metrics.retry_attempts.inc();
+                    last_status = resp.status();
+                    continue;
+                }
                 let (mut resp_parts, resp_body) = resp.into_parts();
                 // Direction: backend -> client. Strip before returning so a
                 // hop-by-hop header the backend sent us (describing its hop
@@ -959,7 +986,9 @@ where
                 if let Some(bm) = ctx.backend_metrics.get(&backend_id) {
                     match err {
                         ForwardError::Timeout => bm.requests_timeout.inc(),
-                        ForwardError::Connect => bm.requests_failure.inc(),
+                        ForwardError::Connect | ForwardError::Transport => {
+                            bm.requests_failure.inc()
+                        }
                     }
                 }
                 balancer.record_latency(&backend_id, attempt_started.elapsed());
@@ -981,18 +1010,12 @@ where
                     ctx.metrics.retry_failures.inc();
                     break;
                 }
-                if !is_idempotent_method(&parts.method) {
+                if !matches!(err, ForwardError::Connect) && !is_idempotent_method(&parts.method) {
                     ctx.metrics.retry_not_idempotent.inc();
                     break;
                 }
-                if let Some(budget) = &ctx.retry_budget {
-                    match budget.check(RETRY_BUDGET_KEY) {
-                        Decision::Deny { .. } => {
-                            ctx.metrics.retry_budget_denials.inc();
-                            break;
-                        }
-                        Decision::Allow => ctx.metrics.retry_budget_admits.inc(),
-                    }
+                if !retry_admitted(&ctx) {
+                    break;
                 }
                 ctx.metrics.retry_attempts.inc();
             }
@@ -1389,6 +1412,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1428,6 +1452,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1486,6 +1511,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1529,6 +1555,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1588,6 +1615,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1629,6 +1657,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1687,6 +1716,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -1779,6 +1809,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout,
             request_timeout: Some(request_timeout),
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2026,6 +2057,106 @@ mod tests {
         assert_eq!(metrics.retry_budget_denials.get(), 0);
     }
 
+    fn ctx_retrying(
+        first: &Backend,
+        pool: Arc<BackendPool>,
+        retry_on_status: Vec<u16>,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(first.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(5),
+            request_timeout: None,
+            retry_on_status,
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_post_whose_backend_refused_the_connection_is_retried_elsewhere() {
+        let dead_addr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let live_addr = spawn_fixed_response_backend(StatusCode::OK, "live").await;
+        let dead = Backend::new("dead", dead_addr, 1, None);
+        let live = Backend::new("live", live_addr, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![dead.clone(), live]));
+        let ctx = ctx_retrying(&dead, pool, Vec::new());
+        let metrics = ctx.metrics.clone();
+
+        let resp = run_through_proxy_with_method(ctx, Method::POST).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(metrics.retry_successes.get(), 1);
+        assert_eq!(metrics.retry_not_idempotent.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_listed_5xx_is_retried_on_another_backend_for_an_idempotent_request() {
+        let failing = Backend::new(
+            "failing",
+            spawn_fixed_response_backend(StatusCode::SERVICE_UNAVAILABLE, "busy").await,
+            1,
+            None,
+        );
+        let healthy = Backend::new(
+            "healthy",
+            spawn_fixed_response_backend(StatusCode::OK, "ok").await,
+            1,
+            None,
+        );
+        let pool = Arc::new(BackendPool::new(vec![failing.clone(), healthy.clone()]));
+
+        let listed = ctx_retrying(&failing, Arc::clone(&pool), vec![503]);
+        assert_eq!(
+            run_through_proxy(listed.clone()).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(listed.metrics.retry_successes.get(), 1);
+
+        let unlisted = ctx_retrying(&failing, Arc::clone(&pool), vec![502]);
+        assert_eq!(
+            run_through_proxy(unlisted).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let post = ctx_retrying(&failing, pool, vec![503]);
+        assert_eq!(
+            run_through_proxy_with_method(post, Method::POST)
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 5xx means the backend saw the request, so a POST must not be replayed"
+        );
+    }
+
     #[tokio::test]
     async fn a_post_to_a_flaky_backend_is_not_retried() {
         let addr = spawn_flaky_then_ok_backend().await;
@@ -2109,6 +2240,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2158,6 +2290,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2221,6 +2354,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2312,6 +2446,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2383,6 +2518,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2454,6 +2590,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2616,6 +2753,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2758,6 +2896,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2801,6 +2940,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -2920,6 +3060,7 @@ mod tests {
                 rate_limit_key: RateLimitKeySource::SourceIp,
                 forward_timeout: Duration::from_secs(1),
                 request_timeout: None,
+                retry_on_status: Vec::new(),
                 max_request_body_bytes: 1024,
                 cluster: None,
                 metrics: test_metrics(),
@@ -2995,6 +3136,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3173,6 +3315,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3224,6 +3367,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3271,6 +3415,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3316,6 +3461,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3753,6 +3899,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -3796,6 +3943,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3846,6 +3994,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3896,6 +4045,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3940,6 +4090,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -3982,6 +4133,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -4030,6 +4182,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: metrics.clone(),
@@ -4082,6 +4235,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4211,6 +4365,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4280,6 +4435,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4362,6 +4518,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4472,6 +4629,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::SourceIp,
             forward_timeout: Duration::from_secs(2),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4614,6 +4772,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::Header("X-Api-Key".to_string()),
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
@@ -4712,6 +4871,7 @@ mod tests {
             rate_limit_key: RateLimitKeySource::Header("X-Trigger".to_string()),
             forward_timeout: Duration::from_secs(1),
             request_timeout: None,
+            retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             cluster: None,
             metrics: test_metrics(),
