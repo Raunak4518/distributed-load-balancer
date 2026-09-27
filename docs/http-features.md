@@ -64,9 +64,21 @@ Every response gets an `x-request-id` header carrying a freshly generated UUIDv4
 
 ### X-Forwarded-For / Forwarded
 
-The proxy does **not inject** `X-Forwarded-For`, `Forwarded`, or `X-Forwarded-Proto`/`X-Forwarded-Host` into the backend request. Whatever such headers a client sends arrive at the backend unmodified (they are not hop-by-hop, so `strip_hop_by_hop` leaves them alone), but the load balancer adds nothing of its own. A backend that needs the real client IP must be given it some other way (e.g. via PROXY protocol upstream of this listener, if applicable to your deployment, or by trusting `X-Forwarded-For` only behind a controlled front end).
+Off by default, in which case the proxy adds nothing and passes any such client headers through untouched. With `[listeners.forwarded]` ([`forwarded.rs`](../crates/lb-proxy/src/forwarded.rs)), every request forwarded to a backend, WebSocket upgrades included, carries:
 
-The one place `X-Forwarded-For` is read by the load balancer itself is as an optional rate-limit key source (`rate_limit.key = "header:X-Forwarded-For"`) — used only to bucket the local rate limiter, and explicitly never used in place of the real peer IP for that purpose unless configured to.
+- `X-Forwarded-For`: the client address (after PROXY protocol, if enabled, so it is the real client rather than the load balancer in front).
+- `X-Forwarded-Proto`: `https` on a TLS listener, otherwise `http`.
+- `X-Forwarded-Host`: the request's `Host` (or HTTP/2 `:authority`).
+- `Forwarded` (RFC 7239): `for=...;proto=...;host="..."`, with IPv6 addresses written `"[...]"`.
+
+What happens to headers the client already sent depends on who sent them. If the immediate peer's address is inside `trusted_cidrs` (your CDN or front proxy), its `X-Forwarded-For` and `Forwarded` chains are kept and this hop is appended, and its `X-Forwarded-Proto`/`X-Forwarded-Host` are kept. From any other peer all four headers are removed first and replaced, so a client cannot claim to be someone else or claim it arrived over HTTPS.
+
+```toml
+[listeners.forwarded]
+trusted_cidrs = ["10.0.0.0/8"]   # empty: trust no one, always overwrite
+```
+
+The rate limiter still keys on the TCP (or PROXY protocol) peer, never on these headers, unless `rate_limit.key = "header:X-Forwarded-For"` is configured explicitly.
 
 ### HSTS injection
 

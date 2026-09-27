@@ -52,7 +52,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Maglev and rendezvous (HRW) hashing; hash-movement measurement
 - [x] Random, P2C least-request, weighted random strategies
 - [x] Peak-EWMA score extended with error rate, tail latency and queue delay, with hysteresis
-- [ ] `Forwarded` / `X-Forwarded-*` with trusted-proxy semantics
+- [x] `Forwarded` / `X-Forwarded-*` with trusted-proxy semantics
 - [ ] Request smuggling defenses audit (TE/CL, duplicate headers, authority/Host validation)
 - [ ] Header rewrite, redirects, fixed/maintenance responses
 - [ ] Request mirroring / shadow traffic

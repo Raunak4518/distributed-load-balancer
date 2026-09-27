@@ -101,6 +101,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `waf` | table | none | HTTP-only | Built-in request-pattern blocking/logging. |
 | `retry_budget` | table | none | HTTP-only | Token-bucket cap on retried requests. |
 | `upstream_limits` | table | none | HTTP-only | Per-backend in-flight request cap and wait queue. |
+| `forwarded` | table | none | HTTP-only | Adds `X-Forwarded-*` and `Forwarded` headers; `trusted_cidrs` lists proxies whose existing headers are kept and extended rather than replaced. See [http-features.md](http-features.md#x-forwarded-for--forwarded). |
 | `adaptive_concurrency` | table | none | HTTP-only | Per-backend in-flight limit that adapts to each backend's latency. |
 
 `http2_enabled()` — whether HTTP/2 is actually served — is `protocol == "http" && tls is set && (http2.enabled != false)`; a plaintext listener never serves HTTP/2 regardless of `http2.enabled`, because ALPN only exists inside a TLS handshake ([`config.rs`](../crates/lb-core/src/config.rs)). See [load-balancing.md](load-balancing.md) for routes/canary/sticky behavior, [http-features.md](http-features.md) for cache/compression/WebSocket behavior, [edge-hardening.md](edge-hardening.md) for connection limits, PROXY protocol and the WAF, and [request-lifecycle.md](request-lifecycle.md) for how the timeouts above compose.

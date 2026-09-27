@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`X-Forwarded-*` and `Forwarded` headers: `[listeners.forwarded]`.**
+  Backends learn the client address, scheme and host. Headers from peers
+  outside `trusted_cidrs` are replaced rather than trusted, so clients cannot
+  spoof them.
 - **`random`, `weighted_random` and `least_request` strategies.**
   `least_request` samples two backends and picks the one with fewer requests
   in flight.
