@@ -726,13 +726,14 @@ where
         }
     }
 
-    // Bypasses the cache-store/sticky-pin/retry-loop machinery below
-    // entirely -- none of it applies to a connection that is about to stop
-    // being HTTP. See `crate::upgrade`'s module docs for why this can't be
-    // handled by `strip_hop_by_hop` (which runs later, in the ordinary
-    // path) instead.
+    // Bypasses the cache-store/retry-loop machinery below entirely -- none
+    // of it applies to a connection that is about to stop being HTTP. See
+    // `crate::upgrade`'s module docs for why this can't be handled by
+    // `strip_hop_by_hop` (which runs later, in the ordinary path) instead.
     if upgrade::is_upgrade_request(req.headers()) {
-        return Ok(upgrade::handle_upgrade(req, &ctx, pool, balancer, &key).await);
+        return Ok(
+            upgrade::handle_upgrade(req, &ctx, pool, balancer, &key, sticky_pin.as_ref()).await,
+        );
     }
 
     let (parts, body) = req.into_parts();
@@ -4135,6 +4136,114 @@ mod tests {
             released,
             "a closed WebSocket must release its active-connection count"
         );
+    }
+
+    fn upgrade_ctx(
+        pool: Arc<BackendPool>,
+        balancer: Arc<dyn LoadBalancer>,
+        sticky: Option<StickyRuntime>,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer,
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            retry_budget: None,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(5),
+            response_body_idle_timeout: Duration::from_secs(60),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(2),
+            max_request_body_bytes: 1024,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+        })
+    }
+
+    async fn open_websocket(addr: SocketAddr, extra_headers: &str) -> (TcpStream, String) {
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n{extra_headers}\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (head, _) = read_response_head(&mut client).await;
+        (client, head)
+    }
+
+    #[tokio::test]
+    async fn a_websocket_upgrade_follows_the_sticky_pin() {
+        let a = Backend::new("a", spawn_upgrade_backend(true).await, 1, None);
+        let b = Backend::new("b", spawn_upgrade_backend(true).await, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![a.clone(), b.clone()]));
+        let ctx = upgrade_ctx(
+            Arc::clone(&pool),
+            Arc::new(FixedPick(a.id.clone())),
+            Some(StickyRuntime {
+                cookie_name: "lb".to_string(),
+                max_age_secs: None,
+                secure: false,
+            }),
+        );
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let (_socket, head) = open_websocket(addr, "Cookie: lb=b\r\n").await;
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101, got:\n{head}"
+        );
+        assert_eq!(
+            pool.active_count(&b.id),
+            1,
+            "the pinned backend must serve the upgrade"
+        );
+        assert_eq!(pool.active_count(&a.id), 0);
+    }
+
+    #[tokio::test]
+    async fn a_websocket_upgrade_moves_to_another_backend_when_the_first_cannot_be_reached() {
+        let unreachable = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let dead = Backend::new("dead", unreachable, 1, None);
+        let live = Backend::new("live", spawn_upgrade_backend(true).await, 1, None);
+        let pool = Arc::new(BackendPool::new(vec![dead.clone(), live.clone()]));
+        let ctx = upgrade_ctx(
+            Arc::clone(&pool),
+            Arc::new(FixedPick(dead.id.clone())),
+            None,
+        );
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let (_socket, head) = open_websocket(addr, "").await;
+        assert!(
+            head.starts_with("HTTP/1.1 101"),
+            "expected 101, got:\n{head}"
+        );
+        assert_eq!(pool.active_count(&live.id), 1);
+        assert_eq!(pool.active_count(&dead.id), 0);
     }
 
     #[tokio::test]

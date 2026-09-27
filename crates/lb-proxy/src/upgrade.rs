@@ -3,8 +3,8 @@
 //! `strip_hop_by_hop` removes `Connection`/`Upgrade` on every ordinary
 //! request, which is correct for ordinary requests and fatal to a WebSocket
 //! handshake -- this module is the separate path an `Upgrade` request takes
-//! instead, bypassing `strip_hop_by_hop` (and the cache, the sticky pin, and
-//! the retry loop, none of which apply to it) entirely.
+//! instead, bypassing `strip_hop_by_hop` (and the cache and the ordinary
+//! retry loop, neither of which applies to it) entirely.
 //!
 //! The backend leg cannot reuse `ProxyContext::client`/`per_backend_client`
 //! (the pooled `hyper_util::client::legacy::Client`): that client has no
@@ -22,9 +22,9 @@
 //! mechanism, RFC 8441 extended CONNECT, is a materially different
 //! bootstrapping protocol and not attempted here -- an h2 client connection
 //! has no `Upgrade` header semantics anyway, so it's naturally excluded by
-//! `is_upgrade_request` rather than specially guarded against), and one
-//! backend attempt with no retry onto a second backend on failure (unlike
-//! the ordinary path's 2-attempt retry loop).
+//! `is_upgrade_request` rather than specially guarded against), and at most
+//! two backend attempts, the second only when connecting to the first
+//! failed -- before any of the client's request has reached a backend.
 
 use crate::forward::backend_scheme_and_authority;
 use crate::service::{empty_body, simple_response, strip_hop_by_hop, ProxyBody, ProxyContext};
@@ -34,7 +34,7 @@ use hyper::body::Incoming;
 use hyper::header::{CONNECTION, UPGRADE};
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use lb_core::{BackendPool, Clock, LoadBalancer, ProxyStream, RateLimiter};
+use lb_core::{BackendId, BackendPool, Clock, LoadBalancer, ProxyStream, RateLimiter};
 use lb_metrics::WebsocketUpgradeResult;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -73,77 +73,97 @@ pub async fn handle_upgrade<R, C>(
     pool: &Arc<BackendPool>,
     balancer: &Arc<dyn LoadBalancer>,
     key: &str,
+    sticky_pin: Option<&BackendId>,
 ) -> Response<ProxyBody>
 where
     R: RateLimiter,
     C: Clock,
 {
-    let Some(backend_id) = balancer.pick(pool, key) else {
-        return simple_response(StatusCode::SERVICE_UNAVAILABLE, "no healthy backend");
-    };
-    let Some(backend) = pool.backend(&backend_id) else {
-        return simple_response(StatusCode::SERVICE_UNAVAILABLE, "no healthy backend");
-    };
-    let active = pool.track_active(&backend_id);
-
-    // Also tells us, by construction, that `backend.server_name` is present
-    // whenever `ctx.backend_tls` is set -- `backend_scheme_and_authority`
-    // only returns `Some` for `(backend_tls: true, server_name: None)`'s
-    // opposite case, same invariant the ordinary request path relies on.
-    let Some((scheme, authority)) = backend_scheme_and_authority(&backend, ctx.backend_tls) else {
-        return simple_response(
-            StatusCode::BAD_GATEWAY,
-            "backend is missing the server_name its TLS configuration requires",
-        );
-    };
     let path_and_query = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
-    let Ok(uri) = hyper::Uri::builder()
-        .scheme(scheme)
-        .authority(authority)
-        .path_and_query(path_and_query)
-        .build()
-    else {
-        return simple_response(StatusCode::BAD_GATEWAY, "backend could not be addressed");
-    };
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let mut tried: Vec<BackendId> = Vec::new();
+    let mut connected = None;
+    for attempt in 0..2u8 {
+        let pinned = (attempt == 0)
+            .then_some(sticky_pin)
+            .flatten()
+            .filter(|id| pool.is_eligible(id))
+            .cloned();
+        let Some(backend_id) = pinned.or_else(|| {
+            balancer
+                .pick_excluding(pool, key, &tried)
+                .or_else(|| balancer.pick(pool, key))
+        }) else {
+            break;
+        };
+        tried.push(backend_id.clone());
+        let Some(backend) = pool.backend(&backend_id) else {
+            continue;
+        };
+        let active = pool.track_active(&backend_id);
 
-    let connect_and_handshake = async {
-        let tcp = TcpStream::connect(backend.address).await?;
-        if let Some(keepalive) = &ctx.backend_tcp_keepalive {
-            apply_tcp_keepalive(&tcp, keepalive);
-        }
-        let io: Box<dyn ProxyStream> = if let Some(connector) = &ctx.backend_tls_connector {
-            let server_name = backend
-                .server_name
-                .clone()
-                .expect("validated: server_name is required when backend_tls is set");
-            let name = rustls::pki_types::ServerName::try_from(server_name).map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
-            })?;
-            let tls = connector
-                .tls_connector_http1_only()
-                .connect(name, tcp)
-                .await?;
-            Box::new(tls)
-        } else {
-            Box::new(tcp)
+        // Also tells us, by construction, that `backend.server_name` is present
+        // whenever `ctx.backend_tls` is set -- `backend_scheme_and_authority`
+        // only returns `Some` for `(backend_tls: true, server_name: None)`'s
+        // opposite case, same invariant the ordinary request path relies on.
+        let Some((scheme, authority)) = backend_scheme_and_authority(&backend, ctx.backend_tls)
+        else {
+            return simple_response(
+                StatusCode::BAD_GATEWAY,
+                "backend is missing the server_name its TLS configuration requires",
+            );
         };
-        hyper::client::conn::http1::handshake(TokioIo::new(io))
-            .await
-            .map_err(|err| std::io::Error::other(err.to_string()))
-    };
-    let (mut sender, conn) =
-        match tokio::time::timeout(ctx.forward_timeout, connect_and_handshake).await {
-            Ok(Ok(pair)) => pair,
-            _ => {
-                ctx.metrics
-                    .record_websocket_upgrade(WebsocketUpgradeResult::BackendUnreachable);
-                return simple_response(StatusCode::BAD_GATEWAY, "backend unreachable");
+        let Ok(uri) = hyper::Uri::builder()
+            .scheme(scheme)
+            .authority(authority)
+            .path_and_query(path_and_query.as_str())
+            .build()
+        else {
+            return simple_response(StatusCode::BAD_GATEWAY, "backend could not be addressed");
+        };
+
+        let connect_and_handshake = async {
+            let tcp = TcpStream::connect(backend.address).await?;
+            if let Some(keepalive) = &ctx.backend_tcp_keepalive {
+                apply_tcp_keepalive(&tcp, keepalive);
             }
+            let io: Box<dyn ProxyStream> = if let Some(connector) = &ctx.backend_tls_connector {
+                let server_name = backend
+                    .server_name
+                    .clone()
+                    .expect("validated: server_name is required when backend_tls is set");
+                let name = rustls::pki_types::ServerName::try_from(server_name).map_err(|err| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+                })?;
+                let tls = connector
+                    .tls_connector_http1_only()
+                    .connect(name, tcp)
+                    .await?;
+                Box::new(tls)
+            } else {
+                Box::new(tcp)
+            };
+            hyper::client::conn::http1::handshake(TokioIo::new(io))
+                .await
+                .map_err(|err| std::io::Error::other(err.to_string()))
         };
+        if let Ok(Ok(pair)) = tokio::time::timeout(ctx.forward_timeout, connect_and_handshake).await
+        {
+            connected = Some((uri, active, pair));
+            break;
+        }
+    }
+    let Some((uri, active, (mut sender, conn))) = connected else {
+        if tried.is_empty() {
+            return simple_response(StatusCode::SERVICE_UNAVAILABLE, "no healthy backend");
+        }
+        ctx.metrics
+            .record_websocket_upgrade(WebsocketUpgradeResult::BackendUnreachable);
+        return simple_response(StatusCode::BAD_GATEWAY, "backend unreachable");
+    };
     // Never pooled: this task's only job is driving this one connection,
     // including its eventual upgrade handoff.
     tokio::spawn(async move {
