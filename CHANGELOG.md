@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`request_timeout_ms`: one deadline for a whole HTTP request.** It spans
+  the request-body read, every attempt including a retry, and the streamed
+  response body. Expiry before the response starts returns `504`; expiry
+  mid-body aborts the response. Counted as
+  `lb_request_timeouts_total{phase="request"}`. Unset by default.
 - **Awaiting-first-probe state for new backends.** A backend that joins a
   pool while the process is serving (a later DNS poll or a config reload)
   receives no traffic until its first health probe succeeds, as long as
