@@ -33,7 +33,7 @@ With `slow_start_ms` set, a backend that has just become eligible again is not h
 
 ## Selection Strategies
 
-All seven strategies implement the same `LoadBalancer` trait: `pick(pool, key) -> Option<BackendId>`, plus an optional `record_latency(id, latency)` hook called after every attempt (success or failure) — only Peak EWMA + P2C uses it. `key` is whatever the listener's `rate_limit.key` already resolves to for that request (`source_ip`, or the configured request header) — passed straight through rather than separately configured, so a listener's existing identity choice doubles as its hashing/affinity identity for strategies that need one.
+All ten strategies implement the same `LoadBalancer` trait: `pick(pool, key) -> Option<BackendId>`, plus an optional `record_latency(id, latency)` hook called after every attempt (success or failure) — only Peak EWMA + P2C uses it. `key` is whatever the listener's `rate_limit.key` already resolves to for that request (`source_ip`, or the configured request header) — passed straight through rather than separately configured, so a listener's existing identity choice doubles as its hashing/affinity identity for strategies that need one.
 
 Set per listener (or per route, or per canary pool) with:
 
@@ -42,7 +42,7 @@ Set per listener (or per route, or per canary pool) with:
 strategy = "round_robin"
 ```
 
-Valid values: `"round_robin"`, `"least_connections"`, `"weighted_round_robin"`, `"consistent_hash"`, `"maglev"`, `"rendezvous_hash"`, `"peak_ewma_p2c"`. `strategy` is required — there is no default.
+Valid values: `"round_robin"`, `"least_connections"`, `"weighted_round_robin"`, `"consistent_hash"`, `"maglev"`, `"rendezvous_hash"`, `"random"`, `"weighted_random"`, `"least_request"`, `"peak_ewma_p2c"`. `strategy` is required — there is no default.
 
 ### Round Robin (`round_robin`)
 
@@ -105,6 +105,10 @@ Samples two eligible backends at random and picks whichever looks cheaper right 
 
 Source: [`peak_ewma_p2c.rs`](../crates/lb-balancer/src/peak_ewma_p2c.rs).
 
+### Random, weighted random and least request (`random`, `weighted_random`, `least_request`)
+
+Three stateless strategies ([`random.rs`](../crates/lb-balancer/src/random.rs)) sharing one lock-free xorshift generator per balancer. `random` picks uniformly among eligible backends. `weighted_random` picks with probability proportional to `weight` (a weight-0 backend is never picked). `least_request` is power-of-two-choices on in-flight requests: it samples two distinct eligible backends and sends the request to the one with fewer in flight. That gets most of `least_connections`' load awareness while avoiding the herding that comes from every request picking the same globally least-loaded backend, at O(1) cost per pick instead of O(N).
+
 ### Maglev (`maglev`)
 
 Google's Maglev hashing ([`maglev.rs`](../crates/lb-balancer/src/maglev.rs)): a 65,537-slot lookup table in which every backend claims slots by walking its own permutation (an offset and a skip derived from its id), round by round, until the table is full. A backend with weight `w` takes `w` slots per round, weight capped at 100 as for `consistent_hash`. A lookup is `table[hash(key) % 65537]`, one array read. Like the ring, the table is built from every backend and rebuilt only when membership or weights change. At lookup, slots whose backend is ineligible are skipped, walking forward to the next slot with an eligible backend, so a backend going down moves only its own keys.
@@ -135,6 +139,9 @@ The ring's lower movement figure is luck, not quality: the backend removed happe
 | Consistent Hashing | `consistent_hash` | yes | yes (minimal remap) | no | O(log R + k) |
 | Maglev | `maglev` | yes | yes (minimal remap) | no | O(1) + k |
 | Rendezvous Hashing | `rendezvous_hash` | yes | yes (minimal remap) | no | O(N) |
+| Random | `random` | no | no | no | O(N) |
+| Weighted Random | `weighted_random` | no | no | no | O(N) |
+| Least Request (P2C) | `least_request` | no | no | indirectly (in-flight count) | O(N) |
 | Peak EWMA + P2C | `peak_ewma_p2c` | no | no | yes | O(1) |
 
 N = total backends in the pool; R = total ring points; k = consecutive ineligible ring points or Maglev slots walked. See [benchmarks.md](benchmarks.md) for measured throughput and tail-latency comparisons across strategies under load.

@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`random`, `weighted_random` and `least_request` strategies.**
+  `least_request` samples two backends and picks the one with fewer requests
+  in flight.
 - **`maglev` and `rendezvous_hash` strategies.** Both keep key-to-backend
   mappings stable across membership changes with far better balance than the
   ring: with 10 backends, each stays within 3% of an even split and moves
