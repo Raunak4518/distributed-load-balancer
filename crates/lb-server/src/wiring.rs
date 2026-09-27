@@ -1040,7 +1040,7 @@ pub(crate) fn build_listener_core(
                         GcraConfig {
                             rate_per_sec: rb.rate_per_sec,
                             burst: rb.burst,
-                            max_tracked_keys: 1,
+                            max_tracked_keys: 1 + lc.routes.len() + lc.canary.len(),
                         },
                         SystemClock,
                     )

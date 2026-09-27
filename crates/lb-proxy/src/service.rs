@@ -465,8 +465,6 @@ fn build_outbound_request(
     )
 }
 
-const RETRY_BUDGET_KEY: &str = "retry";
-
 fn deadline_exceeded(deadline: Option<tokio::time::Instant>) -> bool {
     deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
 }
@@ -482,11 +480,14 @@ fn request_deadline_response(metrics: &ListenerMetrics) -> Response<ProxyBody> {
     simple_response(StatusCode::GATEWAY_TIMEOUT, "request deadline exceeded")
 }
 
-fn retry_admitted<R: RateLimiter, C: Clock>(ctx: &ProxyContext<R, C>) -> bool {
+fn retry_admitted<R: RateLimiter, C: Clock>(
+    ctx: &ProxyContext<R, C>,
+    pool: &Arc<BackendPool>,
+) -> bool {
     let Some(budget) = &ctx.retry_budget else {
         return true;
     };
-    match budget.check(RETRY_BUDGET_KEY) {
+    match budget.check(&format!("{:p}", Arc::as_ptr(pool))) {
         Decision::Deny { .. } => {
             ctx.metrics.retry_budget_denials.inc();
             false
@@ -900,7 +901,7 @@ where
                     && ctx.retry_on_status.contains(&resp.status().as_u16())
                     && is_idempotent_method(&parts.method)
                     && !deadline_exceeded(deadline)
-                    && retry_admitted(&ctx)
+                    && retry_admitted(&ctx, pool)
                 {
                     ctx.metrics.retry_attempts.inc();
                     last_status = resp.status();
@@ -1014,7 +1015,7 @@ where
                     ctx.metrics.retry_not_idempotent.inc();
                     break;
                 }
-                if !retry_admitted(&ctx) {
+                if !retry_admitted(&ctx, pool) {
                     break;
                 }
                 ctx.metrics.retry_attempts.inc();
@@ -2096,6 +2097,29 @@ mod tests {
             hsts_max_age_secs: None,
             retry_budget: None,
         })
+    }
+
+    #[test]
+    fn each_pool_draws_on_its_own_retry_budget() {
+        let backend = Backend::new("b1", "127.0.0.1:9".parse().unwrap(), 1, None);
+        let route_pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let default_pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+        let budget = Gcra::new(
+            GcraConfig {
+                rate_per_sec: 0.001,
+                burst: 1,
+                max_tracked_keys: 2,
+            },
+            FakeClock::new(),
+        );
+        let ctx = ctx_with_retry_budget(&backend, Arc::clone(&default_pool), Some(budget));
+
+        assert!(retry_admitted(&ctx, &route_pool));
+        assert!(!retry_admitted(&ctx, &route_pool));
+        assert!(
+            retry_admitted(&ctx, &default_pool),
+            "a retry storm on one route must not spend another pool's budget"
+        );
     }
 
     #[tokio::test]
