@@ -1086,6 +1086,7 @@ where
                     bm.upstream_duration.observe(elapsed.as_secs_f64());
                 }
                 balancer.record_latency(&backend_id, elapsed);
+                balancer.record_outcome(&backend_id, !resp.status().is_server_error());
                 // A 5xx status is a transport-level "success" (`forward`
                 // completed) but not a real one -- the outlier detector's
                 // "success rate" tracks what actually reached the client,
@@ -1215,6 +1216,7 @@ where
                     }
                 }
                 balancer.record_latency(&backend_id, attempt_started.elapsed());
+                balancer.record_outcome(&backend_id, false);
                 if let Some(outlier) = outlier {
                     outlier.record_outcome(&backend_id, false);
                 }
@@ -2906,6 +2908,73 @@ mod tests {
             cold < 25,
             "a backend 0% into its warm-up got {cold} of 100 requests instead of a small share"
         );
+    }
+
+    struct OutcomeSpy(BackendId, std::sync::Mutex<Vec<bool>>);
+    impl LoadBalancer for OutcomeSpy {
+        fn pick(&self, _pool: &BackendPool, _key: &str) -> Option<BackendId> {
+            Some(self.0.clone())
+        }
+        fn record_outcome(&self, _id: &BackendId, success: bool) {
+            self.1.lock().unwrap().push(success);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_attempt_reports_its_outcome_to_the_balancer() {
+        for (status, expected) in [(StatusCode::OK, true), (StatusCode::BAD_GATEWAY, false)] {
+            let addr = spawn_fixed_response_backend(status, "x").await;
+            let backend = Backend::new("b1", addr, 1, None);
+            let pool = Arc::new(BackendPool::new(vec![backend.clone()]));
+            let spy = Arc::new(OutcomeSpy(
+                backend.id.clone(),
+                std::sync::Mutex::new(Vec::new()),
+            ));
+            let base = ctx_retrying(&backend, pool, Vec::new());
+            let ctx = Arc::new(ProxyContext {
+                balancer: spy.clone(),
+                rate_limiter: Arc::clone(&base.rate_limiter),
+                pool: Arc::clone(&base.pool),
+                routes: Vec::new(),
+                canary: Vec::new(),
+                canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+                sticky: None,
+                cache: None,
+                waf: None,
+                waf_inspect_headers: false,
+                circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+                outlier: None,
+                acme_challenges: None,
+                client: base.client.clone(),
+                per_backend_client: None,
+                backend_tls: false,
+                backend_tls_connector: None,
+                websocket_idle_timeout: base.websocket_idle_timeout,
+                response_body_idle_timeout: base.response_body_idle_timeout,
+                backend_tcp_keepalive: None,
+                rate_limit_key: RateLimitKeySource::SourceIp,
+                forward_timeout: base.forward_timeout,
+                request_timeout: None,
+                retry_on_status: Vec::new(),
+                max_request_body_bytes: 1024,
+                request_buffer_bytes: 64 * 1024,
+                upstream_limits: None,
+                overload: Arc::new(lb_core::OverloadState::new()),
+                backend_gates: BackendMap::new(),
+                adaptive: None,
+                adaptive_limits: BackendMap::new(),
+                slow_start: None,
+                cluster: None,
+                metrics: test_metrics(),
+                backend_metrics: BackendMap::new(),
+                access_log: AccessLog::disabled(),
+                body_read_timeout: Duration::from_secs(10),
+                hsts_max_age_secs: None,
+                retry_budget: None,
+            });
+            run_through_proxy(ctx).await;
+            assert_eq!(*spy.1.lock().unwrap(), vec![expected], "for {status}");
+        }
     }
 
     #[tokio::test]

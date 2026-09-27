@@ -33,4 +33,6 @@ pub trait LoadBalancer: Send + Sync {
     /// use for it and need no change. `PeakEwmaP2c` is the one strategy that
     /// overrides this.
     fn record_latency(&self, _id: &BackendId, _latency: Duration) {}
+
+    fn record_outcome(&self, _id: &BackendId, _success: bool) {}
 }

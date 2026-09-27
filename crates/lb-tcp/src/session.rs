@@ -226,6 +226,7 @@ where
                     bm.requests_success.inc();
                 }
                 ctx.balancer.record_latency(&backend_id, elapsed);
+                ctx.balancer.record_outcome(&backend_id, true);
                 if let Some(outlier) = &ctx.outlier {
                     outlier.record_outcome(&backend_id, true);
                 }
@@ -255,6 +256,7 @@ where
                 }
                 ctx.balancer
                     .record_latency(&backend_id, attempt_started.elapsed());
+                ctx.balancer.record_outcome(&backend_id, false);
                 if let Some(outlier) = &ctx.outlier {
                     outlier.record_outcome(&backend_id, false);
                 }

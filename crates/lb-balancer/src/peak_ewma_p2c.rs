@@ -7,11 +7,30 @@ use std::time::{Duration, Instant};
 const DEFAULT_DECAY: Duration = Duration::from_secs(10);
 const DEFAULT_ESTIMATE_NANOS: u64 = 1_000_000_000;
 const NO_SAMPLE: u64 = u64::MAX;
+const ERROR_SMOOTHING: f64 = 0.1;
+const ERROR_PENALTY: f64 = 10.0;
+const DAMPING: f64 = 0.1;
 
 struct EwmaEntry {
     estimate_nanos: AtomicU64,
     last_update_nanos: AtomicU64,
+    error_rate_bits: AtomicU64,
     update_lock: Mutex<()>,
+}
+
+impl EwmaEntry {
+    fn new() -> Self {
+        EwmaEntry {
+            estimate_nanos: AtomicU64::new(NO_SAMPLE),
+            last_update_nanos: AtomicU64::new(0),
+            error_rate_bits: AtomicU64::new(0f64.to_bits()),
+            update_lock: Mutex::new(()),
+        }
+    }
+
+    fn error_rate(&self) -> f64 {
+        f64::from_bits(self.error_rate_bits.load(Ordering::Relaxed))
+    }
 }
 
 /// Power-of-two-choices load balancing weighted by a decaying latency
@@ -96,10 +115,27 @@ impl<C: Clock> PeakEwmaP2c<C> {
             .retain(|id, _| live.contains(id));
     }
 
-    fn cost(&self, pool: &BackendPool, id: &BackendId) -> u128 {
-        let estimate = self.estimate_nanos(id) as u128;
-        let pending = pool.active_count(id) as u128;
-        estimate * (pending + 1)
+    fn error_rate(&self, id: &BackendId) -> f64 {
+        self.entries
+            .read()
+            .unwrap()
+            .get(id)
+            .map_or(0.0, EwmaEntry::error_rate)
+    }
+
+    fn cost(&self, pool: &BackendPool, id: &BackendId) -> f64 {
+        let estimate = self.estimate_nanos(id) as f64;
+        let pending = pool.active_count(id) as f64;
+        estimate * (pending + 1.0) * (1.0 + ERROR_PENALTY * self.error_rate(id))
+    }
+
+    fn with_entry(&self, id: &BackendId, update: impl FnOnce(&EwmaEntry)) {
+        if let Some(entry) = self.entries.read().unwrap().get(id) {
+            update(entry);
+            return;
+        }
+        let mut entries = self.entries.write().unwrap();
+        update(entries.entry(id.clone()).or_insert_with(EwmaEntry::new));
     }
 }
 
@@ -148,7 +184,8 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
                     (false, true) => a,
                     (true, false) => b,
                     _ => {
-                        if self.cost(pool, a) <= self.cost(pool, b) {
+                        let (cost_a, cost_b) = (self.cost(pool, a), self.cost(pool, b));
+                        if cost_a <= cost_b * (1.0 + DAMPING) {
                             a
                         } else {
                             b
@@ -168,24 +205,27 @@ impl<C: Clock> LoadBalancer for PeakEwmaP2c<C> {
             .as_nanos() as u64;
         let sample_nanos = latency.as_nanos().min((NO_SAMPLE - 1) as u128) as u64;
 
-        if let Some(entry) = self.entries.read().unwrap().get(id) {
-            store_sample(entry, sample_nanos, now_nanos, self.decay);
-            return;
-        }
-        let mut entries = self.entries.write().unwrap();
-        let entry = entries.entry(id.clone()).or_insert_with(|| EwmaEntry {
-            estimate_nanos: AtomicU64::new(NO_SAMPLE),
-            last_update_nanos: AtomicU64::new(0),
-            update_lock: Mutex::new(()),
+        self.with_entry(id, |entry| {
+            store_sample(entry, sample_nanos, now_nanos, self.decay)
         });
-        store_sample(entry, sample_nanos, now_nanos, self.decay);
+    }
+
+    fn record_outcome(&self, id: &BackendId, success: bool) {
+        self.with_entry(id, |entry| {
+            let _guard = entry.update_lock.lock().unwrap();
+            let failure = if success { 0.0 } else { 1.0 };
+            let rate = entry.error_rate() * (1.0 - ERROR_SMOOTHING) + failure * ERROR_SMOOTHING;
+            entry
+                .error_rate_bits
+                .store(rate.to_bits(), Ordering::Relaxed);
+        });
     }
 }
 
 fn store_sample(entry: &EwmaEntry, sample_nanos: u64, now_nanos: u64, decay: Duration) {
     let _guard = entry.update_lock.lock().unwrap();
     let prev = entry.estimate_nanos.load(Ordering::Relaxed);
-    let new_estimate = if prev == NO_SAMPLE {
+    let new_estimate = if prev == NO_SAMPLE || sample_nanos >= prev {
         sample_nanos
     } else {
         let last = entry.last_update_nanos.load(Ordering::Relaxed);
@@ -291,6 +331,58 @@ mod tests {
             lb.pick(&pool, ""),
             Some(BackendId::new("cold")),
             "the never-sampled backend must be preferred so it gets a chance to be measured"
+        );
+    }
+
+    #[test]
+    fn a_latency_spike_is_taken_at_once_rather_than_averaged_in() {
+        let clock = FakeClock::new();
+        let lb = PeakEwmaP2c::new(clock.clone());
+        let id = BackendId::new("b1");
+        for _ in 0..20 {
+            clock.advance(Duration::from_millis(10));
+            lb.record_latency(&id, Duration::from_millis(10));
+        }
+        clock.advance(Duration::from_millis(10));
+        lb.record_latency(&id, Duration::from_millis(200));
+        assert_eq!(
+            lb.estimate_nanos(&id),
+            Duration::from_millis(200).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn a_backend_that_keeps_failing_is_picked_far_less_often() {
+        let pool = pool_of(&["flaky", "steady"]);
+        let lb = PeakEwmaP2c::new(FakeClock::new());
+        for id in ["flaky", "steady"] {
+            lb.record_latency(&BackendId::new(id), Duration::from_millis(10));
+        }
+        for i in 0..40 {
+            lb.record_outcome(&BackendId::new("flaky"), i % 2 == 0);
+            lb.record_outcome(&BackendId::new("steady"), true);
+        }
+        let flaky = (0..400)
+            .filter(|_| lb.pick(&pool, "") == Some(BackendId::new("flaky")))
+            .count();
+        assert!(
+            flaky < 60,
+            "a backend failing half its requests got {flaky}/400"
+        );
+    }
+
+    #[test]
+    fn near_equal_backends_share_traffic_instead_of_one_winning_every_time() {
+        let pool = pool_of(&["a", "b"]);
+        let lb = PeakEwmaP2c::new(FakeClock::new());
+        lb.record_latency(&BackendId::new("a"), Duration::from_millis(100));
+        lb.record_latency(&BackendId::new("b"), Duration::from_millis(104));
+        let b = (0..1_000)
+            .filter(|_| lb.pick(&pool, "") == Some(BackendId::new("b")))
+            .count();
+        assert!(
+            (350..=650).contains(&b),
+            "4% apart is within the damping band, so neither should dominate: b got {b}/1000"
         );
     }
 
@@ -417,16 +509,16 @@ mod tests {
         let clock = FakeClock::new();
         let lb = PeakEwmaP2c::new(clock.clone());
         let id = BackendId::new("b1");
-        lb.record_latency(&id, Duration::from_nanos(1));
-        assert_eq!(lb.estimate_nanos(&id), 1);
+        lb.record_latency(&id, Duration::from_nanos(700));
+        assert_eq!(lb.estimate_nanos(&id), 700);
 
         clock.advance(Duration::from_nanos(500));
-        lb.record_latency(&id, Duration::from_nanos(700));
-        assert_eq!(
-            lb.estimate_nanos(&id),
-            1,
+        lb.record_latency(&id, Duration::from_nanos(1));
+        assert!(
+            (699..=700).contains(&lb.estimate_nanos(&id)),
             "at a 10s decay constant a 500ns gap barely moves the weight off 1.0, \
-             so the estimate should still round down to the prior 1ns sample"
+             so the estimate should stay at the prior 700ns sample, got {}",
+            lb.estimate_nanos(&id)
         );
     }
 
