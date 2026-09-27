@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Header rewrite.** `[listeners.headers]` sets or removes request and
+  response headers. Framing and routing headers (`Host`, `Content-Length`,
+  `Transfer-Encoding` and the hop-by-hop headers) are refused.
 - **`X-Forwarded-*` and `Forwarded` headers: `[listeners.forwarded]`.**
   Backends learn the client address, scheme and host. Headers from peers
   outside `trusted_cidrs` are replaced rather than trusted, so clients cannot

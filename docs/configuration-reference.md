@@ -102,6 +102,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `retry_budget` | table | none | HTTP-only | Token-bucket cap on retried requests. |
 | `upstream_limits` | table | none | HTTP-only | Per-backend in-flight request cap and wait queue. |
 | `forwarded` | table | none | HTTP-only | Adds `X-Forwarded-*` and `Forwarded` headers; `trusted_cidrs` lists proxies whose existing headers are kept and extended rather than replaced. See [http-features.md](http-features.md#x-forwarded-for--forwarded). |
+| `headers` | table | none | HTTP-only | Sets or removes request and response headers. See [`[listeners.headers]`](#listenersheaders). |
 | `adaptive_concurrency` | table | none | HTTP-only | Per-backend in-flight limit that adapts to each backend's latency. |
 
 `http2_enabled()` — whether HTTP/2 is actually served — is `protocol == "http" && tls is set && (http2.enabled != false)`; a plaintext listener never serves HTTP/2 regardless of `http2.enabled`, because ALPN only exists inside a TLS handshake ([`config.rs`](../crates/lb-core/src/config.rs)). See [load-balancing.md](load-balancing.md) for routes/canary/sticky behavior, [http-features.md](http-features.md) for cache/compression/WebSocket behavior, [edge-hardening.md](edge-hardening.md) for connection limits, PROXY protocol and the WAF, and [request-lifecycle.md](request-lifecycle.md) for how the timeouts above compose.
@@ -326,6 +327,27 @@ HTTP-only. Gives every backend its own in-flight limit that the proxy learns fro
 | `max_limit` | integer | `1000` | ≥ `initial_limit` | Ceiling the limit never grows past. |
 | `smoothing` | float | `0.2` | 0 < value ≤ 1 | How far each sample moves the limit toward its new target. |
 | `tolerance` | float | `1.5` | ≥ 1 | How much slower than its baseline a backend may get before its limit shrinks. |
+
+## `[listeners.headers]`
+
+HTTP-only. Request edits apply to every request forwarded to a backend, WebSocket upgrades included, after the `forwarded` headers are added. Response edits apply to every response the listener sends, including ones the proxy generates itself (`429`, `503`), and run last, so they override headers the proxy adds such as `x-request-id`. Removals run before sets, so a header named in both ends up with the set value. A set replaces every existing value of that header.
+
+| Field | Type | Default | Validation | Meaning |
+|---|---|---|---|---|
+| `request_set` | table of strings | `{}` | valid header names and values | Headers set on the request sent to the backend. |
+| `request_remove` | array of strings | `[]` | valid header names | Headers removed from the request. |
+| `response_set` | table of strings | `{}` | valid header names and values | Headers set on the response sent to the client. |
+| `response_remove` | array of strings | `[]` | valid header names | Headers removed from the response. |
+
+`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`, `Keep-Alive` and `Proxy-Connection` are refused: they decide how a message is framed or where it goes, and rewriting them would reopen request smuggling.
+
+```toml
+[listeners.headers]
+request_set = { "x-env" = "prod" }
+request_remove = ["x-internal-debug"]
+response_set = { "x-frame-options" = "DENY" }
+response_remove = ["server"]
+```
 
 ## `[listeners.retry_budget]`
 
