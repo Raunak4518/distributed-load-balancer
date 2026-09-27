@@ -29,7 +29,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Push to peers concurrently with a bounded fan-out
 - [x] Convergence metrics (last successful sync per peer, snapshot size/pages)
 - [x] Node incarnation (boot generation) so a restarted node's counts add to its previous boot's, not max with them
-- [ ] Documented semantics for replay, duplicates, clock skew/rollback, partition and rejoin (with tests)
+- [x] Documented semantics for replay, duplicates, clock skew/rollback, partition and rejoin (with tests)
 
 ### Security
 - [x] rustls updated for RUSTSEC-2026-0285; daily `cargo audit`

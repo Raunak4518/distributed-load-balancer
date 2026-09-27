@@ -140,6 +140,25 @@ The bound assumes every key that changed during a sync interval is gossiped at t
 
 This bound is tested empirically, not just asserted, by `lb-bench`'s cluster harness ([`cluster_main.rs`](../crates/lb-bench/src/cluster_main.rs)): real `ClusterNode`s gossip over real `tokio::net::TcpListener` sockets across a matrix of cluster sizes (3, 5, 10 nodes) and gossip intervals (100ms–5s), each running a synchronized paced burst against one shared key, and the harness compares the true converged total against `configured_limit + convergence_over_admission_bound(...)` for that combination. The bound is a model of steady-state gossip, not a hard guarantee: the reported results, including one combination that exceeded it marginally, are in [`benchmarks.md`](benchmarks.md).
 
+## Event semantics
+
+Every event below leaves the counters in a defined state, and each row names the test that holds it there. Tests are in [`coordinator.rs`](../crates/lb-cluster/src/coordinator.rs), [`robustness_tests.rs`](../crates/lb-cluster/src/robustness_tests.rs) and [`gossip.rs`](../crates/lb-cluster/src/gossip.rs).
+
+| Event | Behavior | Test |
+|---|---|---|
+| Duplicate message | Merge is a per-cell `max`, so applying a message twice equals applying it once. | `prop_duplicate_gossip_message_delivery_is_idempotent` |
+| Reordered or delayed messages | Any delivery order converges to the in-order result. | `prop_delayed_gossip_delivery_converges_like_in_order_delivery`, `prop_duplicated_and_reordered_gossip_ingestion_matches_the_deduplicated_in_order_result` |
+| Replay of a captured message | Within the window it is a duplicate (no effect); after the window its cells are outside every total and it revives nothing. There is no nonce: a valid tag proves the sender held the secret, and replaying what a node really admitted cannot inflate anything beyond it. | `a_replayed_old_message_neither_inflates_nor_revives_counts` |
+| Peer clock behind (or rolled back) | Its cells land on older epochs: visible while inside the window, invisible once further behind than the window. | `a_peer_running_behind_is_merged_and_visible_immediately_regardless_of_magnitude`, `a_laggard_peer_whose_skew_exceeds_the_window_becomes_invisible_by_aging_out` |
+| Peer clock ahead (or jumped forward) | Up to 5 s ahead: stored, and counted once the receiver's clock reaches those epochs. Further ahead: rejected and counted in `lb_cluster_future_skew_rejections_total`. | `a_peer_at_most_five_seconds_ahead_is_stored_but_not_yet_visible` |
+| Node restart | Counts from the new boot add to the previous boot's via the message `incarnation`. | `a_restarted_peer_adds_to_its_previous_boot_instead_of_being_maxed_with_it` |
+| Packet loss | Over-admission widens with loss; convergence completes once loss stops. | `packet_loss_at_increasing_rates_widens_overshoot_and_convergence_still_completes_once_loss_stops` |
+| Partition and rejoin | Each side enforces its own view during the partition, so the combined total can exceed the limit; after healing the sides converge within one round. | `partition_overshoot_grows_with_duration_once_the_window_cycles_and_heals_cleanly_afterward`, `a_real_network_partition_heals_and_converges_once_connectivity_is_restored` |
+| Stalled or dead peer | Pushes to other peers are unaffected; each push is time-bounded. | `a_stalled_peer_does_not_delay_pushes_to_the_others` |
+| Forged `node_id` (with `[cluster.tls]`) | Dropped unless the peer certificate names that `node_id`. | `a_peer_cannot_gossip_under_a_node_id_its_certificate_does_not_name` |
+
+There is no split-brain resolution step, by design: the state is a CRDT, so there is nothing to choose between. The price is the over-admission bound above, which grows with partition length.
+
 ## Failure modes
 
 - **Dead peer.** No explicit health tracking exists for peers. A peer that stops responding simply stops contributing new cells; its last-known counts age out of the window on their own via `prune()`, exactly as if it had gone quiet gracefully.

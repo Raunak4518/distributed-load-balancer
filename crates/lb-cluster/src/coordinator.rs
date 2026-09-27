@@ -388,6 +388,44 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_old_message_neither_inflates_nor_revives_counts() {
+        let clock = FakeClock::new();
+        let sender = Arc::new(ClusterNode::new(
+            "sender",
+            10,
+            clock.clone(),
+            b"secret".to_vec(),
+        ));
+        let coord = ListenerCoordinator::new(Arc::clone(&sender), "web", 100);
+        for _ in 0..5 {
+            assert!(coord.try_admit("k"));
+        }
+        let captured = sender.snapshot_message();
+
+        let receiver = ClusterNode::new("receiver", 10, clock.clone(), b"secret".to_vec());
+        for _ in 0..3 {
+            receiver.merge_message(&captured);
+        }
+        assert_eq!(
+            receiver
+                .store()
+                .total_in_window("web\u{1}k", clock.unix_secs()),
+            5
+        );
+
+        clock.advance(std::time::Duration::from_secs(60));
+        receiver.prune();
+        receiver.merge_message(&captured);
+        assert_eq!(
+            receiver
+                .store()
+                .total_in_window("web\u{1}k", clock.unix_secs()),
+            0,
+            "a message replayed after its window must not bring its counts back"
+        );
+    }
+
+    #[test]
     fn delayed_delivery_of_successive_snapshots_converges_to_in_order_result() {
         let sender_clock = FakeClock::new();
         let sender = Arc::new(ClusterNode::new(
