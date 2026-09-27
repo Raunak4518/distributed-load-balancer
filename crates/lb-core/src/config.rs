@@ -1104,6 +1104,9 @@ pub enum LoadBalancingStrategy {
     PeakEwmaP2c,
     Maglev,
     RendezvousHash,
+    Random,
+    WeightedRandom,
+    LeastRequest,
 }
 
 impl Config {

@@ -1,7 +1,7 @@
 use arc_swap::ArcSwap;
 use lb_balancer::{
-    ConsistentHash, LeastConnections, Maglev, PeakEwmaP2c, RendezvousHash, RoundRobin,
-    WeightedRoundRobin,
+    ConsistentHash, LeastConnections, LeastRequest, Maglev, PeakEwmaP2c, Random, RendezvousHash,
+    RoundRobin, WeightedRandom, WeightedRoundRobin,
 };
 use lb_cluster::{ClusterNode, ListenerCoordinator};
 use lb_core::ClusterCoordinator;
@@ -40,6 +40,9 @@ fn build_balancer(strategy: &LoadBalancingStrategy) -> Arc<dyn LoadBalancer> {
         LoadBalancingStrategy::PeakEwmaP2c => Arc::new(PeakEwmaP2c::new(SystemClock)),
         LoadBalancingStrategy::Maglev => Arc::new(Maglev::new()),
         LoadBalancingStrategy::RendezvousHash => Arc::new(RendezvousHash::new()),
+        LoadBalancingStrategy::Random => Arc::new(Random::new()),
+        LoadBalancingStrategy::WeightedRandom => Arc::new(WeightedRandom::new()),
+        LoadBalancingStrategy::LeastRequest => Arc::new(LeastRequest::new()),
     }
 }
 

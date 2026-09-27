@@ -3,6 +3,7 @@ mod hash;
 mod least_connections;
 mod maglev;
 mod peak_ewma_p2c;
+mod random;
 mod rendezvous;
 mod round_robin;
 mod weighted_round_robin;
@@ -11,6 +12,7 @@ pub use consistent_hash::ConsistentHash;
 pub use least_connections::LeastConnections;
 pub use maglev::Maglev;
 pub use peak_ewma_p2c::PeakEwmaP2c;
+pub use random::{LeastRequest, Random, WeightedRandom};
 pub use rendezvous::RendezvousHash;
 pub use round_robin::RoundRobin;
 pub use weighted_round_robin::WeightedRoundRobin;
@@ -36,6 +38,9 @@ mod tests {
             ("consistent_hash", Box::new(ConsistentHash::new())),
             ("maglev", Box::new(Maglev::new())),
             ("rendezvous_hash", Box::new(RendezvousHash::new())),
+            ("random", Box::new(Random::new())),
+            ("weighted_random", Box::new(WeightedRandom::new())),
+            ("least_request", Box::new(LeastRequest::new())),
             (
                 "peak_ewma_p2c",
                 Box::new(PeakEwmaP2c::new(lb_core::SystemClock)),
