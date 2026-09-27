@@ -100,6 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A restarted cluster node's counts were under-counted by its peers.**
+  Its new counts were merged with `max` against the ones it gossiped before
+  restarting. Gossip messages now carry a per-boot `incarnation`, and peers
+  add the two boots' counts together. Peers without the field still
+  interoperate.
 - **One slow peer could stall gossip to every other peer.** Pushes went to
   peers one at a time with no bound on the write, so an unreachable or stalled
   peer delayed the whole round, or held it indefinitely. Pushes now run
