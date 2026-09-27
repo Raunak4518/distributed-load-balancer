@@ -11,8 +11,24 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
+
+#[derive(Clone, Copy, Debug)]
+pub struct AdminLimits {
+    pub max_connections: usize,
+    pub header_read_timeout: Duration,
+}
+
+impl Default for AdminLimits {
+    fn default() -> Self {
+        AdminLimits {
+            max_connections: 64,
+            header_read_timeout: Duration::from_secs(5),
+        }
+    }
+}
 
 /// Returns true when this instance should receive traffic.
 pub type ReadinessCheck = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -54,8 +70,30 @@ pub fn spawn_admin_server(
     extension: Option<AdminExtension>,
     admin_token: Option<Arc<[u8]>>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_admin_server_with_limits(
+        metrics,
+        listener,
+        readiness,
+        extension,
+        admin_token,
+        AdminLimits::default(),
+    )
+}
+
+pub fn spawn_admin_server_with_limits(
+    metrics: Arc<Metrics>,
+    listener: TcpListener,
+    readiness: ReadinessCheck,
+    extension: Option<AdminExtension>,
+    admin_token: Option<Arc<[u8]>>,
+    limits: AdminLimits,
+) -> tokio::task::JoinHandle<()> {
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     tokio::spawn(async move {
         loop {
+            let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
+                return;
+            };
             let Ok((stream, _peer)) = listener.accept().await else {
                 continue;
             };
@@ -65,6 +103,7 @@ pub fn spawn_admin_server(
             let extension = extension.clone();
             let admin_token = admin_token.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let svc = service_fn(move |req| {
                     let metrics = Arc::clone(&metrics);
                     let readiness = Arc::clone(&readiness);
@@ -72,7 +111,12 @@ pub fn spawn_admin_server(
                     let admin_token = admin_token.clone();
                     async move { route(req, metrics, readiness, extension, admin_token).await }
                 });
-                if let Err(err) = http1::Builder::new().serve_connection(io, svc).await {
+                if let Err(err) = http1::Builder::new()
+                    .timer(hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(limits.header_read_timeout)
+                    .serve_connection(io, svc)
+                    .await
+                {
                     tracing::debug!(error = %err, "admin connection error");
                 }
             });
@@ -303,6 +347,69 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.status(), 200, "path {path} should be reachable");
         }
+    }
+
+    async fn start_limited(limits: AdminLimits) -> std::net::SocketAddr {
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let readiness: ReadinessCheck = Arc::new(|| true);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_admin_server_with_limits(metrics, listener, readiness, None, None, limits);
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_finishes_its_request_head_is_disconnected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = start_limited(AdminLimits {
+            max_connections: 8,
+            header_read_timeout: Duration::from_millis(200),
+        })
+        .await;
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(b"GET /metrics HTTP/1.1\r\nHo")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let closed =
+            tokio::time::timeout(Duration::from_secs(3), stalled.read_to_end(&mut buf)).await;
+        assert!(
+            closed.is_ok(),
+            "a stalled request head must not hold an admin connection open"
+        );
+    }
+
+    #[tokio::test]
+    async fn connections_past_the_cap_wait_for_a_free_slot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let addr = start_limited(AdminLimits {
+            max_connections: 1,
+            header_read_timeout: Duration::from_secs(30),
+        })
+        .await;
+        let holder = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut waiting = tokio::net::TcpStream::connect(addr).await.unwrap();
+        waiting
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), waiting.read(&mut buf))
+                .await
+                .is_err(),
+            "a connection past the cap must not be served while the cap is held"
+        );
+
+        drop(holder);
+        let n = tokio::time::timeout(Duration::from_secs(3), waiting.read(&mut buf))
+            .await
+            .expect("the waiting connection must be served once a slot frees")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
     }
 
     #[tokio::test]
