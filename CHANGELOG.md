@@ -92,6 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One failing route could spend the whole listener's retry budget.** The
+  budget is now kept per pool: the default pool, each route and each canary
+  pool get their own bucket of the configured size.
 - **Retries now depend on how the attempt failed.** A connect failure (the
   request never left the proxy) is retried for any method, including `POST`;
   a reset or malformed response after the connection was established, and a

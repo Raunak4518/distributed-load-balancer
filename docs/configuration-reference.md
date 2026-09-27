@@ -287,12 +287,12 @@ HTTP-only. A small, fixed, built-in pattern check — not a configurable rule en
 
 ## `[listeners.retry_budget]`
 
-HTTP-only.
+HTTP-only. Every pool on the listener — the default pool, each route's and each canary pool's — gets its own budget of this size, so retries against one failing route cannot use up another route's budget.
 
 | Field | Type | Default | Validation | Meaning |
 |---|---|---|---|---|
-| `rate_per_sec` | float | required | must be > 0.0 | Sustained retry rate allowed for this listener. |
-| `burst` | integer | required | must be > 0 | Burst capacity for retries. |
+| `rate_per_sec` | float | required | must be > 0.0 | Sustained retry rate allowed for each pool. |
+| `burst` | integer | required | must be > 0 | Burst capacity for retries, per pool. |
 
 ## `[listeners.client_tcp_keepalive]` / `[listeners.backend_tcp_keepalive]`
 
