@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`retry_on_status`: retry listed 5xx responses on another backend** for
+  idempotent requests, within the retry budget and request deadline. Empty by
+  default.
 - **`request_timeout_ms`: one deadline for a whole HTTP request.** It spans
   the request-body read, every attempt including a retry, and the streamed
   response body. Expiry before the response starts returns `504`; expiry
@@ -89,6 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Retries now depend on how the attempt failed.** A connect failure (the
+  request never left the proxy) is retried for any method, including `POST`;
+  a reset or malformed response after the connection was established, and a
+  response-header timeout, are still retried only for idempotent methods.
 - **WebSocket upgrades ignored the sticky pin and never retried.** An upgrade
   now goes to the backend its sticky cookie names when that backend is
   eligible, and moves to another backend once when connecting to the first
