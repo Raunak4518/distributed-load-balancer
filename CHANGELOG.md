@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`maglev` and `rendezvous_hash` strategies.** Both keep key-to-backend
+  mappings stable across membership changes with far better balance than the
+  ring: with 10 backends, each stays within 3% of an even split and moves
+  about 10% of keys when one backend leaves.
 - **Priority failover and zone preference.** Backends take a `priority`
   (higher numbers are backups used only once every lower tier is ineligible)
   and a `zone`; a listener's `local_zone` keeps traffic in-zone while any

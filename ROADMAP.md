@@ -49,7 +49,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Adaptive concurrency limit per backend (gradient-based)
 - [x] Slow start / warm-up for recovered and newly added backends
 - [x] Priority failover and backup pools; locality/zone-aware selection
-- [ ] Maglev and rendezvous (HRW) hashing; hash-movement measurement
+- [x] Maglev and rendezvous (HRW) hashing; hash-movement measurement
 - [ ] Random, P2C least-request, weighted random strategies
 - [ ] Peak-EWMA score extended with error rate, tail latency and queue delay, with hysteresis
 - [ ] `Forwarded` / `X-Forwarded-*` with trusted-proxy semantics

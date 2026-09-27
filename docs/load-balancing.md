@@ -33,7 +33,7 @@ With `slow_start_ms` set, a backend that has just become eligible again is not h
 
 ## Selection Strategies
 
-All five strategies implement the same `LoadBalancer` trait: `pick(pool, key) -> Option<BackendId>`, plus an optional `record_latency(id, latency)` hook called after every attempt (success or failure) — only Peak EWMA + P2C uses it. `key` is whatever the listener's `rate_limit.key` already resolves to for that request (`source_ip`, or the configured request header) — passed straight through rather than separately configured, so a listener's existing identity choice doubles as its hashing/affinity identity for strategies that need one.
+All seven strategies implement the same `LoadBalancer` trait: `pick(pool, key) -> Option<BackendId>`, plus an optional `record_latency(id, latency)` hook called after every attempt (success or failure) — only Peak EWMA + P2C uses it. `key` is whatever the listener's `rate_limit.key` already resolves to for that request (`source_ip`, or the configured request header) — passed straight through rather than separately configured, so a listener's existing identity choice doubles as its hashing/affinity identity for strategies that need one.
 
 Set per listener (or per route, or per canary pool) with:
 
@@ -42,7 +42,7 @@ Set per listener (or per route, or per canary pool) with:
 strategy = "round_robin"
 ```
 
-Valid values: `"round_robin"`, `"least_connections"`, `"weighted_round_robin"`, `"consistent_hash"`, `"peak_ewma_p2c"`. `strategy` is required — there is no default.
+Valid values: `"round_robin"`, `"least_connections"`, `"weighted_round_robin"`, `"consistent_hash"`, `"maglev"`, `"rendezvous_hash"`, `"peak_ewma_p2c"`. `strategy` is required — there is no default.
 
 ### Round Robin (`round_robin`)
 
@@ -105,6 +105,26 @@ Samples two eligible backends at random and picks whichever looks cheaper right 
 
 Source: [`peak_ewma_p2c.rs`](../crates/lb-balancer/src/peak_ewma_p2c.rs).
 
+### Maglev (`maglev`)
+
+Google's Maglev hashing ([`maglev.rs`](../crates/lb-balancer/src/maglev.rs)): a 65,537-slot lookup table in which every backend claims slots by walking its own permutation (an offset and a skip derived from its id), round by round, until the table is full. A backend with weight `w` takes `w` slots per round, weight capped at 100 as for `consistent_hash`. A lookup is `table[hash(key) % 65537]`, one array read. Like the ring, the table is built from every backend and rebuilt only when membership or weights change. At lookup, slots whose backend is ineligible are skipped, walking forward to the next slot with an eligible backend, so a backend going down moves only its own keys.
+
+### Rendezvous hashing (`rendezvous_hash`)
+
+Highest-random-weight hashing ([`rendezvous.rs`](../crates/lb-balancer/src/rendezvous.rs)): every eligible backend scores `weight / -ln(u)`, where `u` is a uniform value derived from `hash(key, backend id)`, and the highest score wins. There is no table or ring to build, and weights are exact. The cost is one hash per eligible backend per pick, O(N).
+
+### Hash quality, measured
+
+All three hashing strategies use the same fixed 64-bit FNV-1a + fmix64 hash, so a key maps identically on every node running the same version. Measured over 20,000 keys and 10 equal backends by `lb-balancer`'s tests (`removing_one_of_ten_backends_moves_close_to_a_tenth_of_keys`, `hashing_strategies_spread_keys_evenly_over_equal_backends`):
+
+| Strategy | Keys moved when 1 of 10 backends is removed (ideal 10%) | Busiest / quietest backend (ideal 2000 each) |
+|---|---|---|
+| `consistent_hash` | 6.0% | 3228 / 1181 |
+| `maglev` | 10.3% | 2057 / 1938 |
+| `rendezvous_hash` | 10.0% | 2045 / 1927 |
+
+The ring's lower movement figure is luck, not quality: the backend removed happened to own fewer keys than average, because 10 virtual nodes per unit of weight spread keys unevenly — its busiest backend receives 2.7× the keys of its quietest. Maglev and rendezvous hashing both stay within 3% of an even split and move almost exactly the ideal share. Prefer them over `consistent_hash` for new deployments; `consistent_hash` stays for compatibility.
+
 ### Comparison
 
 | Strategy | Config value | Uses request key | Session affinity across churn | Latency-aware | Per-pick cost |
@@ -113,9 +133,11 @@ Source: [`peak_ewma_p2c.rs`](../crates/lb-balancer/src/peak_ewma_p2c.rs).
 | Least Connections | `least_connections` | no | no | indirectly (in-flight count) | O(N) |
 | Weighted Round Robin | `weighted_round_robin` | no | no | no | O(N) |
 | Consistent Hashing | `consistent_hash` | yes | yes (minimal remap) | no | O(log R + k) |
+| Maglev | `maglev` | yes | yes (minimal remap) | no | O(1) + k |
+| Rendezvous Hashing | `rendezvous_hash` | yes | yes (minimal remap) | no | O(N) |
 | Peak EWMA + P2C | `peak_ewma_p2c` | no | no | yes | O(1) |
 
-N = total backends in the pool; R = total ring points; k = consecutive ineligible points walked. See [benchmarks.md](benchmarks.md) for measured throughput and tail-latency comparisons across strategies under load.
+N = total backends in the pool; R = total ring points; k = consecutive ineligible ring points or Maglev slots walked. See [benchmarks.md](benchmarks.md) for measured throughput and tail-latency comparisons across strategies under load.
 
 ## Routes
 

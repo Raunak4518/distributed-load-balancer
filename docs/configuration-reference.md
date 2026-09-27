@@ -249,7 +249,7 @@ Also applies, with the identical shape, to `[listeners.routes.load_balancing]` a
 |---|---|---|---|---|
 | `strategy` | string | required | one of the five values below | Backend-selection algorithm. |
 
-`strategy` values: `"round_robin"`, `"least_connections"`, `"weighted_round_robin"`, `"consistent_hash"`, `"peak_ewma_p2c"`. See [load-balancing.md](load-balancing.md) for the selection logic of each, including how `consistent_hash` uses `rate_limit.key` as its hash input and how `peak_ewma_p2c` combines decaying latency with pending-request count.
+`strategy` values: `"round_robin"`, `"least_connections"`, `"weighted_round_robin"`, `"consistent_hash"`, `"maglev"`, `"rendezvous_hash"`, `"peak_ewma_p2c"`. See [load-balancing.md](load-balancing.md) for the selection logic of each, including how `consistent_hash` uses `rate_limit.key` as its hash input and how `peak_ewma_p2c` combines decaying latency with pending-request count.
 
 ## `[[listeners.routes]]`
 
