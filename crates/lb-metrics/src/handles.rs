@@ -85,6 +85,9 @@ pub struct ListenerMetrics {
     pub timeouts_body: IntCounter,
     pub timeouts_upstream_body: IntCounter,
     pub timeouts_request: IntCounter,
+    pub upstream_overflow_queue_full: IntCounter,
+    pub upstream_overflow_queue_timeout: IntCounter,
+    pub upstream_queue_duration: Histogram,
     pub requests_streamed: IntCounter,
     /// Early warning that the rate-limit overflow bucket is about to engage.
     pub tracked_keys: IntGauge,

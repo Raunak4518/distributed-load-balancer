@@ -112,6 +112,8 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub retry_on_status: Vec<u16>,
     pub max_request_body_bytes: usize,
     pub request_buffer_bytes: usize,
+    pub upstream_limits: Option<crate::gate::UpstreamLimits>,
+    pub backend_gates: BackendMap<crate::gate::BackendGate>,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
     /// `forward_timeout`/`body_read_timeout` never apply past that point.
@@ -923,6 +925,37 @@ where
         let Some(backend) = pool.backend(&backend_id) else {
             continue;
         };
+        let gate_permit = match (&ctx.upstream_limits, ctx.backend_gates.get(&backend_id)) {
+            (Some(limits), Some(gate)) => {
+                match gate
+                    .enter(
+                        limits.max_pending,
+                        within_deadline(deadline, limits.max_queue),
+                    )
+                    .await
+                {
+                    Ok((permit, waited)) => {
+                        ctx.metrics
+                            .upstream_queue_duration
+                            .observe(waited.as_secs_f64());
+                        Some(permit)
+                    }
+                    Err(refusal) => {
+                        match refusal {
+                            crate::gate::GateRefusal::QueueFull => {
+                                ctx.metrics.upstream_overflow_queue_full.inc()
+                            }
+                            crate::gate::GateRefusal::QueueTimeout => {
+                                ctx.metrics.upstream_overflow_queue_timeout.inc()
+                            }
+                        }
+                        last_status = StatusCode::SERVICE_UNAVAILABLE;
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
         // Held across the dial+forward below and dropped at the end of this
         // iteration regardless of outcome -- the only way `LeastConnections`
         // has real numbers to compare.
@@ -1070,6 +1103,7 @@ where
                         Some(ctx.metrics.timeouts_upstream_body.clone()),
                     )
                     .with_deadline(deadline, Some(ctx.metrics.timeouts_request.clone()))
+                    .holding(gate_permit)
                     .boxed()
                 };
 
@@ -1531,6 +1565,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1572,6 +1608,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1632,6 +1670,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1677,6 +1717,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1738,6 +1780,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1781,6 +1825,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1841,6 +1887,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -1935,6 +1983,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2213,6 +2263,8 @@ mod tests {
             retry_on_status,
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2338,6 +2390,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes,
             request_buffer_bytes,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2450,6 +2504,134 @@ mod tests {
         assert!(head.starts_with("HTTP/1.1 413"), "{head}");
     }
 
+    fn ctx_gated(
+        first: &Backend,
+        pool: Arc<BackendPool>,
+        limits: crate::gate::UpstreamLimits,
+    ) -> Arc<ProxyContext<AlwaysAllow, FakeClock>> {
+        let gates: BackendMap<crate::gate::BackendGate> = pool
+            .all_backend_ids()
+            .into_iter()
+            .map(|id| (id, crate::gate::BackendGate::new(limits.max_active)))
+            .collect();
+        Arc::new(ProxyContext {
+            rate_limiter: Arc::new(AlwaysAllow),
+            balancer: Arc::new(FixedPick(first.id.clone())),
+            pool,
+            routes: Vec::new(),
+            canary: Vec::new(),
+            canary_cursor: std::sync::atomic::AtomicUsize::new(0),
+            sticky: None,
+            cache: None,
+            waf: None,
+            waf_inspect_headers: false,
+            circuit_breakers: BackendMap::<CircuitBreaker<FakeClock>>::new(),
+            outlier: None,
+            acme_challenges: None,
+            client: build_client(None, HashMap::new(), false, None),
+            per_backend_client: None,
+            backend_tls: false,
+            backend_tls_connector: None,
+            websocket_idle_timeout: Duration::from_secs(300),
+            response_body_idle_timeout: Duration::from_secs(60),
+            backend_tcp_keepalive: None,
+            rate_limit_key: RateLimitKeySource::SourceIp,
+            forward_timeout: Duration::from_secs(5),
+            request_timeout: None,
+            retry_on_status: Vec::new(),
+            max_request_body_bytes: 1024,
+            request_buffer_bytes: 64 * 1024,
+            upstream_limits: Some(limits),
+            backend_gates: gates,
+            cluster: None,
+            metrics: test_metrics(),
+            backend_metrics: BackendMap::new(),
+            access_log: AccessLog::disabled(),
+            body_read_timeout: Duration::from_secs(10),
+            hsts_max_age_secs: None,
+            retry_budget: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_full_backend_hands_the_request_to_another_one() {
+        let busy = Backend::new(
+            "busy",
+            spawn_trickling_backend(10, Duration::from_millis(100), false).await,
+            1,
+            None,
+        );
+        let spare = Backend::new(
+            "spare",
+            spawn_fixed_response_backend(StatusCode::OK, "spare").await,
+            1,
+            None,
+        );
+        let pool = Arc::new(BackendPool::new(vec![busy.clone(), spare.clone()]));
+        let ctx = ctx_gated(
+            &busy,
+            pool,
+            crate::gate::UpstreamLimits {
+                max_active: 1,
+                max_pending: 0,
+                max_queue: Duration::from_secs(1),
+            },
+        );
+        let metrics = ctx.metrics.clone();
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let slow = tokio::spawn(async move { fetch_raw(addr).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let quick = fetch_raw(addr).await;
+        assert!(
+            String::from_utf8_lossy(&quick).contains("spare"),
+            "{}",
+            String::from_utf8_lossy(&quick)
+        );
+        assert_eq!(metrics.upstream_overflow_queue_full.get(), 1);
+        let slow = slow.await.unwrap();
+        assert!(String::from_utf8_lossy(&slow).contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn the_gate_is_held_until_the_response_body_finishes_then_released() {
+        let only = Backend::new(
+            "only",
+            spawn_trickling_backend(6, Duration::from_millis(100), false).await,
+            1,
+            None,
+        );
+        let pool = Arc::new(BackendPool::new(vec![only.clone()]));
+        let ctx = ctx_gated(
+            &only,
+            pool,
+            crate::gate::UpstreamLimits {
+                max_active: 1,
+                max_pending: 0,
+                max_queue: Duration::from_secs(1),
+            },
+        );
+        let metrics = ctx.metrics.clone();
+        let addr = spawn_proxy_listener(ctx).await;
+
+        let first = tokio::spawn(async move { fetch_raw(addr).await });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let refused = fetch_raw(addr).await;
+        assert!(
+            String::from_utf8_lossy(&refused).starts_with("HTTP/1.1 503"),
+            "the slot is still held while the first body streams: {}",
+            String::from_utf8_lossy(&refused)
+        );
+        first.await.unwrap();
+        let after = fetch_raw(addr).await;
+        assert!(
+            String::from_utf8_lossy(&after).starts_with("HTTP/1.1 200"),
+            "the slot must be released once the body completes: {}",
+            String::from_utf8_lossy(&after)
+        );
+        assert!(metrics.upstream_overflow_queue_full.get() >= 1);
+    }
+
     #[tokio::test]
     async fn a_post_to_a_flaky_backend_is_not_retried() {
         let addr = spawn_flaky_then_ok_backend().await;
@@ -2536,6 +2718,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2587,6 +2771,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2652,6 +2838,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2745,6 +2933,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2818,6 +3008,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -2891,6 +3083,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3055,6 +3249,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3199,6 +3395,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3244,6 +3442,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3365,6 +3565,8 @@ mod tests {
                 retry_on_status: Vec::new(),
                 max_request_body_bytes: 1024,
                 request_buffer_bytes: 64 * 1024,
+                upstream_limits: None,
+                backend_gates: BackendMap::new(),
                 cluster: None,
                 metrics: test_metrics(),
                 backend_metrics: BackendMap::new(),
@@ -3442,6 +3644,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3622,6 +3826,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3675,6 +3881,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3724,6 +3932,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3771,6 +3981,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4210,6 +4422,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4255,6 +4469,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4307,6 +4523,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4359,6 +4577,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4405,6 +4625,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4449,6 +4671,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4499,6 +4723,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: metrics.clone(),
             backend_metrics: BackendMap::new(),
@@ -4553,6 +4779,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4684,6 +4912,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4755,6 +4985,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4839,6 +5071,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -4951,6 +5185,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -5120,6 +5356,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -5220,6 +5458,8 @@ mod tests {
             retry_on_status: Vec::new(),
             max_request_body_bytes: 1024,
             request_buffer_bytes: 64 * 1024,
+            upstream_limits: None,
+            backend_gates: BackendMap::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),

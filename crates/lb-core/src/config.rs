@@ -462,6 +462,23 @@ pub struct ListenerConfig {
 
     #[serde(default)]
     pub retry_budget: Option<RetryBudgetConfig>,
+
+    #[serde(default)]
+    pub upstream_limits: Option<UpstreamLimitsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamLimitsConfig {
+    pub max_active_per_backend: usize,
+    #[serde(default)]
+    pub max_pending_per_backend: usize,
+    #[serde(default = "default_max_queue_ms")]
+    pub max_queue_ms: u64,
+}
+
+fn default_max_queue_ms() -> u64 {
+    1_000
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1304,6 +1321,14 @@ impl ListenerConfig {
                 "retry_on_status may only list 5xx statuses, got {status}"
             )));
         }
+        if let Some(limits) = &self.upstream_limits {
+            if limits.max_active_per_backend == 0 || limits.max_queue_ms == 0 {
+                return Err(invalid(
+                    "upstream_limits.max_active_per_backend and max_queue_ms must be positive"
+                        .into(),
+                ));
+            }
+        }
         if self.request_buffer_bytes == Some(0) {
             return Err(invalid("request_buffer_bytes must be positive".into()));
         }
@@ -1504,6 +1529,9 @@ impl ListenerConfig {
                         "retry_budget is an http-only setting -- lb-tcp's own retry loop does not consult a listener-level budget"
                             .into(),
                     ));
+                }
+                if self.upstream_limits.is_some() {
+                    return Err(invalid("upstream_limits is an http-only setting".into()));
                 }
                 if let RateLimitKeySource::Header(name) = &self.rate_limit.key {
                     return Err(invalid(format!(
@@ -1769,6 +1797,27 @@ mod tests {
             "        listen = \"0.0.0.0:5432\"\n        retry_on_status = [503]",
         );
         assert!(Config::parse(&tcp).is_err());
+    }
+
+    #[test]
+    fn upstream_limits_parse_with_defaults_and_are_validated() {
+        let web_only = |body: &str| {
+            VALID.replacen(
+                "        [listeners.load_balancing]",
+                &format!("        [listeners.upstream_limits]\n{body}\n\n        [listeners.load_balancing]"),
+                1,
+            )
+        };
+        let cfg = Config::parse(&web_only("        max_active_per_backend = 32")).unwrap();
+        let limits = cfg.listeners[0].upstream_limits.clone().unwrap();
+        assert_eq!(limits.max_active_per_backend, 32);
+        assert_eq!(limits.max_pending_per_backend, 0);
+        assert_eq!(limits.max_queue_ms, 1_000);
+        assert!(Config::parse(&web_only("        max_active_per_backend = 0")).is_err());
+        assert!(Config::parse(&web_only(
+            "        max_active_per_backend = 4\n        max_queue_ms = 0"
+        ))
+        .is_err());
     }
 
     #[test]

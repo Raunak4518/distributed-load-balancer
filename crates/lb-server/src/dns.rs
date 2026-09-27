@@ -46,6 +46,8 @@ pub(crate) struct DnsBackendRuntime {
     pub(crate) breakers: BackendMap<CircuitBreaker<SystemClock>>,
     pub(crate) backend_metrics: BackendMap<BackendMetrics>,
     pub(crate) outlier: Option<Arc<OutlierDetector>>,
+    pub(crate) gates: BackendMap<lb_proxy::BackendGate>,
+    pub(crate) gate_size: Option<usize>,
 }
 
 impl DnsBackendRuntime {
@@ -65,6 +67,10 @@ impl DnsBackendRuntime {
             .reconcile(live, |id| self.metrics.backend(&self.listener_name, &id.0));
         if let Some(outlier) = &self.outlier {
             outlier.reconcile(live);
+        }
+        if let Some(size) = self.gate_size {
+            self.gates
+                .reconcile(live, |_| lb_proxy::BackendGate::new(size));
         }
         for id in departed {
             self.metrics.remove_backend(&self.listener_name, &id.0);
@@ -263,6 +269,8 @@ mod tests {
             breakers: BackendMap::new(),
             backend_metrics: BackendMap::new(),
             outlier: None,
+            gates: BackendMap::new(),
+            gate_size: None,
         }
     }
 

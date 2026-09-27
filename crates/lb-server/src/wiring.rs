@@ -1059,6 +1059,25 @@ pub(crate) fn build_listener_core(
                 request_timeout: lc.request_timeout(),
                 retry_on_status: lc.retry_on_status.clone(),
                 request_buffer_bytes: lc.request_buffer_bytes(),
+                upstream_limits: lc
+                    .upstream_limits
+                    .as_ref()
+                    .map(|u| lb_proxy::UpstreamLimits {
+                        max_active: u.max_active_per_backend,
+                        max_pending: u.max_pending_per_backend,
+                        max_queue: Duration::from_millis(u.max_queue_ms),
+                    }),
+                backend_gates: match &lc.upstream_limits {
+                    Some(u) => all_backends()
+                        .map(|b| {
+                            (
+                                b.id.clone(),
+                                lb_proxy::BackendGate::new(u.max_active_per_backend),
+                            )
+                        })
+                        .collect(),
+                    None => BackendMap::new(),
+                },
                 max_request_body_bytes: lc.max_request_body_bytes(),
                 websocket_idle_timeout: lc.websocket_idle_timeout(),
                 response_body_idle_timeout: lc.response_body_idle_timeout(),
@@ -1187,6 +1206,8 @@ pub(crate) fn spawn_listener_tasks(
                         breakers: ctx.circuit_breakers.clone(),
                         backend_metrics: ctx.backend_metrics.clone(),
                         outlier: core.outlier.clone(),
+                        gates: ctx.backend_gates.clone(),
+                        gate_size: ctx.upstream_limits.map(|l| l.max_active),
                     },
                 ));
             }
@@ -1255,6 +1276,8 @@ pub(crate) fn spawn_listener_tasks(
                         breakers: ctx.circuit_breakers.clone(),
                         backend_metrics: ctx.backend_metrics.clone(),
                         outlier: core.outlier.clone(),
+                        gates: BackendMap::new(),
+                        gate_size: None,
                     },
                 ));
             }

@@ -362,6 +362,8 @@ async fn dns_churn_experiment() {
         request_timeout: None,
         retry_on_status: Vec::new(),
         request_buffer_bytes: 64 * 1024,
+        upstream_limits: None,
+        backend_gates: lb_core::BackendMap::new(),
         max_request_body_bytes: 1024 * 1024,
         cluster: None,
         metrics: test_metrics(),

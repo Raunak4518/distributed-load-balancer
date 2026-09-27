@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod forward;
+pub mod gate;
 pub mod per_backend;
 pub mod resolver;
 pub mod service;
@@ -12,6 +13,7 @@ pub use forward::{
     build_client, forward, full_body, ForwardError, ProbeCapableClient, ProxyClient,
     ProxyRequestBody,
 };
+pub use gate::{BackendGate, GateRefusal, UpstreamLimits};
 pub use per_backend::PerBackendClients;
 pub use resolver::PinnedResolver;
 pub use service::{handle, AccessLog, CompiledCanaryPool, CompiledRoute, ProxyBody, ProxyContext};

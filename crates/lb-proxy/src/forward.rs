@@ -304,6 +304,7 @@ pub struct IdleTimeoutBody<B> {
     timer: std::pin::Pin<Box<tokio::time::Sleep>>,
     on_timeout: Option<lb_metrics::IntCounter>,
     on_deadline: Option<lb_metrics::IntCounter>,
+    hold: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl<B> IdleTimeoutBody<B> {
@@ -315,7 +316,13 @@ impl<B> IdleTimeoutBody<B> {
             timer: Box::pin(tokio::time::sleep(idle)),
             on_timeout,
             on_deadline: None,
+            hold: None,
         }
+    }
+
+    pub fn holding(mut self, guard: Option<impl std::any::Any + Send + Sync>) -> Self {
+        self.hold = guard.map(|g| Box::new(g) as Box<dyn std::any::Any + Send + Sync>);
+        self
     }
 
     pub fn with_deadline(

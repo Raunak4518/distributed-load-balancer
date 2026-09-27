@@ -23,6 +23,8 @@ pub struct Metrics {
     registry: Registry,
     requests_total: IntCounterVec,
     request_duration: HistogramVec,
+    upstream_overflow: IntCounterVec,
+    upstream_queue_duration: HistogramVec,
     active_connections: IntGaugeVec,
     connections_total: IntCounterVec,
     ratelimit_rejected: IntCounterVec,
@@ -342,6 +344,23 @@ impl Metrics {
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
+        let upstream_overflow = IntCounterVec::new(
+            Opts::new(
+                "lb_upstream_overflow_total",
+                "Backend picks refused because the backend was at upstream_limits, by reason",
+            ),
+            &["listener", "reason"],
+        )?;
+        registry.register(Box::new(upstream_overflow.clone()))?;
+        let upstream_queue_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "lb_upstream_queue_duration_seconds",
+                "Time a request waited for a free slot on its backend",
+            )
+            .buckets(latency_buckets()),
+            &["listener"],
+        )?;
+        registry.register(Box::new(upstream_queue_duration.clone()))?;
         registry.register(Box::new(active_connections.clone()))?;
         registry.register(Box::new(connections_total.clone()))?;
         registry.register(Box::new(ratelimit_rejected.clone()))?;
@@ -388,6 +407,8 @@ impl Metrics {
             registry,
             requests_total,
             request_duration,
+            upstream_overflow,
+            upstream_queue_duration,
             active_connections,
             connections_total,
             ratelimit_rejected,
@@ -480,6 +501,13 @@ impl Metrics {
                 .request_timeouts
                 .with_label_values(&[name, "upstream_body"]),
             timeouts_request: self.request_timeouts.with_label_values(&[name, "request"]),
+            upstream_overflow_queue_full: self
+                .upstream_overflow
+                .with_label_values(&[name, "queue_full"]),
+            upstream_overflow_queue_timeout: self
+                .upstream_overflow
+                .with_label_values(&[name, "queue_timeout"]),
+            upstream_queue_duration: self.upstream_queue_duration.with_label_values(&[name]),
             tracked_keys: self.ratelimit_tracked_keys.with_label_values(&[name]),
             cluster_convergence_bound: self
                 .ratelimit_cluster_convergence_bound
