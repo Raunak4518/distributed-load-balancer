@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Priority failover and zone preference.** Backends take a `priority`
+  (higher numbers are backups used only once every lower tier is ineligible)
+  and a `zone`; a listener's `local_zone` keeps traffic in-zone while any
+  same-zone backend is eligible. Works with every strategy.
 - **Slow start: `slow_start_ms`.** A backend that recovers, is undrained or
   is newly discovered ramps from 10% to 100% of its share over the window,
   for every load-balancing strategy.

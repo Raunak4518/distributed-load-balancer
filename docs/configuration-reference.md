@@ -70,6 +70,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `write_timeout_ms` | integer | `30000` | must be > 0; HTTP-only (must be unset on TCP) | Max time a client may take to read the response before the connection is dropped. |
 | `websocket_idle_timeout_ms` | integer | `300000` (300s) | HTTP-only | Idle timeout applied to a connection after it upgrades (e.g. WebSocket); request-shaped timeouts stop applying once the upgrade completes. |
 | `response_body_idle_timeout_ms` | integer | `60000` (60s) | must be > 0; HTTP-only | Longest gap allowed between chunks of a streamed backend response body. `forward_timeout_ms` bounds the wait for response headers only; this bounds a backend that sends headers and then stalls or trickles the body. When it fires, the client's response is aborted (never presented as complete) and `lb_request_timeouts_total{phase="upstream_body"}` increments. |
+| `local_zone` | string | none | none | This instance's zone. When set, backends with a different (or no) `zone` rank just behind same-zone backends of the same `priority`, so traffic stays in-zone while any same-zone backend is eligible. |
 | `slow_start_ms` | integer | none (off) | must be > 0; HTTP-only | Warm-up window for a backend that just became eligible again: after recovering its health check, its circuit closing, an outlier un-ejection or an undrain, or its first good probe after being added by DNS discovery. Its share of new traffic ramps linearly from 10% to 100% over the window, for any load-balancing strategy. Backends present at startup start fully warm. |
 | `retry_on_status` | array of integers | `[]` | each must be 500–599; HTTP-only | Backend response statuses that trigger the one retry on another backend, e.g. `[502, 503, 504]`. Only for idempotent methods, since a backend that answered has seen the request. Subject to the retry budget and `request_timeout_ms`. |
 | `request_timeout_ms` | integer | none (no overall limit) | must be > 0; HTTP-only | One deadline for the whole request, started when the request head arrives: it caps the request-body read, every attempt including a retry, and the streamed response body together. The per-phase timeouts still apply inside it; whichever expires first wins. Expiry before the response starts returns `504 Gateway Timeout`; expiry while the body is streaming aborts the response. Both count `lb_request_timeouts_total{phase="request"}`. It does not apply to a WebSocket once upgraded. |
@@ -192,6 +193,8 @@ Also applies, with the identical shape, to `[[listeners.routes.backends]]` and `
 | `address` | socket address | required | none | Backend's IP and port. |
 | `weight` | integer | `1` | none | Relative weight; consulted only by `weighted_round_robin` and `consistent_hash` (as virtual-node count). |
 | `server_name` | string | none | required if `backend_tls` is set; see validation above | Hostname on the backend's certificate. |
+| `priority` | integer | `0` | none | Failover tier. Traffic goes only to the lowest-numbered tier that has an eligible backend; higher numbers are backups. |
+| `zone` | string | none | none | Zone or locality label, compared with the listener's `local_zone`. |
 
 ## `[listeners.health_check]`
 

@@ -21,6 +21,12 @@ If `health_check.max_ejected_fraction` is configured, a circuit trip or outlier 
 
 Source: [`pool.rs`](../crates/lb-core/src/pool.rs), [`balancer.rs`](../crates/lb-core/src/balancer.rs).
 
+## Priority Tiers and Zones
+
+Each backend has a `priority` (default `0`), and a listener can set `local_zone` to prefer backends whose `zone` matches. The two combine into one ordering: priority 0 in-zone, then priority 0 out-of-zone, then priority 1 in-zone, and so on. The pool offers the strategies only the best tier that currently has an eligible backend ([`pool.rs`](../crates/lb-core/src/pool.rs)), so every strategy, sticky pins and consistent-hash lookups respect it with no strategy-specific code. When a tier's last eligible backend fails its health check, trips its circuit, is ejected or drained, the next tier takes over. When one recovers, traffic returns (subject to `slow_start_ms`, if set). A pool whose backends all share one tier pays no cost for any of this.
+
+Failover is driven by eligibility, not by load. A request that finds every backend of the active tier at its `upstream_limits` or `adaptive_concurrency` limit gets `503` rather than spilling into a backup tier. Size the primary tier for peak load, or leave the limits unset, if spilling matters. DNS-discovered backends have priority `0`.
+
 ## Slow Start
 
 With `slow_start_ms` set, a backend that has just become eligible again is not handed its full share at once. That covers: recovered health checks, a closed circuit, an outlier un-ejection, an operator undrain, or a backend newly added by DNS discovery passing its first probe. The pool stamps the moment it becomes eligible. For the next `slow_start_ms`, each time the strategy picks it, the proxy keeps it with a probability rising linearly from 10% to 100%, and otherwise asks the strategy for a different backend, falling back to the warming one if there is none. This sits outside the strategies, so it works the same for all of them. Sticky pins are exempt, and backends that were present at startup begin fully warm, so a restart does not throttle the whole pool.
