@@ -144,10 +144,14 @@ jobs:
         with:
           path: dist
 
+      - name: Collect assets and checksums
+        run: |
+          mkdir -p assets
+          find dist -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} assets/ \;
+          (cd assets && sha256sum -- * > SHA256SUMS)
+          cat assets/SHA256SUMS
+
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/*/*.tar.gz
-            dist/*/*.deb
-            dist/*/*.rpm
+          files: assets/*
           generate_release_notes: true

@@ -140,7 +140,7 @@ Every tagged release publishes the following through [`.github/workflows/release
 **Install script** (Linux or macOS; selects the right release asset):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Raunak4518/distributed-load-balancer/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Raunak4518/distributed-load-balancer/main/scripts/install.sh | bash
 ```
 
 **Container** (mount your config over the default; listeners must bind `0.0.0.0` inside the container):
