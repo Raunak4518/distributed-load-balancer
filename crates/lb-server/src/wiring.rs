@@ -1104,6 +1104,23 @@ pub(crate) fn build_listener_core(
                     }),
                 adaptive: lc.adaptive_concurrency.as_ref().map(adaptive_config),
                 slow_start: lc.slow_start_ms.map(Duration::from_millis),
+                direct_responses: lc
+                    .direct_responses
+                    .iter()
+                    .map(|d| lb_proxy::DirectResponse {
+                        path_prefix: d.path_prefix.clone(),
+                        host: d.host.clone(),
+                        status: hyper::StatusCode::from_u16(d.status)
+                            .unwrap_or(hyper::StatusCode::SERVICE_UNAVAILABLE),
+                        body: d.body.clone().unwrap_or_default().into(),
+                        content_type: d
+                            .content_type
+                            .as_deref()
+                            .and_then(|c| hyper::header::HeaderValue::from_str(c).ok()),
+                        redirect: d.redirect.clone(),
+                        keep_path: d.keep_path,
+                    })
+                    .collect(),
                 headers: lc.headers.as_ref().map(|h| lb_proxy::HeaderRewrite {
                     request: lb_proxy::HeaderEdits::new(&h.request_set, &h.request_remove),
                     response: lb_proxy::HeaderEdits::new(&h.response_set, &h.response_remove),

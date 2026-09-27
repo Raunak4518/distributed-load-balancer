@@ -360,6 +360,8 @@ pub struct ListenerConfig {
     pub forwarded: Option<ForwardedConfig>,
     #[serde(default)]
     pub headers: Option<HeaderRewriteConfig>,
+    #[serde(default)]
+    pub direct_responses: Vec<DirectResponseConfig>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -517,6 +519,79 @@ pub struct HeaderRewriteConfig {
     pub response_set: BTreeMap<String, String>,
     #[serde(default)]
     pub response_remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectResponseConfig {
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    pub status: u16,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub redirect: Option<String>,
+    #[serde(default)]
+    pub keep_path: bool,
+}
+
+const REDIRECT_STATUSES: &[u16] = &[301, 302, 303, 307, 308];
+
+impl DirectResponseConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !(200..=599).contains(&self.status) {
+            return Err(format!(
+                "direct_responses: status {} must be between 200 and 599",
+                self.status
+            ));
+        }
+        if let Some(prefix) = &self.path_prefix {
+            if !prefix.starts_with('/') {
+                return Err(format!(
+                    "direct_responses: path_prefix '{prefix}' must start with '/'"
+                ));
+            }
+        }
+        let is_redirect_status = REDIRECT_STATUSES.contains(&self.status);
+        match &self.redirect {
+            Some(location) => {
+                if !is_redirect_status {
+                    return Err(format!(
+                        "direct_responses: redirect needs a redirect status (301, 302, 303, 307 or 308), not {}",
+                        self.status
+                    ));
+                }
+                location.parse::<http::Uri>().map_err(|_| {
+                    format!("direct_responses: redirect '{location}' is not a valid URI")
+                })?;
+                http::HeaderValue::from_str(location).map_err(|_| {
+                    format!("direct_responses: redirect '{location}' is not a valid header value")
+                })?;
+            }
+            None if is_redirect_status => {
+                return Err(format!(
+                    "direct_responses: status {} needs a redirect location",
+                    self.status
+                ));
+            }
+            None if self.keep_path => {
+                return Err("direct_responses: keep_path only applies to a redirect".into());
+            }
+            None => {}
+        }
+        if let Some(content_type) = &self.content_type {
+            http::HeaderValue::from_str(content_type).map_err(|_| {
+                format!(
+                    "direct_responses: content_type '{content_type}' is not a valid header value"
+                )
+            })?;
+        }
+        Ok(())
+    }
 }
 
 const FRAMING_HEADERS: &[&str] = &[
@@ -1544,6 +1619,9 @@ impl ListenerConfig {
                 if let Some(headers) = &self.headers {
                     headers.validate().map_err(invalid)?;
                 }
+                for direct in &self.direct_responses {
+                    direct.validate().map_err(invalid)?;
+                }
                 if self.health_check.path.is_none() {
                     return Err(invalid(
                         "health_check.path is required for http listeners".into(),
@@ -1684,6 +1762,9 @@ impl ListenerConfig {
                         "compression is an http-only setting -- a tcp listener has no response to compress"
                             .into(),
                     ));
+                }
+                if !self.direct_responses.is_empty() {
+                    return Err(invalid("direct_responses is an http-only setting".into()));
                 }
                 if !self.routes.is_empty() {
                     return Err(invalid(
@@ -2039,6 +2120,38 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(cfg.listeners[0].local_zone.as_deref(), Some("eu-1"));
+    }
+
+    #[test]
+    fn direct_responses_parse_and_are_validated() {
+        let with = |body: &str| {
+            VALID.replacen(
+                "        [listeners.load_balancing]",
+                &format!("        [[listeners.direct_responses]]\n{body}\n\n        [listeners.load_balancing]"),
+                1,
+            )
+        };
+        let cfg = Config::parse(&with(
+            "        path_prefix = \"/old\"\n        status = 308\n        redirect = \"https://new.example\"\n        keep_path = true",
+        ))
+        .unwrap();
+        let direct = &cfg.listeners[0].direct_responses[0];
+        assert_eq!(direct.status, 308);
+        assert_eq!(direct.redirect.as_deref(), Some("https://new.example"));
+        assert!(direct.keep_path);
+        assert!(Config::parse(&with("        status = 503\n        body = \"down\"")).is_ok());
+        for bad in [
+            "        status = 99",
+            "        status = 600",
+            "        status = 301",
+            "        status = 200\n        redirect = \"https://x.example\"",
+            "        status = 200\n        keep_path = true",
+            "        status = 302\n        redirect = \"not a uri\"",
+            "        status = 200\n        path_prefix = \"api\"",
+            "        status = 200\n        content_type = \"text/plain\\nx\"",
+        ] {
+            assert!(Config::parse(&with(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -119,6 +119,7 @@ pub struct ProxyContext<R: RateLimiter, C: Clock> {
     pub slow_start: Option<Duration>,
     pub forwarded: Option<crate::forwarded::ForwardedHeaders>,
     pub headers: Option<crate::headers::HeaderRewrite>,
+    pub direct_responses: Vec<crate::direct::DirectResponse>,
     pub adaptive_limits: BackendMap<crate::adaptive::AdaptiveLimit>,
     /// See `crate::upgrade`'s module docs: how long a WebSocket/Upgrade
     /// connection may sit idle once the backend accepts the handshake.
@@ -201,15 +202,12 @@ pub struct CompiledCanaryPool {
 /// its query, and query strings can otherwise produce surprising matches
 /// (`/api?path_prefix=/other`).
 fn route_matches(route: &CompiledRoute, path: &str, host: Option<&str>) -> bool {
-    let path_ok = match &route.path_prefix {
-        None => true,
-        Some(prefix) => path == prefix || path.starts_with(&format!("{prefix}/")),
-    };
-    let host_ok = match &route.host {
-        None => true,
-        Some(expected) => host.is_some_and(|h| h.eq_ignore_ascii_case(expected)),
-    };
-    path_ok && host_ok
+    crate::direct::prefix_and_host_match(
+        route.path_prefix.as_deref(),
+        route.host.as_deref(),
+        path,
+        host,
+    )
 }
 
 /// The first rule (in declaration order) whose `path_prefix`/`host` both
@@ -813,6 +811,20 @@ where
                 return Ok(simple_response(StatusCode::FORBIDDEN, "request blocked"));
             }
             // Log mode: recorded above, falls through to normal handling.
+        }
+    }
+
+    if !ctx.direct_responses.is_empty() {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok());
+        if let Some(direct) = ctx
+            .direct_responses
+            .iter()
+            .find(|d| d.matches(req.uri().path(), host))
+        {
+            return Ok(direct.respond(req.uri()));
         }
     }
 
@@ -1703,6 +1715,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -1752,6 +1765,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -1820,6 +1834,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -1873,6 +1888,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -1942,6 +1958,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -1993,6 +2010,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -2061,6 +2079,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -2163,6 +2182,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -2449,6 +2469,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -2582,6 +2603,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -2739,6 +2761,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -2791,6 +2814,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -2887,6 +2911,7 @@ mod tests {
             adaptive: Some(fixed),
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: limits,
             cluster: None,
@@ -2930,6 +2955,7 @@ mod tests {
             )),
             slow_start: Some(Duration::from_secs(60)),
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             rate_limiter: Arc::clone(&base.rate_limiter),
             pool,
@@ -3058,6 +3084,7 @@ mod tests {
             adaptive_limits: BackendMap::new(),
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             cluster: None,
             metrics: test_metrics(),
             backend_metrics: BackendMap::new(),
@@ -3134,6 +3161,7 @@ mod tests {
                 adaptive_limits: BackendMap::new(),
                 slow_start: None,
                 headers: None,
+                direct_responses: Vec::new(),
                 forwarded: None,
                 cluster: None,
                 metrics: test_metrics(),
@@ -3319,6 +3347,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -3378,6 +3407,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -3451,6 +3481,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -3552,6 +3583,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -3633,6 +3665,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -3714,6 +3747,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -3886,6 +3920,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -4038,6 +4073,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -4091,6 +4127,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -4220,6 +4257,7 @@ mod tests {
                 adaptive: None,
                 slow_start: None,
                 headers: None,
+                direct_responses: Vec::new(),
                 forwarded: None,
                 adaptive_limits: BackendMap::new(),
                 cluster: None,
@@ -4305,6 +4343,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -4493,6 +4532,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -4554,6 +4594,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -4611,6 +4652,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -4666,6 +4708,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5113,6 +5156,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5166,6 +5210,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5226,6 +5271,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5286,6 +5332,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5340,6 +5387,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5392,6 +5440,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5450,6 +5499,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5512,6 +5562,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5651,6 +5702,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5730,6 +5782,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5822,6 +5875,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -5942,6 +5996,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -6119,6 +6174,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
@@ -6227,6 +6283,7 @@ mod tests {
             adaptive: None,
             slow_start: None,
             headers: None,
+            direct_responses: Vec::new(),
             forwarded: None,
             adaptive_limits: BackendMap::new(),
             cluster: None,
