@@ -44,7 +44,8 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] `cargo deny` (licenses, sources, duplicate versions) in CI
 
 ## Phase 1 — An elite proxy
-- [ ] Upstream connection pools: per-backend max connections / pending / active, max requests and lifetime per connection, queue-time metric
+- [x] Per-backend in-flight request limit with a bounded wait queue, queue-time metric, overflow to another backend
+- [ ] Custom upstream connection pool: max connections per backend, max requests and lifetime per connection, warm-up
 - [ ] HTTP/2 upstream GOAWAY handling and connection draining
 - [ ] Overload manager: memory/FD/connection pressure → staged shedding levels
 - [ ] Adaptive concurrency limit per backend (gradient-based)
@@ -99,6 +100,7 @@ because every later phase builds on the guarantees of the earlier ones.
 
 ## Phase 7 — Proof
 - [ ] Reproducible comparison benchmarks against HAProxy, Envoy, NGINX on identical setups
+- [ ] Integration tests bind listeners race-free (pass pre-bound sockets instead of probing for free ports)
 - [ ] Fuzzing: HTTP/1 parser path, PROXY protocol, gossip frames, config
 - [ ] `loom` models for the lock-free pool and counter code
 - [ ] Multi-host cluster tests with partitions, loss and clock skew

@@ -86,6 +86,7 @@ One entry per entry point; repeat the table for multiple listeners.
 | `cache` | table | none | HTTP-only | In-memory response cache for `GET` `200` responses. |
 | `waf` | table | none | HTTP-only | Built-in request-pattern blocking/logging. |
 | `retry_budget` | table | none | HTTP-only | Token-bucket cap on retried requests. |
+| `upstream_limits` | table | none | HTTP-only | Per-backend in-flight request cap and wait queue. |
 
 `http2_enabled()` — whether HTTP/2 is actually served — is `protocol == "http" && tls is set && (http2.enabled != false)`; a plaintext listener never serves HTTP/2 regardless of `http2.enabled`, because ALPN only exists inside a TLS handshake ([`config.rs`](../crates/lb-core/src/config.rs)). See [load-balancing.md](load-balancing.md) for routes/canary/sticky behavior, [http-features.md](http-features.md) for cache/compression/WebSocket behavior, [edge-hardening.md](edge-hardening.md) for connection limits, PROXY protocol and the WAF, and [request-lifecycle.md](request-lifecycle.md) for how the timeouts above compose.
 
@@ -285,6 +286,16 @@ HTTP-only. A small, fixed, built-in pattern check — not a configurable rule en
 |---|---|---|---|---|
 | `mode` | string | `"block"` | `"block"` or `"log"` | `block` returns `403` on a match; `log` records the match and forwards the request unmodified. |
 | `inspect_headers` | boolean | `false` | none | Also inspects header values, not just path/query. |
+
+## `[listeners.upstream_limits]`
+
+HTTP-only. Caps how many requests each backend handles at once, so one slow backend cannot absorb every request and hold them all while a healthy backend sits idle. A slot is held from dispatch until the response body has been fully streamed. When a backend is full, a request waits for a slot only if fewer than `max_pending_per_backend` requests are already waiting, and for at most `max_queue_ms` (or what remains of `request_timeout_ms`). A request that cannot get a slot is sent to another backend — the request never left, so this is not counted as a backend failure — and if no backend has room it is answered `503`. Absent: no limit. WebSocket upgrades are not gated, since they would hold a slot for their whole life.
+
+| Field | Type | Default | Validation | Meaning |
+|---|---|---|---|---|
+| `max_active_per_backend` | integer | required | must be > 0 | Requests one backend may have in flight at once. |
+| `max_pending_per_backend` | integer | `0` | none | Requests allowed to wait for a slot on a full backend; `0` means never wait, move on immediately. |
+| `max_queue_ms` | integer | `1000` | must be > 0 | Longest a request waits for a slot. |
 
 ## `[listeners.retry_budget]`
 

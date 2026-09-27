@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-backend in-flight limits: `[listeners.upstream_limits]`.** Caps
+  concurrent requests per backend, with an optional bounded wait queue and
+  queue timeout. A full backend hands the request to another one; slots are
+  held until the response body finishes. New metrics:
+  `lb_upstream_overflow_total` and `lb_upstream_queue_duration_seconds`.
 - **TLS and mutual TLS for the admin listener.** `[admin.tls]` with
   `cert_file`/`key_file` serves the admin API over TLS; `client_ca_file`
   requires client certificates, which also satisfies the non-loopback

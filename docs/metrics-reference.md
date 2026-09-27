@@ -67,6 +67,18 @@ Labels: `listener`, `phase` (`header` | `body` | `upstream_body` | `request`).
 
 ## Backends, health, and circuit breaking
 
+### `lb_upstream_overflow_total` — counter
+
+Labels: `listener`, `reason` (`queue_full` | `queue_timeout`).
+
+Incremented when a picked backend was at `upstream_limits.max_active_per_backend` and the request could not get a slot: the wait queue was already at `max_pending_per_backend` (`queue_full`), or no slot freed up within `max_queue_ms` (`queue_timeout`). The request then goes to another backend, or is answered `503` if none has room.
+
+### `lb_upstream_queue_duration_seconds` — histogram
+
+Labels: `listener`.
+
+Time each gated request waited for a slot on its backend (0 when a slot was free). Only observed when `upstream_limits` is configured.
+
 See [`health-checking.md`](health-checking.md) and [`load-balancing.md`](load-balancing.md) for the mechanisms behind these metrics.
 
 Every metric in this section is labeled per backend and exists for statically configured and DNS-discovered backends alike. When a DNS-discovered backend leaves the resolved set, all of its series in this section are removed from the exposition, so autoscaling churn does not accumulate stale `backend` label values.
