@@ -2,7 +2,8 @@ mod admin;
 mod handles;
 
 pub use admin::{
-    spawn_admin_server, spawn_admin_server_with_limits, AdminExtension, AdminLimits, ReadinessCheck,
+    spawn_admin_server, spawn_admin_server_with_options, AdminExtension, AdminOptions,
+    ReadinessCheck,
 };
 pub use handles::{
     BackendMetrics, ListenerMetrics, RequestCounters, StatusClass, WafRule, WebsocketUpgradeResult,

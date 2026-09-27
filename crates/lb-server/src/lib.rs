@@ -74,6 +74,12 @@ pub async fn run_and_report_reload_handle(
         })?,
         None => None,
     };
+    let admin_read_token = match config.admin.as_ref() {
+        Some(a) => a.resolve_read_token().map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?,
+        None => None,
+    };
 
     let WiredApp {
         listeners,
@@ -183,12 +189,16 @@ pub async fn run_and_report_reload_handle(
         let readiness: lb_metrics::ReadinessCheck = Arc::new(move || {
             readiness::is_ready(&ready_state, &tls_resolvers, readiness::unix_now())
         });
-        cluster_tasks.push(lb_metrics::spawn_admin_server(
+        cluster_tasks.push(lb_metrics::spawn_admin_server_with_options(
             Arc::clone(&metrics),
             admin_listener,
             readiness,
             Some(admin_backends::extension(Arc::clone(&reload))),
             admin_token.map(|t| Arc::from(t.into_boxed_slice())),
+            lb_metrics::AdminOptions {
+                read_only_token: admin_read_token.map(|t| Arc::from(t.into_boxed_slice())),
+                ..lb_metrics::AdminOptions::default()
+            },
         ));
     }
 

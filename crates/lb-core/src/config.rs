@@ -43,6 +43,10 @@ pub struct AdminConfig {
     #[serde(default)]
     pub token: Option<String>,
     #[serde(default)]
+    pub read_token_env: Option<String>,
+    #[serde(default)]
+    pub read_token: Option<String>,
+    #[serde(default)]
     pub allow_unauthenticated: bool,
 }
 
@@ -77,6 +81,34 @@ impl AdminConfig {
         };
         if token.is_empty() {
             return Err(ConfigError::Invalid("admin token must not be empty".into()));
+        }
+        Ok(Some(token.into_bytes()))
+    }
+
+    pub fn resolve_read_token(&self) -> Result<Option<Vec<u8>>, ConfigError> {
+        let token = match (&self.read_token_env, &self.read_token) {
+            (None, None) => return Ok(None),
+            (Some(var), None) => std::env::var(var).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "admin.read_token_env names '{var}', but that environment variable is not set"
+                ))
+            })?,
+            (None, Some(literal)) => literal.clone(),
+            (Some(_), Some(_)) => {
+                return Err(ConfigError::Invalid(
+                    "admin requires at most one of read_token_env or read_token".into(),
+                ))
+            }
+        };
+        if token.is_empty() {
+            return Err(ConfigError::Invalid(
+                "admin read token must not be empty".into(),
+            ));
+        }
+        if self.resolve_token()?.as_deref() == Some(token.as_bytes()) {
+            return Err(ConfigError::Invalid(
+                "admin read token must differ from the admin token".into(),
+            ));
         }
         Ok(Some(token.into_bytes()))
     }
@@ -1061,6 +1093,20 @@ impl Config {
             if admin.token_env.is_some() && admin.token.is_some() {
                 return Err(ConfigError::Invalid(
                     "admin requires at most one of token_env or token".into(),
+                ));
+            }
+            if admin.read_token_env.is_some() && admin.read_token.is_some() {
+                return Err(ConfigError::Invalid(
+                    "admin requires at most one of read_token_env or read_token".into(),
+                ));
+            }
+            if (admin.read_token_env.is_some() || admin.read_token.is_some())
+                && admin.token_env.is_none()
+                && admin.token.is_none()
+            {
+                return Err(ConfigError::Invalid(
+                    "admin.read_token needs admin.token (or token_env) as well: without one the admin API is open to everyone"
+                        .into(),
                 ));
             }
             if !admin.listen.ip().to_canonical().is_loopback()
@@ -2422,6 +2468,27 @@ mod tests {
 
     fn with_admin(admin: &str) -> String {
         format!("[admin]\n{admin}\n{VALID}")
+    }
+
+    #[test]
+    fn a_read_token_needs_an_admin_token_and_must_differ_from_it() {
+        assert!(Config::parse(&with_admin(
+            "listen = \"127.0.0.1:9100\"\nread_token = \"viewer\""
+        ))
+        .is_err());
+        let cfg = Config::parse(&with_admin(
+            "listen = \"127.0.0.1:9100\"\ntoken = \"admin\"\nread_token = \"viewer\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.admin.unwrap().resolve_read_token().unwrap(),
+            Some(b"viewer".to_vec())
+        );
+        let same = Config::parse(&with_admin(
+            "listen = \"127.0.0.1:9100\"\ntoken = \"admin\"\nread_token = \"admin\"",
+        ))
+        .unwrap();
+        assert!(same.admin.unwrap().resolve_read_token().is_err());
     }
 
     #[test]

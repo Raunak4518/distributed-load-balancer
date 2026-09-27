@@ -5,7 +5,7 @@ use hyper::body::Incoming;
 use hyper::header::AUTHORIZATION;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::future::Future;
@@ -15,17 +15,36 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
-#[derive(Clone, Copy, Debug)]
-pub struct AdminLimits {
+#[derive(Clone, Debug)]
+pub struct AdminOptions {
     pub max_connections: usize,
     pub header_read_timeout: Duration,
+    pub read_only_token: Option<Arc<[u8]>>,
 }
 
-impl Default for AdminLimits {
+impl Default for AdminOptions {
     fn default() -> Self {
-        AdminLimits {
+        AdminOptions {
             max_connections: 64,
             header_read_timeout: Duration::from_secs(5),
+            read_only_token: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdminRole {
+    Unauthenticated,
+    ReadOnly,
+    Admin,
+}
+
+impl AdminRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            AdminRole::Unauthenticated => "unauthenticated",
+            AdminRole::ReadOnly => "read_only",
+            AdminRole::Admin => "admin",
         }
     }
 }
@@ -70,31 +89,33 @@ pub fn spawn_admin_server(
     extension: Option<AdminExtension>,
     admin_token: Option<Arc<[u8]>>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_admin_server_with_limits(
+    spawn_admin_server_with_options(
         metrics,
         listener,
         readiness,
         extension,
         admin_token,
-        AdminLimits::default(),
+        AdminOptions::default(),
     )
 }
 
-pub fn spawn_admin_server_with_limits(
+pub fn spawn_admin_server_with_options(
     metrics: Arc<Metrics>,
     listener: TcpListener,
     readiness: ReadinessCheck,
     extension: Option<AdminExtension>,
     admin_token: Option<Arc<[u8]>>,
-    limits: AdminLimits,
+    options: AdminOptions,
 ) -> tokio::task::JoinHandle<()> {
-    let slots = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let slots = Arc::new(tokio::sync::Semaphore::new(options.max_connections));
+    let header_read_timeout = options.header_read_timeout;
+    let read_only_token = options.read_only_token;
     tokio::spawn(async move {
         loop {
             let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
                 return;
             };
-            let Ok((stream, _peer)) = listener.accept().await else {
+            let Ok((stream, peer)) = listener.accept().await else {
                 continue;
             };
             let io = TokioIo::new(stream);
@@ -102,6 +123,7 @@ pub fn spawn_admin_server_with_limits(
             let readiness = Arc::clone(&readiness);
             let extension = extension.clone();
             let admin_token = admin_token.clone();
+            let read_only_token = read_only_token.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let svc = service_fn(move |req| {
@@ -109,11 +131,23 @@ pub fn spawn_admin_server_with_limits(
                     let readiness = Arc::clone(&readiness);
                     let extension = extension.clone();
                     let admin_token = admin_token.clone();
-                    async move { route(req, metrics, readiness, extension, admin_token).await }
+                    let read_only_token = read_only_token.clone();
+                    async move {
+                        route(
+                            req,
+                            metrics,
+                            readiness,
+                            extension,
+                            admin_token,
+                            read_only_token,
+                            peer,
+                        )
+                        .await
+                    }
                 });
                 if let Err(err) = http1::Builder::new()
                     .timer(hyper_util::rt::TokioTimer::new())
-                    .header_read_timeout(limits.header_read_timeout)
+                    .header_read_timeout(header_read_timeout)
                     .serve_connection(io, svc)
                     .await
                 {
@@ -130,7 +164,11 @@ async fn route(
     readiness: ReadinessCheck,
     extension: Option<AdminExtension>,
     admin_token: Option<Arc<[u8]>>,
+    read_only_token: Option<Arc<[u8]>>,
+    peer: std::net::SocketAddr,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
     // Checked before anything else, so every route below except `/healthz`
     // and `/ready` (including `extension`'s, which owns everything under
     // /backends) is covered by one check instead of needing its own. A
@@ -138,30 +176,80 @@ async fn route(
     // through timing -- the same concern `lb-cluster`'s gossip HMAC check
     // already guards against -- hence `ConstantTimeEq` rather than a plain
     // comparison.
-    let is_probe = matches!(req.uri().path(), "/healthz" | "/ready");
-    if let Some(token) = admin_token.as_ref().filter(|_| !is_probe) {
-        let presented = req
-            .headers()
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
-        let authorized = presented.is_some_and(|p| bool::from(p.as_bytes().ct_eq(token)));
-        if !authorized {
+    let (role, allowed) = authorize(&req, admin_token.as_deref(), read_only_token.as_deref());
+    let response = match (allowed, role) {
+        (true, _) => dispatch(req, &metrics, readiness, extension).await,
+        (false, Some(_)) => {
             metrics.admin_auth_failures.inc();
-            return Ok(unauthorized());
+            text(
+                StatusCode::FORBIDDEN,
+                "this token may only read".to_string(),
+            )
         }
+        (false, None) => {
+            metrics.admin_auth_failures.inc();
+            unauthorized()
+        }
+    };
+    if !matches!(method, Method::GET | Method::HEAD) {
+        tracing::info!(
+            target: "lb_admin_audit",
+            method = %method,
+            path = %path,
+            peer = %peer,
+            role = role.map_or("none", AdminRole::as_str),
+            allowed,
+            status = response.status().as_u16(),
+            "admin write request"
+        );
     }
+    Ok(response)
+}
 
+fn authorize(
+    req: &Request<Incoming>,
+    admin_token: Option<&[u8]>,
+    read_only_token: Option<&[u8]>,
+) -> (Option<AdminRole>, bool) {
+    let Some(admin_token) = admin_token else {
+        return (Some(AdminRole::Unauthenticated), true);
+    };
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::as_bytes);
+    let matches = |token: &[u8]| presented.is_some_and(|p| bool::from(p.ct_eq(token)));
+    if matches(admin_token) {
+        return (Some(AdminRole::Admin), true);
+    }
+    if read_only_token.is_some_and(matches) {
+        let reading = matches!(*req.method(), Method::GET | Method::HEAD);
+        return (Some(AdminRole::ReadOnly), reading);
+    }
+    if matches!(req.uri().path(), "/healthz" | "/ready") {
+        return (Some(AdminRole::Unauthenticated), true);
+    }
+    (None, false)
+}
+
+async fn dispatch(
+    req: Request<Incoming>,
+    metrics: &Metrics,
+    readiness: ReadinessCheck,
+    extension: Option<AdminExtension>,
+) -> Response<Full<Bytes>> {
     // Checked by prefix, before matching on the exact built-in paths below,
     // so the request can be handed to the extension by value (it may need
     // the body, e.g. for a future write endpoint) without first needing it
     // back to fall through -- there is nothing to fall through to once a
     // path is recognized as the extension's own.
     if req.uri().path().starts_with("/backends") {
-        return Ok(match extension {
+        return match extension {
             Some(ext) => ext(req).await,
             None => text(StatusCode::NOT_FOUND, "not found".to_string()),
-        });
+        };
     }
 
     let response = match req.uri().path() {
@@ -186,7 +274,7 @@ async fn route(
 
         _ => text(StatusCode::NOT_FOUND, "not found".to_string()),
     };
-    Ok(response)
+    response
 }
 
 fn text(status: StatusCode, body: String) -> Response<Full<Bytes>> {
@@ -349,21 +437,22 @@ mod tests {
         }
     }
 
-    async fn start_limited(limits: AdminLimits) -> std::net::SocketAddr {
+    async fn start_limited(options: AdminOptions) -> std::net::SocketAddr {
         let metrics = Arc::new(Metrics::new().unwrap());
         let readiness: ReadinessCheck = Arc::new(|| true);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        spawn_admin_server_with_limits(metrics, listener, readiness, None, None, limits);
+        spawn_admin_server_with_options(metrics, listener, readiness, None, None, options);
         addr
     }
 
     #[tokio::test]
     async fn a_client_that_never_finishes_its_request_head_is_disconnected() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let addr = start_limited(AdminLimits {
+        let addr = start_limited(AdminOptions {
             max_connections: 8,
             header_read_timeout: Duration::from_millis(200),
+            read_only_token: None,
         })
         .await;
         let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -383,9 +472,10 @@ mod tests {
     #[tokio::test]
     async fn connections_past_the_cap_wait_for_a_free_slot() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let addr = start_limited(AdminLimits {
+        let addr = start_limited(AdminOptions {
             max_connections: 1,
             header_read_timeout: Duration::from_secs(30),
+            read_only_token: None,
         })
         .await;
         let holder = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -410,6 +500,141 @@ mod tests {
             .expect("the waiting connection must be served once a slot frees")
             .unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    }
+
+    async fn start_with_roles() -> std::net::SocketAddr {
+        let metrics = Arc::new(Metrics::new().unwrap());
+        let readiness: ReadinessCheck = Arc::new(|| true);
+        let extension: AdminExtension = Arc::new(|req: Request<Incoming>| {
+            Box::pin(async move { text(StatusCode::OK, format!("saw {}", req.uri().path())) })
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_admin_server_with_options(
+            metrics,
+            listener,
+            readiness,
+            Some(extension),
+            Some(Arc::from(b"admin-secret".as_slice())),
+            AdminOptions {
+                read_only_token: Some(Arc::from(b"viewer-secret".as_slice())),
+                ..AdminOptions::default()
+            },
+        );
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_read_only_token_can_read_but_not_write() {
+        let addr = start_with_roles().await;
+        let client = reqwest::Client::new();
+        let send = |method: reqwest::Method, path: &str, token: &str| {
+            client
+                .request(method, format!("http://{addr}{path}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+        };
+        assert_eq!(
+            send(reqwest::Method::GET, "/metrics", "viewer-secret")
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            send(reqwest::Method::GET, "/backends", "viewer-secret")
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            send(
+                reqwest::Method::POST,
+                "/backends/web/b1/drain",
+                "viewer-secret"
+            )
+            .await
+            .unwrap()
+            .status(),
+            403
+        );
+        assert_eq!(
+            send(
+                reqwest::Method::POST,
+                "/backends/web/b1/drain",
+                "admin-secret"
+            )
+            .await
+            .unwrap()
+            .status(),
+            200
+        );
+        assert_eq!(
+            send(reqwest::Method::POST, "/backends/web/b1/drain", "wrong")
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_write_attempt_is_audited_with_who_what_and_outcome() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let addr = start_with_roles().await;
+        let client = reqwest::Client::new();
+        for token in ["viewer-secret", "admin-secret"] {
+            client
+                .post(format!("http://{addr}/backends/web/b1/drain"))
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .unwrap();
+        }
+        client
+            .get(format!("http://{addr}/metrics"))
+            .header("Authorization", "Bearer admin-secret")
+            .send()
+            .await
+            .unwrap();
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let audit: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("lb_admin_audit"))
+            .collect();
+        assert_eq!(audit.len(), 2, "exactly the two writes are audited:\n{log}");
+        assert!(
+            audit[0].contains("role=\"read_only\"") || audit[0].contains("role=read_only"),
+            "{}",
+            audit[0]
+        );
+        assert!(audit[0].contains("status=403"), "{}", audit[0]);
+        assert!(audit[1].contains("admin"), "{}", audit[1]);
+        assert!(audit[1].contains("status=200"), "{}", audit[1]);
+        assert!(audit[1].contains("/backends/web/b1/drain"), "{}", audit[1]);
+        assert!(audit[1].contains("127.0.0.1"), "{}", audit[1]);
     }
 
     #[tokio::test]
