@@ -19,7 +19,7 @@ lb-tls = { path = "../lb-tls" }
 # connection needs. No `lb-tcp` -> `lb-proxy` edge exists, so this adds no
 # cycle.
 lb-tcp = { path = "../lb-tcp" }
-sha2 = "0.10"
+sha2 = "0.11"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
