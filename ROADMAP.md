@@ -21,7 +21,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Stream request bodies to the backend when no retry or cache needs them buffered
 - [x] Audit: every `spawn()` has an owner and a shutdown path
 - [x] Audit: every map keyed by client input has a cardinality bound
-- [ ] Audit: cancellation (client disconnect) propagates to the upstream request
+- [x] Audit: cancellation (client disconnect) propagates to the upstream request
 
 ### Cluster
 - [x] Changed keys gossiped first; documented convergence bound
