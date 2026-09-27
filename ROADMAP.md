@@ -41,7 +41,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Audit log of admin write operations (drain/undrain)
 - [x] Separate read-only and read-write admin tokens (authorization, not just authentication)
 - [x] Optional mTLS for the admin listener
-- [ ] `cargo deny` (licenses, sources, duplicate versions) in CI
+- [x] `cargo deny` (licenses, sources, duplicate versions) in CI
 
 ## Phase 1 — An elite proxy
 - [ ] Upstream connection pools: per-backend max connections / pending / active, max requests and lifetime per connection, queue-time metric

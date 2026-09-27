@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SHA256SUMS` file, and `scripts/install.sh` checks the downloaded tarball
   against it before installing, refusing a release without one unless
   `ALLOW_UNVERIFIED=1`. A daily `cargo audit` workflow checks the dependency
-  tree against the RustSec advisory database.
+  tree against the RustSec advisory database. A `cargo deny` job enforces a license
+  allow-list and crates.io as the only dependency source.
 - **ACME key material was written non-atomically with default permissions.**
   Account credentials, private keys and certificates are now written to a
   temporary file, synced and renamed into place, and on Unix the credentials
