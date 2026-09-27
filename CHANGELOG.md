@@ -151,6 +151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Peak EWMA could starve a recovered backend.** The error penalty never
+  decayed without traffic, and a recovered backend kept its old latency, so
+  power-of-two-choices never picked it again. The error rate now decays over
+  time, and a backend's history is reset when it becomes eligible again.
 - **Long-lived HTTP connections ignored config reloads.** Each keep-alive or
   HTTP/2 connection kept the configuration it connected under, so it could
   keep sending requests to backends a reload had removed. The configuration
