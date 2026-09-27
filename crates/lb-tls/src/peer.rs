@@ -96,6 +96,43 @@ impl PeerTls {
     }
 }
 
+pub fn peer_certificate_names<S>(stream: &tokio_rustls::server::TlsStream<S>) -> Vec<String> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::FromDer;
+    let Some(leaf) = stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+    else {
+        return Vec::new();
+    };
+    let Ok((_, cert)) = x509_parser::certificate::X509Certificate::from_der(leaf.as_ref()) else {
+        return Vec::new();
+    };
+    let Ok(Some(san)) = cert.subject_alternative_name() else {
+        return Vec::new();
+    };
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|name| match name {
+            GeneralName::DNSName(dns) => Some(dns.to_string()),
+            GeneralName::URI(uri) => Some(uri.to_string()),
+            GeneralName::IPAddress(bytes) => match bytes.len() {
+                4 => <[u8; 4]>::try_from(*bytes)
+                    .ok()
+                    .map(|b| IpAddr::from(b).to_string()),
+                16 => <[u8; 16]>::try_from(*bytes)
+                    .ok()
+                    .map(|b| IpAddr::from(b).to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,9 +193,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut tls = server_tls.accept(stream).await.unwrap();
+            let names = peer_certificate_names(&tls);
             let mut buf = [0u8; 5];
             tls.read_exact(&mut buf).await.unwrap();
-            buf
+            (buf, names)
         });
 
         let stream = TcpStream::connect(addr).await.unwrap();
@@ -166,7 +204,9 @@ mod tests {
         tls.write_all(b"hello").await.unwrap();
         tls.shutdown().await.unwrap();
 
-        assert_eq!(server.await.unwrap(), *b"hello");
+        let (received, names) = server.await.unwrap();
+        assert_eq!(received, *b"hello");
+        assert_eq!(names, vec!["127.0.0.1".to_string()]);
     }
 
     /// The whole point of mutual auth: a client with no certificate at all

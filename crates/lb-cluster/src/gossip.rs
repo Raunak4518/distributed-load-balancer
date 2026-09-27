@@ -87,7 +87,10 @@ where
                 let _guard = guard;
                 match tls {
                     Some(tls) => match tls.accept(stream).await {
-                        Ok(tls_stream) => handle_peer_connection(node, tls_stream, peer).await,
+                        Ok(tls_stream) => {
+                            let names = lb_tls::peer_certificate_names(&tls_stream);
+                            handle_peer_connection(node, tls_stream, peer, Some(names)).await
+                        }
                         Err(err) => {
                             // A bad or missing peer certificate closes only
                             // this connection, same resilience posture as a
@@ -97,25 +100,31 @@ where
                             tracing::warn!(peer = %peer, error = ?err, "peer tls handshake failed");
                         }
                     },
-                    None => handle_peer_connection(node, stream, peer).await,
+                    None => handle_peer_connection(node, stream, peer, None).await,
                 }
             });
         }
     })
 }
 
-async fn handle_peer_connection<C, S>(node: Arc<ClusterNode<C>>, stream: S, peer: SocketAddr)
-where
+async fn handle_peer_connection<C, S>(
+    node: Arc<ClusterNode<C>>,
+    stream: S,
+    peer: SocketAddr,
+    certified_names: Option<Vec<String>>,
+) where
     C: Clock,
     S: AsyncRead + Unpin,
 {
-    handle_peer_connection_with_timeout(node, stream, peer, PEER_READ_TIMEOUT).await
+    handle_peer_connection_with_timeout(node, stream, peer, certified_names, PEER_READ_TIMEOUT)
+        .await
 }
 
 async fn handle_peer_connection_with_timeout<C, S>(
     node: Arc<ClusterNode<C>>,
     mut stream: S,
     peer: SocketAddr,
+    certified_names: Option<Vec<String>>,
     read_timeout: Duration,
 ) where
     C: Clock,
@@ -126,6 +135,18 @@ async fn handle_peer_connection_with_timeout<C, S>(
             tokio::time::timeout(read_timeout, read_message(&mut stream, node.secret())).await;
         match attempt {
             Ok(Ok(msg)) => {
+                if let Some(names) = &certified_names {
+                    if !names.contains(&msg.node_id) {
+                        tracing::warn!(
+                            peer = %peer,
+                            node_id = %msg.node_id,
+                            certificate_names = ?names,
+                            "peer sent a node_id its certificate does not name; dropped"
+                        );
+                        node.record_peer_sync(peer, "identity_mismatch");
+                        return;
+                    }
+                }
                 if node.merge_message(&msg) == MergeOutcome::OwnNodeIdEcho {
                     node.record_peer_sync(peer, "own_node_id");
                     tracing::error!(
@@ -361,6 +382,7 @@ mod tests {
             receiver,
             server_stream,
             peer_addr,
+            None,
             Duration::from_millis(50),
         )
         .await;
@@ -421,7 +443,8 @@ mod tests {
         ca_cert_path: &std::path::Path,
         ca: &TestCa,
     ) -> lb_core::PeerTlsConfig {
-        let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        let params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), stem.to_string()]).unwrap();
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &ca.cert, &ca.key).unwrap();
         let cert_path = dir.join(format!("{stem}.crt"));
@@ -514,10 +537,10 @@ mod tests {
         let ca_cert_path = dir.join("ca.crt");
         std::fs::write(&ca_cert_path, ca.cert.pem()).unwrap();
         let receiver_tls = Arc::new(
-            lb_tls::PeerTls::new(&peer_tls_config(&dir, "recv", &ca_cert_path, &ca)).unwrap(),
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "receiver", &ca_cert_path, &ca)).unwrap(),
         );
         let sender_tls = Arc::new(
-            lb_tls::PeerTls::new(&peer_tls_config(&dir, "send", &ca_cert_path, &ca)).unwrap(),
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "sender", &ca_cert_path, &ca)).unwrap(),
         );
 
         let (listener, addr) = bound_listener().await;
@@ -621,6 +644,58 @@ mod tests {
                 .total_in_window("web\u{1}victim", clock.unix_secs()),
             0,
             "an untrusted peer certificate managed to inject counter values"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_cannot_gossip_under_a_node_id_its_certificate_does_not_name() {
+        let clock = FakeClock::new();
+        let receiver = Arc::new(ClusterNode::new(
+            "receiver",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+        let impostor = Arc::new(ClusterNode::new(
+            "someone-else",
+            10,
+            clock.clone(),
+            SECRET.to_vec(),
+        ));
+
+        let dir = tmpdir();
+        let ca = TestCa::new();
+        let ca_cert_path = dir.join("ca.crt");
+        std::fs::write(&ca_cert_path, ca.cert.pem()).unwrap();
+        let receiver_tls = Arc::new(
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "receiver", &ca_cert_path, &ca)).unwrap(),
+        );
+        let impostor_tls = Arc::new(
+            lb_tls::PeerTls::new(&peer_tls_config(&dir, "honest", &ca_cert_path, &ca)).unwrap(),
+        );
+
+        let (listener, addr) = bound_listener().await;
+        let _srv = spawn_peer_listener(Arc::clone(&receiver), listener, Some(receiver_tls));
+
+        let coord = ListenerCoordinator::new(Arc::clone(&impostor), "web", 1_000);
+        for _ in 0..50 {
+            assert!(coord.try_admit("victim"));
+        }
+        let _sync = spawn_sync_loop(
+            Arc::clone(&impostor),
+            vec![addr],
+            Duration::from_millis(20),
+            Duration::from_millis(500),
+            Some(impostor_tls),
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            receiver
+                .store()
+                .total_in_window("web\u{1}victim", clock.unix_secs()),
+            0,
+            "a trusted certificate must not let its holder speak for another node_id"
         );
     }
 

@@ -49,7 +49,8 @@ fn peer_cert_files(
     let ca_cert_path = dir.join("ca.crt");
     std::fs::write(&ca_cert_path, ca_cert.pem()).unwrap();
 
-    let params = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+    let params =
+        rcgen::CertificateParams::new(vec!["127.0.0.1".to_string(), stem.to_string()]).unwrap();
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = params.signed_by(&key, ca_cert, ca_key).unwrap();
     let cert_path = dir.join(format!("{stem}.crt"));
@@ -273,10 +274,10 @@ async fn cluster_coordination_works_over_mutual_tls() {
     let traffic_b = free_addr().await;
 
     let (ca_cert, ca_key) = peer_ca();
-    let (ca_path_a, cert_a, key_a) = peer_cert_files("a", &ca_cert, &ca_key);
+    let (ca_path_a, cert_a, key_a) = peer_cert_files("lb-a", &ca_cert, &ca_key);
     // Every node's ca_file must point at the same CA; each node still gets
     // its own leaf cert/key, same as a real deployment would provision.
-    let (_ca_path_b, cert_b, key_b) = peer_cert_files("b", &ca_cert, &ca_key);
+    let (_ca_path_b, cert_b, key_b) = peer_cert_files("lb-b", &ca_cert, &ca_key);
 
     let config_a = Config::parse(&cluster_config_toml_with_tls(
         "lb-a",

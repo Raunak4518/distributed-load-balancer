@@ -17,7 +17,7 @@ pub use acme::{
 pub use certs::{load_certificate, LoadedCert};
 pub use connector::BackendConnector;
 pub use error::TlsError;
-pub use peer::PeerTls;
+pub use peer::{peer_certificate_names, PeerTls};
 pub use reload::{reload_once, spawn_reloader, FileStamp, ReloadReport};
 pub use resolver::{CertStore, SniResolver};
 pub use transport::BackendTlsTransport;
