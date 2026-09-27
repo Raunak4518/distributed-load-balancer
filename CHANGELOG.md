@@ -46,6 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gossip push metrics:** `lb_cluster_peer_push_total{peer,outcome}` and
+  `lb_cluster_last_successful_push_timestamp_seconds{peer}`.
 - **`retry_on_status`: retry listed 5xx responses on another backend** for
   idempotent requests, within the retry budget and request deadline. Empty by
   default.
@@ -98,6 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **One slow peer could stall gossip to every other peer.** Pushes went to
+  peers one at a time with no bound on the write, so an unreachable or stalled
+  peer delayed the whole round, or held it indefinitely. Pushes now run
+  concurrently (up to 16 at once), each bounded by twice the connect timeout.
 - **The admin listener had no connection limit or header timeout.** It now
   serves at most 64 connections at once and drops any that has not sent its
   request head within 5 seconds.

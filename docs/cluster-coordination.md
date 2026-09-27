@@ -143,7 +143,7 @@ This bound is tested empirically, not just asserted, by `lb-bench`'s cluster har
 ## Failure modes
 
 - **Dead peer.** No explicit health tracking exists for peers. A peer that stops responding simply stops contributing new cells; its last-known counts age out of the window on their own via `prune()`, exactly as if it had gone quiet gracefully.
-- **Unreachable peer during a push.** A connection failure to one peer during a sync round does not affect delivery to any other peer, and does not stop the sync loop — each peer is pushed to independently within the round.
+- **Unreachable or stalled peer during a push.** Each round pushes to every peer concurrently (at most 16 at a time) and waits for all of them, with each push bounded by twice the connect timeout. A peer that refuses, times out or stalls mid-handshake therefore delays nobody else and cannot hold the sync loop past that bound. Outcomes are counted per peer in `lb_cluster_peer_push_total`, and `lb_cluster_last_successful_push_timestamp_seconds` shows how fresh each peer's copy of this node's counts is.
 - **Malformed or unauthenticated frame.** Closes only that one connection; the peer listener keeps serving every other connection.
 - **Duplicate `node_id`.** Detected and logged loudly (see above) rather than silently corrupting shared state; the message is not merged.
 - **Full partition.** Covered above — each side keeps enforcing its own local view, and the combined total can exceed the nominal limit for the partition's duration; this is a known, accepted property of the model, not a defect.

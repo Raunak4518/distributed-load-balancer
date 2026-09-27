@@ -26,8 +26,8 @@ because every later phase builds on the guarantees of the earlier ones.
 ### Cluster
 - [x] Changed keys gossiped first; documented convergence bound
 - [x] Gossip `node_id` bound to the peer certificate under `[cluster.tls]`
-- [ ] Push to peers concurrently with a bounded fan-out
-- [ ] Convergence metrics (last successful sync per peer, snapshot size/pages)
+- [x] Push to peers concurrently with a bounded fan-out
+- [x] Convergence metrics (last successful sync per peer, snapshot size/pages)
 - [ ] Node incarnation (boot generation) so a restarted node's stale counts are superseded, not maxed
 - [ ] Documented semantics for replay, duplicates, clock skew/rollback, partition and rejoin (with tests)
 

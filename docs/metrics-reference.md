@@ -133,6 +133,18 @@ Labels: `peer`, `outcome`.
 
 Incremented once per message or connection outcome on the gossip receive path ([`gossip.rs`](../crates/lb-cluster/src/gossip.rs)). `outcome` is `merged` (an authenticated message was applied), `own_node_id` (a peer announced this node's own `node_id`), `auth_failed` (the HMAC tag did not verify), `identity_mismatch` (with `[cluster.tls]`, the message's `node_id` is not named by the peer's certificate), `bad_frame` (a malformed or oversized frame) or `timeout` (no complete frame within the read timeout). A peer closing its connection after pushing is a normal end of stream and is not counted. `peer` is the sender's IP when it is one of the configured `cluster.peers`, and `unknown` otherwise, so connections from arbitrary addresses cannot grow the label set.
 
+### `lb_cluster_peer_push_total` — counter
+
+Labels: `peer`, `outcome`.
+
+Incremented once per outbound push of this node's counters to a peer ([`gossip.rs`](../crates/lb-cluster/src/gossip.rs)). `outcome` is `ok` (the frame was written and the connection closed cleanly), `failed` (connect, TLS handshake or write error) or `timeout` (the push did not finish within twice the connect timeout). `peer` follows the same bounded rule as `lb_cluster_peer_sync_total`.
+
+### `lb_cluster_last_successful_push_timestamp_seconds` — gauge
+
+Labels: `peer`.
+
+Unix time of the last `ok` push to that peer. `time() - lb_cluster_last_successful_push_timestamp_seconds` is how stale that peer's view of this node's counts can be; alert when it exceeds a few sync intervals.
+
 ### `lb_cluster_auth_failures_total` — counter
 
 Labels: `peer`.
