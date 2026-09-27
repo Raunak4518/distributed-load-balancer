@@ -3,6 +3,7 @@ pub mod cache;
 pub mod forward;
 pub mod forwarded;
 pub mod gate;
+pub mod headers;
 pub mod per_backend;
 pub mod resolver;
 pub mod service;
@@ -18,6 +19,7 @@ pub use forward::{
 };
 pub use forwarded::ForwardedHeaders;
 pub use gate::{BackendGate, GateRefusal, UpstreamLimits};
+pub use headers::{HeaderEdits, HeaderRewrite};
 pub use per_backend::PerBackendClients;
 pub use resolver::PinnedResolver;
 pub use service::{handle, AccessLog, CompiledCanaryPool, CompiledRoute, ProxyBody, ProxyContext};

@@ -335,6 +335,7 @@ fn build_ctx(
         backend_gates: lb_core::BackendMap::new(),
         adaptive: None,
         slow_start: None,
+        headers: None,
         forwarded: None,
         adaptive_limits: lb_core::BackendMap::new(),
         max_request_body_bytes: 1024 * 1024,

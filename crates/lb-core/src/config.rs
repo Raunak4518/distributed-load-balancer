@@ -1,7 +1,7 @@
 use crate::error::ConfigError;
 use crate::http2::Http2Config;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -358,6 +358,8 @@ pub struct ListenerConfig {
     pub local_zone: Option<String>,
     #[serde(default)]
     pub forwarded: Option<ForwardedConfig>,
+    #[serde(default)]
+    pub headers: Option<HeaderRewriteConfig>,
     /// Caps how long a WebSocket (or other `Upgrade`) connection may sit
     /// idle after the backend accepts the handshake -- the request-shaped
     /// timeouts above (`forward_timeout_ms`, body read/write) stop applying
@@ -502,6 +504,57 @@ pub struct ListenerConfig {
 
     #[serde(default)]
     pub adaptive_concurrency: Option<AdaptiveConcurrencyConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderRewriteConfig {
+    #[serde(default)]
+    pub request_set: BTreeMap<String, String>,
+    #[serde(default)]
+    pub request_remove: Vec<String>,
+    #[serde(default)]
+    pub response_set: BTreeMap<String, String>,
+    #[serde(default)]
+    pub response_remove: Vec<String>,
+}
+
+const FRAMING_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
+    "keep-alive",
+    "proxy-connection",
+];
+
+impl HeaderRewriteConfig {
+    fn validate(&self) -> Result<(), String> {
+        let sets = self.request_set.iter().chain(&self.response_set);
+        for (name, value) in sets {
+            check_rewritable_header(name)?;
+            http::HeaderValue::from_str(value)
+                .map_err(|_| format!("headers: invalid value for '{name}'"))?;
+        }
+        for name in self.request_remove.iter().chain(&self.response_remove) {
+            check_rewritable_header(name)?;
+        }
+        Ok(())
+    }
+}
+
+fn check_rewritable_header(name: &str) -> Result<(), String> {
+    let parsed = http::HeaderName::from_bytes(name.as_bytes())
+        .map_err(|_| format!("headers: '{name}' is not a valid header name"))?;
+    if FRAMING_HEADERS.contains(&parsed.as_str()) {
+        return Err(format!(
+            "headers: '{name}' controls message framing or routing and cannot be rewritten"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -1488,6 +1541,9 @@ impl ListenerConfig {
 
         match self.protocol {
             Protocol::Http => {
+                if let Some(headers) = &self.headers {
+                    headers.validate().map_err(invalid)?;
+                }
                 if self.health_check.path.is_none() {
                     return Err(invalid(
                         "health_check.path is required for http listeners".into(),
@@ -1667,6 +1723,9 @@ impl ListenerConfig {
                 }
                 if self.upstream_limits.is_some() {
                     return Err(invalid("upstream_limits is an http-only setting".into()));
+                }
+                if self.headers.is_some() {
+                    return Err(invalid("headers is an http-only setting".into()));
                 }
                 if self.forwarded.is_some() {
                     return Err(invalid(
@@ -1980,6 +2039,35 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(cfg.listeners[0].local_zone.as_deref(), Some("eu-1"));
+    }
+
+    #[test]
+    fn header_rewrites_parse_and_refuse_framing_headers() {
+        let with = |body: &str| {
+            VALID.replacen(
+                "        [listeners.load_balancing]",
+                &format!(
+                    "        [listeners.headers]\n{body}\n\n        [listeners.load_balancing]"
+                ),
+                1,
+            )
+        };
+        let cfg = Config::parse(&with(
+            "        request_set = { \"x-env\" = \"prod\" }\n        response_remove = [\"server\"]",
+        ))
+        .unwrap();
+        let headers = cfg.listeners[0].headers.as_ref().unwrap();
+        assert_eq!(headers.request_set["x-env"], "prod");
+        assert_eq!(headers.response_remove, vec!["server".to_string()]);
+        for bad in [
+            "        request_set = { \"Content-Length\" = \"5\" }",
+            "        request_remove = [\"host\"]",
+            "        response_set = { \"transfer-encoding\" = \"chunked\" }",
+            "        request_set = { \"bad name\" = \"x\" }",
+            "        request_set = { \"x-ok\" = \"line\\nbreak\" }",
+        ] {
+            assert!(Config::parse(&with(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]
