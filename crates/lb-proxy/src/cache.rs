@@ -14,7 +14,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use hyper::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, HOST, SET_COOKIE, VARY,
+    ACCEPT_ENCODING, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, HOST, PRAGMA, SET_COOKIE, VARY,
 };
 use hyper::{HeaderMap, Method, StatusCode, Uri};
 use lb_core::Clock;
@@ -82,6 +82,33 @@ pub fn request_is_cacheable(method: &Method, headers: &HeaderMap) -> bool {
     *method == Method::GET
         && !headers.contains_key(AUTHORIZATION)
         && !crate::upgrade::is_upgrade_request(headers)
+}
+
+pub fn request_wants_a_fresh_response(headers: &HeaderMap) -> bool {
+    let mut has_cache_control = false;
+    for value in headers.get_all(CACHE_CONTROL) {
+        has_cache_control = true;
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        for directive in value.split(',') {
+            let directive = directive.trim().to_ascii_lowercase();
+            if directive == "no-cache"
+                || directive
+                    .strip_prefix("max-age=")
+                    .is_some_and(|secs| parse_seconds(secs) == Some(0))
+            {
+                return true;
+            }
+        }
+    }
+    !has_cache_control
+        && headers
+            .get_all(PRAGMA)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .any(|d| d.trim().eq_ignore_ascii_case("no-cache"))
 }
 
 fn varies_only_on_accept_encoding(headers: &HeaderMap) -> bool {

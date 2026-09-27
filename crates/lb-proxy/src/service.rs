@@ -649,7 +649,12 @@ where
         .filter(|_| cache::request_is_cacheable(req.method(), req.headers()))
         .map(|_| cache::key_for(req.method(), req.uri(), req.headers()));
     if let (Some(cache), Some(key)) = (&ctx.cache, &cache_key) {
-        if let Some(cached) = cache.get(key) {
+        let cached = if cache::request_wants_a_fresh_response(req.headers()) {
+            None
+        } else {
+            cache.get(key)
+        };
+        if let Some(cached) = cached {
             ctx.metrics.cache_hit.inc();
             let (mut parts, _) = Response::new(()).into_parts();
             parts.status = cached.status;
@@ -3460,6 +3465,36 @@ mod tests {
         assert_eq!(backend_hits(&count), 3);
         cache_send_with(addr, "/a", &[]).await;
         assert_eq!(backend_hits(&count), 3);
+    }
+
+    #[tokio::test]
+    async fn a_client_asking_for_a_fresh_response_is_not_answered_from_the_cache() {
+        let (addr, count) = cached_proxy("hello", &[], test_cache(), None).await;
+        cache_send_with(addr, "/a", &[]).await;
+        cache_send_with(addr, "/a", &[]).await;
+        assert_eq!(backend_hits(&count), 1);
+        let mut hits = 1;
+        for headers in [
+            &[("cache-control", "no-cache")][..],
+            &[("cache-control", "max-age=0")][..],
+            &[("pragma", "no-cache")][..],
+        ] {
+            cache_send_with(addr, "/a", headers).await;
+            hits += 1;
+            assert_eq!(
+                backend_hits(&count),
+                hits,
+                "{headers:?} must reach the backend"
+            );
+        }
+        cache_send_with(addr, "/a", &[("cache-control", "max-age=60")]).await;
+        cache_send_with(
+            addr,
+            "/a",
+            &[("pragma", "no-cache"), ("cache-control", "max-age=60")],
+        )
+        .await;
+        assert_eq!(backend_hits(&count), hits);
     }
 
     #[tokio::test]
