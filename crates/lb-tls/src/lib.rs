@@ -1,5 +1,6 @@
 mod acceptor;
 mod acme;
+mod admin;
 mod certs;
 mod connector;
 mod error;
@@ -14,6 +15,7 @@ pub use acme::{
     obtain_certificate_http01, renew_once, retry_issuance, spawn_acme_renewer, AcmeChallengeStore,
     AcmeError, AcmeRetryPolicy, AcmeTrust,
 };
+pub use admin::AdminTls;
 pub use certs::{load_certificate, LoadedCert};
 pub use connector::BackendConnector;
 pub use error::TlsError;

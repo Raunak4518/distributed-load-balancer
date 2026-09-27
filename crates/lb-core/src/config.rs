@@ -48,9 +48,26 @@ pub struct AdminConfig {
     pub read_token: Option<String>,
     #[serde(default)]
     pub allow_unauthenticated: bool,
+    #[serde(default)]
+    pub tls: Option<AdminTlsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminTlsConfig {
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    #[serde(default)]
+    pub client_ca_file: Option<PathBuf>,
 }
 
 impl AdminConfig {
+    pub fn requires_client_certificates(&self) -> bool {
+        self.tls
+            .as_ref()
+            .is_some_and(|tls| tls.client_ca_file.is_some())
+    }
+
     /// Resolves the admin bearer token.
     ///
     /// Unlike `ClusterConfig::resolve_secret`, `Ok(None)` (neither field set)
@@ -1112,11 +1129,13 @@ impl Config {
             if !admin.listen.ip().to_canonical().is_loopback()
                 && admin.token_env.is_none()
                 && admin.token.is_none()
+                && !admin.requires_client_certificates()
                 && !admin.allow_unauthenticated
             {
                 return Err(ConfigError::Invalid(format!(
-                    "admin.listen {} is not a loopback address, so the admin API needs a \
-                     token: set admin.token_env (or admin.token), or set \
+                    "admin.listen {} is not a loopback address, so the admin API needs \
+                     authentication: set admin.token_env (or admin.token), require client \
+                     certificates with [admin.tls] client_ca_file, or set \
                      admin.allow_unauthenticated = true to accept an open admin port",
                     admin.listen
                 )));
@@ -2516,6 +2535,14 @@ mod tests {
             "listen = \"0.0.0.0:9100\"\nallow_unauthenticated = true",
         ))
         .unwrap();
+        Config::parse(&with_admin(
+            "listen = \"0.0.0.0:9100\"\n[admin.tls]\ncert_file = \"a.pem\"\nkey_file = \"k.pem\"\nclient_ca_file = \"ca.pem\"",
+        ))
+        .unwrap();
+        assert!(Config::parse(&with_admin(
+            "listen = \"0.0.0.0:9100\"\n[admin.tls]\ncert_file = \"a.pem\"\nkey_file = \"k.pem\"",
+        ))
+        .is_err());
     }
 
     #[test]

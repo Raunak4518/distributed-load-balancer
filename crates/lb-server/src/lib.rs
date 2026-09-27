@@ -74,6 +74,27 @@ pub async fn run_and_report_reload_handle(
         })?,
         None => None,
     };
+    let admin_tls = match config.admin.as_ref().and_then(|a| a.tls.as_ref()) {
+        Some(tls) => Some(Arc::new(
+            lb_tls::AdminTls::new(
+                &tls.cert_file,
+                &tls.key_file,
+                tls.client_ca_file.as_deref(),
+                Duration::from_secs(5),
+            )
+            .map_err(|err| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("admin listener could not load its TLS material: {err}"),
+                )
+            })?,
+        )),
+        None => None,
+    };
+    let admin_mtls = config
+        .admin
+        .as_ref()
+        .is_some_and(|a| a.requires_client_certificates());
     let admin_read_token = match config.admin.as_ref() {
         Some(a) => a.resolve_read_token().map_err(|err| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
@@ -173,8 +194,8 @@ pub async fn run_and_report_reload_handle(
         // a gap and a zero must not look identical to an alert.
         metrics
             .admin_auth_disabled
-            .set(admin_token.is_none() as i64);
-        if admin_token.is_none() {
+            .set((admin_token.is_none() && !admin_mtls) as i64);
+        if admin_token.is_none() && !admin_mtls {
             tracing::warn!(
                 "admin listener has no token configured -- metrics, health, and backend \
                  drain/undrain are reachable by anyone who can reach this port"
@@ -197,6 +218,17 @@ pub async fn run_and_report_reload_handle(
             admin_token.map(|t| Arc::from(t.into_boxed_slice())),
             lb_metrics::AdminOptions {
                 read_only_token: admin_read_token.map(|t| Arc::from(t.into_boxed_slice())),
+                acceptor: admin_tls.map(|tls| -> lb_metrics::AdminAcceptor {
+                    Arc::new(move |stream| {
+                        let tls = Arc::clone(&tls);
+                        Box::pin(async move {
+                            tls.accept(stream)
+                                .await
+                                .ok()
+                                .map(|s| Box::new(s) as Box<dyn lb_metrics::AdminIo>)
+                        })
+                    })
+                }),
                 ..lb_metrics::AdminOptions::default()
             },
         ));

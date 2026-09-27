@@ -15,11 +15,22 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
-#[derive(Clone, Debug)]
+pub trait AdminIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AdminIo for T {}
+
+pub type AdminAcceptor = Arc<
+    dyn Fn(tokio::net::TcpStream) -> Pin<Box<dyn Future<Output = Option<Box<dyn AdminIo>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
 pub struct AdminOptions {
     pub max_connections: usize,
     pub header_read_timeout: Duration,
     pub read_only_token: Option<Arc<[u8]>>,
+    pub acceptor: Option<AdminAcceptor>,
 }
 
 impl Default for AdminOptions {
@@ -28,6 +39,7 @@ impl Default for AdminOptions {
             max_connections: 64,
             header_read_timeout: Duration::from_secs(5),
             read_only_token: None,
+            acceptor: None,
         }
     }
 }
@@ -110,6 +122,7 @@ pub fn spawn_admin_server_with_options(
     let slots = Arc::new(tokio::sync::Semaphore::new(options.max_connections));
     let header_read_timeout = options.header_read_timeout;
     let read_only_token = options.read_only_token;
+    let acceptor = options.acceptor;
     tokio::spawn(async move {
         loop {
             let Ok(permit) = Arc::clone(&slots).acquire_owned().await else {
@@ -118,7 +131,7 @@ pub fn spawn_admin_server_with_options(
             let Ok((stream, peer)) = listener.accept().await else {
                 continue;
             };
-            let io = TokioIo::new(stream);
+            let acceptor = acceptor.clone();
             let metrics = Arc::clone(&metrics);
             let readiness = Arc::clone(&readiness);
             let extension = extension.clone();
@@ -126,6 +139,14 @@ pub fn spawn_admin_server_with_options(
             let read_only_token = read_only_token.clone();
             tokio::spawn(async move {
                 let _permit = permit;
+                let io: Box<dyn AdminIo> = match &acceptor {
+                    Some(accept) => match accept(stream).await {
+                        Some(io) => io,
+                        None => return,
+                    },
+                    None => Box::new(stream),
+                };
+                let io = TokioIo::new(io);
                 let svc = service_fn(move |req| {
                     let metrics = Arc::clone(&metrics);
                     let readiness = Arc::clone(&readiness);
@@ -453,6 +474,7 @@ mod tests {
             max_connections: 8,
             header_read_timeout: Duration::from_millis(200),
             read_only_token: None,
+            acceptor: None,
         })
         .await;
         let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -476,6 +498,7 @@ mod tests {
             max_connections: 1,
             header_read_timeout: Duration::from_secs(30),
             read_only_token: None,
+            acceptor: None,
         })
         .await;
         let holder = tokio::net::TcpStream::connect(addr).await.unwrap();
