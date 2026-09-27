@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Slow start: `slow_start_ms`.** A backend that recovers, is undrained or
+  is newly discovered ramps from 10% to 100% of its share over the window,
+  for every load-balancing strategy.
 - **Adaptive per-backend concurrency: `[listeners.adaptive_concurrency]`.**
   Each backend gets an in-flight limit learned from its latency (Gradient2):
   it grows while latency holds steady and shrinks when latency rises or

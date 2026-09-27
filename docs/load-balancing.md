@@ -21,6 +21,10 @@ If `health_check.max_ejected_fraction` is configured, a circuit trip or outlier 
 
 Source: [`pool.rs`](../crates/lb-core/src/pool.rs), [`balancer.rs`](../crates/lb-core/src/balancer.rs).
 
+## Slow Start
+
+With `slow_start_ms` set, a backend that has just become eligible again is not handed its full share at once. That covers: recovered health checks, a closed circuit, an outlier un-ejection, an operator undrain, or a backend newly added by DNS discovery passing its first probe. The pool stamps the moment it becomes eligible. For the next `slow_start_ms`, each time the strategy picks it, the proxy keeps it with a probability rising linearly from 10% to 100%, and otherwise asks the strategy for a different backend, falling back to the warming one if there is none. This sits outside the strategies, so it works the same for all of them. Sticky pins are exempt, and backends that were present at startup begin fully warm, so a restart does not throttle the whole pool.
+
 ## Selection Strategies
 
 All five strategies implement the same `LoadBalancer` trait: `pick(pool, key) -> Option<BackendId>`, plus an optional `record_latency(id, latency)` hook called after every attempt (success or failure) — only Peak EWMA + P2C uses it. `key` is whatever the listener's `rate_limit.key` already resolves to for that request (`source_ip`, or the configured request header) — passed straight through rather than separately configured, so a listener's existing identity choice doubles as its hashing/affinity identity for strategies that need one.

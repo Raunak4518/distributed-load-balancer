@@ -47,7 +47,7 @@ because every later phase builds on the guarantees of the earlier ones.
 - [x] Per-backend in-flight request limit with a bounded wait queue, queue-time metric, overflow to another backend
 - [x] Overload manager: memory/FD/connection pressure → staged shedding levels
 - [x] Adaptive concurrency limit per backend (gradient-based)
-- [ ] Slow start / warm-up for recovered and newly added backends
+- [x] Slow start / warm-up for recovered and newly added backends
 - [ ] Priority failover and backup pools; locality/zone-aware selection
 - [ ] Maglev and rendezvous (HRW) hashing; hash-movement measurement
 - [ ] Random, P2C least-request, weighted random strategies
