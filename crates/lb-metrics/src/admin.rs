@@ -192,7 +192,7 @@ async fn route(
     let path = req.uri().path().to_string();
     // Checked before anything else, so every route below except `/healthz`
     // and `/ready` (including `extension`'s, which owns everything under
-    // /backends) is covered by one check instead of needing its own. A
+    // /backends and /cache) is covered by one check instead of needing its own. A
     // byte-wise `==` here would leak how much of the presented token matched
     // through timing -- the same concern `lb-cluster`'s gossip HMAC check
     // already guards against -- hence `ConstantTimeEq` rather than a plain
@@ -266,7 +266,7 @@ async fn dispatch(
     // the body, e.g. for a future write endpoint) without first needing it
     // back to fall through -- there is nothing to fall through to once a
     // path is recognized as the extension's own.
-    if req.uri().path().starts_with("/backends") {
+    if req.uri().path().starts_with("/backends") || req.uri().path().starts_with("/cache") {
         return match extension {
             Some(ext) => ext(req).await,
             None => text(StatusCode::NOT_FOUND, "not found".to_string()),

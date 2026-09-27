@@ -106,6 +106,59 @@ async fn a_repeated_get_is_served_from_cache_without_a_second_backend_hit() {
     );
 }
 
+#[tokio::test]
+async fn a_purged_path_is_fetched_from_the_backend_again() {
+    let (backend, count) = support::spawn_counting_backend(StatusCode::OK).await;
+    let admin = free_addr().await;
+    let listen = free_addr().await;
+    let config = Config::parse(&cache_config_toml(admin, &listen.to_string(), backend)).unwrap();
+    tokio::spawn(lb_server::run(config, None));
+    support::wait_until_listening(listen).await;
+    support::wait_until_listening(admin).await;
+
+    let client = reqwest::Client::new();
+    let fetch = |path: &'static str| {
+        let client = client.clone();
+        async move {
+            let resp = client
+                .get(format!("http://{listen}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    };
+    fetch("/docs/a").await;
+    fetch("/other").await;
+    fetch("/docs/a").await;
+    fetch("/other").await;
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+
+    let purge = client
+        .post(format!("http://{admin}/cache/web/purge?path_prefix=/docs"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(purge.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&purge.text().await.unwrap()).unwrap();
+    assert_eq!(body["purged"], 1);
+
+    fetch("/docs/a").await;
+    fetch("/other").await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        3,
+        "only the purged path goes back to the backend"
+    );
+
+    let missing = client
+        .post(format!("http://{admin}/cache/nope/purge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
 /// A listener with no `[listeners.cache]` section behaves exactly as every
 /// other feature this session added when its own config section is absent:
 /// every request reaches the backend, and the cache result counters (always

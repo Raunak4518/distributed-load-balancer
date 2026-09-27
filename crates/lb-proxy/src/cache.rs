@@ -340,6 +340,24 @@ impl<C: Clock> ResponseCache<C> {
         }
     }
 
+    pub fn purge(&self, host: Option<&str>, path_prefix: Option<&str>) -> usize {
+        let matching: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| key_matches(e.key(), host, path_prefix))
+            .map(|e| e.key().clone())
+            .collect();
+        let mut purged = 0;
+        for key in matching {
+            if let Some((_, removed)) = self.entries.remove(&key) {
+                self.total_bytes
+                    .fetch_sub(removed.accounted_size, Ordering::Relaxed);
+                purged += 1;
+            }
+        }
+        purged
+    }
+
     fn remove_expired(&self, key: &str, now: Instant) {
         if let Some((_, removed)) = self
             .entries
@@ -367,6 +385,20 @@ impl<C: Clock> ResponseCache<C> {
             self.remove_expired(&key, now);
         }
     }
+}
+
+fn key_matches(key: &str, host: Option<&str>, path_prefix: Option<&str>) -> bool {
+    let mut fields = key.splitn(3, '|');
+    let (Some(_method), Some(key_host), Some(rest)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return false;
+    };
+    let host_ok = host.is_none_or(|h| h.eq_ignore_ascii_case(key_host));
+    let path_ok = path_prefix.is_none_or(|prefix| {
+        rest.strip_prefix(prefix)
+            .is_some_and(|tail| tail.is_empty() || tail.starts_with(['/', '?', '|']))
+    });
+    host_ok && path_ok
 }
 
 /// Runs `cache.sweep_expired()` on `interval` for as long as the listener
@@ -785,6 +817,41 @@ mod tests {
         assert_eq!(cache.evictions(), 2);
         assert!(cache.accounted_bytes() <= entry * 10);
         assert_accounting_matches_entries(&cache);
+    }
+
+    #[test]
+    fn purge_removes_only_entries_matching_the_host_and_whole_path_segments() {
+        let cache = ResponseCache::new(1024, 1 << 20, Duration::from_secs(60), FakeClock::new());
+        let get = Method::GET;
+        let key = |host: &str, path: &str| {
+            key_for(
+                &get,
+                &path.parse::<Uri>().unwrap(),
+                &headers_with(&[("host", host)]),
+            )
+        };
+        for (host, path) in [
+            ("a.example", "/api"),
+            ("a.example", "/api/users?page=2"),
+            ("a.example", "/apiary"),
+            ("b.example", "/api/users"),
+        ] {
+            cache.put(
+                key(host, path),
+                StatusCode::OK,
+                HeaderMap::new(),
+                Bytes::from_static(b"x"),
+                Duration::from_secs(60),
+            );
+        }
+        assert_eq!(cache.purge(Some("A.example"), Some("/api")), 2);
+        assert!(cache.get(&key("a.example", "/api")).is_none());
+        assert!(cache.get(&key("a.example", "/api/users?page=2")).is_none());
+        assert!(cache.get(&key("a.example", "/apiary")).is_some());
+        assert!(cache.get(&key("b.example", "/api/users")).is_some());
+        assert_accounting_matches_entries(&cache);
+        assert_eq!(cache.purge(None, None), 2);
+        assert_eq!(cache.accounted_bytes(), 0);
     }
 
     #[test]

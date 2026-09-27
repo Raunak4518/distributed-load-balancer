@@ -100,6 +100,9 @@ fn handle(req: &Request<Incoming>, reload: &ReloadState) -> Response<Full<Bytes>
     }
 
     if req.method() == Method::POST {
+        if let ["cache", listener, "purge"] = segments.as_slice() {
+            return purge_cache(reload, listener, req.uri().query());
+        }
         if let [_, listener, id, action] = segments.as_slice() {
             match *action {
                 "drain" => return set_drain(reload, listener, id, true),
@@ -172,6 +175,40 @@ fn set_drain(reload: &ReloadState, listener: &str, id: &str, drain: bool) -> Res
             "listener": listener,
             "backend": id,
             "manually_drained": drain,
+        }),
+    )
+}
+
+fn purge_cache(reload: &ReloadState, listener: &str, query: Option<&str>) -> Response<Full<Bytes>> {
+    let Some(ListenerReloadHandle::Http(ctx)) = reload.listeners.get(listener) else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": format!("no such http listener '{listener}'")}),
+        );
+    };
+    let Some(cache) = ctx.load().cache.clone() else {
+        return json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"error": format!("listener '{listener}' has no cache")}),
+        );
+    };
+    let param = |name: &str| {
+        query?
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value.to_string())
+    };
+    let host = param("host");
+    let path_prefix = param("path_prefix");
+    let purged = cache.purge(host.as_deref(), path_prefix.as_deref());
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "listener": listener,
+            "host": host,
+            "path_prefix": path_prefix,
+            "purged": purged,
         }),
     )
 }
