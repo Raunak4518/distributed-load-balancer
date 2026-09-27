@@ -87,7 +87,7 @@ An in-memory, listener-scoped cache that answers a repeated request straight fro
 
 An entry is only stored, and only served, under all of the following:
 
-- **Request**: only a `GET` with no `Authorization` header that is not a WebSocket/`Upgrade` handshake. Any other request bypasses the cache in both directions: it is never answered from the cache and its response is never stored. Skipping authenticated requests follows RFC 9111 §3.5 for shared caches; skipping upgrade handshakes guarantees a stored plain `GET` can never prevent an upgrade on the same URL.
+- **Request**: only a `GET` with no `Authorization` header that is not a WebSocket/`Upgrade` handshake. Any other request bypasses the cache in both directions: it is never answered from the cache and its response is never stored. Skipping authenticated requests follows RFC 9111 §3.5 for shared caches; skipping upgrade handshakes guarantees a stored plain `GET` can never prevent an upgrade on the same URL. A cacheable request that carries `Cache-Control: no-cache` or `max-age=0` — or, with no `Cache-Control` header at all, `Pragma: no-cache` — is never answered from the cache: it goes to the backend, and its response may replace the stored entry (this is what a browser's hard reload sends).
 - **Status**: only `200 OK`. Any other status is never cached.
 - **Content-Length**: the response must declare an explicit `Content-Length`, and it must be within the cache's `max_entry_bytes`. A chunked or unknown-length response is never cached — its length can't be checked before the body is fully read, and buffering an unbounded body to find out would defeat the size cap it's trying to enforce.
 - **`Set-Cookie`**: a response that sets a cookie is never stored, so one client's cookie is never replayed to another.
@@ -132,6 +132,7 @@ A background task runs `sweep_expired()` on a fixed interval for the life of the
 - **The load balancer's own sticky cookie is never stored.** The cache decision and body buffering happen before the sticky `Set-Cookie` is added to the outgoing response.
 - **No revalidation.** `ETag`, `Last-Modified` and conditional requests are not supported: a conditional request that hits the cache receives the full stored `200` rather than a `304`, and an expired entry is refetched rather than revalidated.
 - **No eviction.** See above; a full cache admits nothing new until entries expire.
+- **Hits bypass pool selection.** The cache is consulted before route matching, the canary split and the sticky pin, so a hit is served without choosing a pool. A canary pool's configured `percent` therefore applies to cache misses only, and a response stored from one pool can be served to clients the split would have sent to the other. Keep canary-sensitive paths out of the cache with `Cache-Control: no-store` or `private` from the backend.
 
 ### Configuration
 
@@ -176,11 +177,13 @@ Sources: [`compression.rs`](../crates/lb-server/src/compression.rs), [`lib.rs`](
 
 A request is treated as a protocol-upgrade request when its `Connection` header contains an `upgrade` token (case-insensitive, comma-separated — a client may send `Connection: keep-alive, Upgrade`) **and** its `Upgrade` header names something non-empty. Detection is generic, not specific to `websocket`: any HTTP/1.1 `Upgrade` request takes this path. An HTTP/2 client connection has no `Upgrade` header semantics and is naturally excluded rather than specially guarded against.
 
-This check runs after rate limiting, the WAF, the response-cache lookup, and route resolution, and before the body read, the sticky pin, and the retry loop — none of which apply to a connection that is about to stop being ordinary HTTP.
+This check runs after rate limiting, the WAF, the response-cache lookup, and route resolution, and before the body read and the ordinary retry loop — neither of which applies to a connection that is about to stop being ordinary HTTP. The sticky pin does apply, as described below.
 
 The response cache never answers an upgrade handshake, even for a URL whose plain `GET` response is cached; see [response caching](#what-is-cacheable).
 
 ### Dedicated, non-pooled backend connection
+
+The backend is chosen the same way as for an ordinary request: a valid sticky-session cookie naming an eligible backend in the selected pool is honored first, otherwise the balancer picks. If connecting to that backend (TCP, TLS, or the HTTP/1.1 client handshake) fails or times out, one other backend is tried; nothing from the client has been sent at that point, so the retry is invisible to it. Once the upgrade request has been sent there is no retry, and a backend that answers with anything other than `101` has its response relayed as-is.
 
 A WebSocket or other upgraded connection counts as one in-flight connection against its backend for its whole life, the same accounting an ordinary request gets for its duration, so `least_connections`, `peak_ewma_p2c`'s pending-load signal, the passive `unhealthy_request_count` threshold and `GET /backends`' `active_conns` all see long-lived WebSocket sessions.
 
@@ -188,7 +191,7 @@ The upgrade path dials its own one-off HTTP/1.1 connection to the backend direct
 
 Request headers (`Connection`, `Upgrade`, `Sec-WebSocket-*`, etc.) are forwarded to the backend **verbatim** — `strip_hop_by_hop` is deliberately not applied on this path, since those are exactly the headers the backend needs intact to answer the handshake.
 
-v1 scope is HTTP/1.1 only on both legs: an h2 client's own upgrade mechanism (RFC 8441 extended CONNECT) is a materially different bootstrapping protocol and is not implemented. There is also no retry: one backend is picked and one attempt is made — unlike the ordinary request path's 2-attempt retry loop.
+v1 scope is HTTP/1.1 only on both legs: an h2 client's own upgrade mechanism (RFC 8441 extended CONNECT) is a materially different bootstrapping protocol and is not implemented. Retry is limited to connection failures, as described above.
 
 ### 101 relay
 

@@ -131,7 +131,7 @@ The only cluster-gossip counter that is actually wired up. Incremented in `Count
 
 Labels: `peer`, `outcome`.
 
-Incremented once per message or connection outcome on the gossip receive path ([`gossip.rs`](../crates/lb-cluster/src/gossip.rs)). `outcome` is `merged` (an authenticated message was applied), `own_node_id` (a peer announced this node's own `node_id`), `auth_failed` (the HMAC tag did not verify), `bad_frame` (a malformed or oversized frame) or `timeout` (no complete frame within the read timeout). A peer closing its connection after pushing is a normal end of stream and is not counted. `peer` is the sender's IP when it is one of the configured `cluster.peers`, and `unknown` otherwise, so connections from arbitrary addresses cannot grow the label set.
+Incremented once per message or connection outcome on the gossip receive path ([`gossip.rs`](../crates/lb-cluster/src/gossip.rs)). `outcome` is `merged` (an authenticated message was applied), `own_node_id` (a peer announced this node's own `node_id`), `auth_failed` (the HMAC tag did not verify), `identity_mismatch` (with `[cluster.tls]`, the message's `node_id` is not named by the peer's certificate), `bad_frame` (a malformed or oversized frame) or `timeout` (no complete frame within the read timeout). A peer closing its connection after pushing is a normal end of stream and is not counted. `peer` is the sender's IP when it is one of the configured `cluster.peers`, and `unknown` otherwise, so connections from arbitrary addresses cannot grow the label set.
 
 ### `lb_cluster_auth_failures_total` — counter
 

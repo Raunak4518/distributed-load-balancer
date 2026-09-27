@@ -33,7 +33,7 @@ Because the unit hardcodes `/etc/lb-server/config.toml`, that is where a config 
 
 ### Manual install
 
-[`scripts/install.sh`](../scripts/install.sh) downloads the release tarball for the running OS/architecture (Linux musl or macOS, `x86_64`/`aarch64`) from the latest (or `$VERSION`-pinned) GitHub release and installs the single binary to `$INSTALL_DIR` (default `/usr/local/bin`). It does not install the systemd unit or a config file — pair it with a config of your own and, on Linux, the unit above if you want it supervised.
+[`scripts/install.sh`](../scripts/install.sh) downloads the release tarball for the running OS/architecture (Linux musl or macOS, `x86_64`/`aarch64`) from the latest (or `$VERSION`-pinned) GitHub release and installs the single binary to `$INSTALL_DIR` (default `/usr/local/bin`). Before extracting it, the script downloads the release's `SHA256SUMS` file and checks the tarball against it, aborting on a mismatch; a release without `SHA256SUMS` (v0.3.0 and earlier) is refused unless `ALLOW_UNVERIFIED=1` is set. Every release publishes `SHA256SUMS` covering its tarballs, `.deb` and `.rpm` packages, so the same check works by hand with `sha256sum -c --ignore-missing SHA256SUMS`. It does not install the systemd unit or a config file — pair it with a config of your own and, on Linux, the unit above if you want it supervised.
 
 ## Command-line interface
 

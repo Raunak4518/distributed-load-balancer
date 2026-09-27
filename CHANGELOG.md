@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Release downloads can be verified.** Every release now publishes a
+  `SHA256SUMS` file, and `scripts/install.sh` checks the downloaded tarball
+  against it before installing, refusing a release without one unless
+  `ALLOW_UNVERIFIED=1`. A daily `cargo audit` workflow checks the dependency
+  tree against the RustSec advisory database.
 - **ACME key material was written non-atomically with default permissions.**
   Account credentials, private keys and certificates are now written to a
   temporary file, synced and renamed into place, and on Unix the credentials
@@ -52,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: with `[cluster.tls]`, a peer certificate must name its node's
+  `node_id`.** Gossip is merged only under a `node_id` that appears as a DNS,
+  URI or IP Subject Alternative Name in the sender's client certificate, so a
+  peer holding a valid certificate can no longer publish counts as another
+  node. Reissue peer certificates with the `node_id` added, or use each node's
+  bind IP as its `node_id`.
 - **Breaking: `proxy_protocol = true` now requires `proxy_protocol_trusted_cidrs`.**
   Connections from outside the listed networks are closed before their PROXY
   header is read (`lb_connections_rejected_total{reason="untrusted_proxy"}`),
@@ -73,6 +84,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **WebSocket upgrades ignored the sticky pin and never retried.** An upgrade
+  now goes to the backend its sticky cookie names when that backend is
+  eligible, and moves to another backend once when connecting to the first
+  fails, before anything from the client has been sent.
+- **The README piped the install script to `sh`**, which fails on shells
+  without `pipefail`; it now uses `bash`.
+- **The response cache ignored a client's request for a fresh response.** A
+  request with `Cache-Control: no-cache` or `max-age=0`, or `Pragma: no-cache`
+  without `Cache-Control`, now goes to the backend instead of being answered
+  from the cache.
 - **The HTTP/2 slowloris deadline was disarmed by a single byte.** A client
   could send one byte of the connection preface and then hold the connection
   indefinitely. The deadline now stays armed until the full preface and the
