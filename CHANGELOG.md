@@ -104,6 +104,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`peak_ewma_p2c` is now a true peak EWMA with an error penalty.** A
+  latency spike raises a backend's estimate immediately instead of being
+  averaged in; failing backends (connect errors, timeouts, 5xx) cost up to 11×
+  more; and backends within 10% of each other share traffic instead of
+  flip-flopping.
 - **Large request bodies are streamed instead of buffered.** Bodies up to the
   new `request_buffer_bytes` (default 64 KiB) are buffered as before and can
   be retried. Larger ones are streamed to the backend as they arrive, still
